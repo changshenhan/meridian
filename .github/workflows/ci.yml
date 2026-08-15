@@ -38,3 +38,40 @@ jobs:
         run: |
           cargo run --release -p meridian-bench --bin gate -- --record
           cargo run --release -p meridian-bench --bin gate -- --fail-over 10
+
+  # Noir（S-05）—— Windows 无法构建 nargo_cli v1.0.0-beta.26（termion 仅 unix），
+  # 且该版本无 Windows 预编译二进制、无 prove/verify 子命令（proving 已外移到 bb）。
+  # 因此本 job 是 ZK 电路**唯一**的验证路径：compile/test/约束数 + 完整 prove/verify/回读。
+  # 工具链锁定：nargo v1.0.0-beta.26 + bb（bbup 默认，见 circuits/README.md）。
+  noir:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install nargo v1.0.0-beta.26 (pinned)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash
+          "$HOME/.nargo/bin/noirup" --version 1.0.0-beta.26
+
+      - name: Install barretenberg (bbup)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/refs/heads/next/barretenberg/bbup/install | bash
+          "$HOME/.bb/bbup"
+          "$HOME/.bb/bb" --version
+
+      # S-05 验收：电路编译通过；约束数记录在案；正/负向测试框架就位。
+      - name: spend_authorization — compile, tests, constraint count
+        working-directory: circuits
+        run: |
+          export PATH="$HOME/.nargo/bin:$PATH"
+          nargo fetch
+          nargo compile
+          nargo test
+          nargo info
+
+      # TEMPORARY 冒烟：跑通 prove → verify → 公共输入回读 管线。
+      - name: smoke — prove → verify → public-input readback
+        run: |
+          export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"
+          bash scripts/smoke_zk.sh

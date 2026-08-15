@@ -18,6 +18,8 @@ pub enum Error {
     ECategory,
     ESeq,
     EOrdering,
+    /// 双钥绑定验证失败（S-05：Ed25519 对 attestation 公钥的绑定签名 / 承诺不匹配）。
+    EAttestBind,
 }
 
 impl Error {
@@ -38,6 +40,7 @@ impl Error {
             Error::ECategory => "E_CATEGORY",
             Error::ESeq => "E_SEQ",
             Error::EOrdering => "E_ORDERING",
+            Error::EAttestBind => "E_ATTEST_BIND",
         }
     }
 }

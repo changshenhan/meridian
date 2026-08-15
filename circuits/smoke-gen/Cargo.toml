@@ -1,0 +1,15 @@
+[package]
+name = "smoke-gen"
+version = "0.1.0"
+edition = "2021"
+
+# TEMPORARY —— S-05 管线冒烟脚手架的链下签名生成器（CI 专用）。
+# 用 k256 生成 secp256k1 签名，写 smoke 电路的 Prover.toml，
+# 配合 nargo compile/execute → bb prove/verify → 公共输入回读。
+# 验证完成后删除；不进 SPEC / 文档（仅 circuits/README.md 一行 TEMPORARY 备注）。
+#
+# 独立工作区：不进 meridian 主 workspace，避免污染主仓 fmt/clippy/test 门禁。
+[workspace]
+
+[dependencies]
+k256 = { version = "0.13", features = ["ecdsa"] }

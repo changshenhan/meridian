@@ -1,0 +1,18 @@
+[package]
+name = "spend_authorization"
+version = "0.1.0"
+type = "bin"
+authors = ["Meridian Labs"]
+
+# 依赖版本锁定（S-05 决策记录：Noir 1.0 移出 stdlib 的库按 git tag 锁定）
+# 锁定工具链：nargo v1.0.0-beta.26（见 meridian/rust-toolchain.toml 与 circuits/README.md）
+[dependencies]
+# 外部库清单（EXTERNAL_NOIR_LIBRARIES.yml）：
+#   eddsa   v0.1.3  — BabyJubJub + Poseidon 的 EdDSA（attestation key 验签）
+#   ec      v0.1.2  — eddsa 的下游依赖；测试里构造在曲线上的 R8 点（仅 #[cfg(test)] 使用）
+#   poseidon        — eddsa 库的 hasher 依赖（PoseidonHasher）
+#   sha256  v0.3.0  — agent_commit 承诺哈希（链下用 Rust sha2 复现，保持一致）
+eddsa = { tag = "v0.1.3", git = "https://github.com/noir-lang/eddsa" }
+ec = { tag = "v0.1.2", git = "https://github.com/noir-lang/ec" }
+poseidon = { tag = "v0.1.1", git = "https://github.com/noir-lang/poseidon" }
+sha256 = { tag = "v0.3.0", git = "https://github.com/noir-lang/sha256" }
