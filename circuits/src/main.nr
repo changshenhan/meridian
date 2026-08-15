@@ -22,8 +22,9 @@ use poseidon::poseidon::PoseidonHasher;
 use sha256;
 
 /// 类别白名单容量（Noir 数组定长；多余槽位填零，用 categories_len 约束有效长度）。
-/// Noir 1.0 模块级常量用 `global`（`const` 是函数内局部常量）。
-global MAX_CATEGORIES: usize = 8;
+/// Noir 1.0 已移除 `usize`：模块级常量用 `global`（`const` 是函数内局部常量），
+/// 数组长度/数值泛型统一用 `u32`（CI run 31905033362 实测：`usize` 无法解析）。
+global MAX_CATEGORIES: u32 = 8;
 
 /// 断言 3+4+5：预算与有效期约束（拆出以便黑箱测试覆盖正/负两态）。
 fn budget_and_window_ok(
@@ -42,7 +43,7 @@ fn budget_and_window_ok(
     if categories_len > 0 {
         let mut found = false;
         for i in 0..MAX_CATEGORIES {
-            if (i as u32) < categories_len {
+            if i < categories_len {
                 found = found | (categories[i] == category);
             }
         }
@@ -83,7 +84,10 @@ pub fn main(
     message: pub Field,
     amount: pub u64,
     category: pub [u8; 32],
-    spend_nonce: pub u64,
+    // S-05 仅作为公共输入携带、未约束（防误用：证明可带任意 nonce）；
+    // S-09 由 intent_hash 字段级绑定 + 账本幂等登记真正约束。前缀 _ 抑制
+    // unused 警告，S-09 约束落地时改回 spend_nonce。
+    _spend_nonce: pub u64,
     now: pub u64,
     // ——— Private ———
     agent_pub_x: Field,

@@ -184,11 +184,15 @@ pub fn owner_signing_key_from_bytes(bytes: [u8; 32]) -> OwnerSigningKey {
 }
 
 /// owner 签署一张委托（测试/发卡工具用；生产走钱包）。
+/// 产出**低位 s** 的规范签名：链上 DSA.sol 拒绝高位 s（延展性防线，TECH_SPEC §9），
+/// 签发侧必须与之一致，否则合法委托会被链上 reject。
 pub fn sign_delegation(d: &Delegation, owner_key: &OwnerSigningKey) -> SignedDelegation {
     let h = delegation_hash(d);
     let sig: EcdsaSignature = owner_key
         .sign_prehash(&h)
         .expect("secp256k1 signing cannot fail");
+    // 已低位则原样（normalize_s 返回 None），否则取 n-s（ecrecover 同样可恢复）。
+    let sig = sig.normalize_s().unwrap_or(sig);
     let sb = sig.to_bytes();
     let mut bytes = [0u8; 64];
     bytes.copy_from_slice(&sb[..]);
@@ -330,6 +334,25 @@ mod tests {
         let mut i2 = i.clone();
         i2.amount += 1;
         assert_ne!(intent_hash(&i), intent_hash(&i2));
+    }
+
+    #[test]
+    fn sign_delegation_always_low_s() {
+        // S-06：DSA.sol 拒绝高位 s，签发侧必须产出规范低位 s（任何私钥下都成立）。
+        // secp256k1 群阶 n 的一半，大端 32 字节（s <= n/2 即低位）。
+        let n_half: [u8; 32] = hex::decode(
+            "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        for seed in [7u8, 9u8, 0xAB, 0xCD] {
+            let owner_key = owner_signing_key_from_bytes([seed; 32]);
+            let sd = sign_delegation(&sample_delegation(), &owner_key);
+            let s: [u8; 32] = sd.signature.0[32..].try_into().unwrap();
+            // [u8] 按字节字典序比较 = 大端整数比较，s 必须 <= n/2。
+            assert!(s.as_slice() <= n_half.as_slice(), "signature s must be low-s");
+        }
     }
 
     #[test]
