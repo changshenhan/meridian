@@ -7,11 +7,14 @@ authors = ["Meridian Labs"]
 # 依赖版本锁定（S-05 决策记录，2026-08-16 修订）：
 #   Noir 1.0 移出 stdlib 的库按 git 锁定。eddsa 的最新 tag v0.1.3 仍是 Noir 0.x
 #   API（`u1`），与 nargo v1.0.0-beta.26 不兼容（CI 首跑实测失败）→ 改用 eddsa@main
-#   的 1.0 端口（commit 7e206c9，`compiler_version = ">=1.0.0"`），按 commit 锁定
-#   （比 tag 更严格，无漂移）。eddsa@main 弃用 `ec`、改用 `noir-edwards` v0.2.5。
+#   的 1.0 端口（commit 7e206c9，`compiler_version = ">=1.0.0"`）。
+#   nargo 1.0 的 git 依赖**只认 `tag` 键**（`rev` 解析直接报错，CI run 31904604734
+#   实测）→ 把该 commit fork 到 changshenhan/eddsa 并打 tag `v1.0-7e206c9` 锁定
+#   （tag 指向的 SHA 由我们控制，永不移位，比上游 rev 更稳）。
+#   eddsa@main 弃用 `ec`、改用 `noir-edwards` v0.2.5。
 # 详见 circuits/README.md。
 [dependencies]
-eddsa = { rev = "7e206c95f850346a84faf78e3430cd2bc3f6aabf", git = "https://github.com/noir-lang/eddsa" }
+eddsa = { tag = "v1.0-7e206c9", git = "https://github.com/changshenhan/eddsa" }
 # 测试专用：构造在曲线上的 R8 点（eddsa@main 的测试同一套 API）。
 edwards = { tag = "v0.2.5", git = "https://github.com/noir-lang/noir-edwards" }
 # 与 eddsa@main 的传递依赖同 tag，保证 PoseidonHasher 是同一个类型。

@@ -25,7 +25,7 @@ barretenberg `v6.0.0-nightly.20260724`。升级任何一侧都要重查此配对
 
 | 库 | 锁定 | 用途 |
 |---|---|---|
-| `eddsa` | @main rev `7e206c9`（git commit，比 tag 更严格） | BabyJubJub + Poseidon 的 EdDSA：agent attestation key 验签（`eddsa_verify`） |
+| `eddsa` | fork tag `v1.0-7e206c9`（changshenhan/eddsa，指向 1.0 端口 commit `7e206c9`） | BabyJubJub + Poseidon 的 EdDSA：agent attestation key 验签（`eddsa_verify`） |
 | `edwards` | `v0.2.5` | **仅测试用**——构造在曲线上的 R8 点（`Curve { x, y }.mul(ScalarField::<63>::from(...))`）。替代 eddsa 0.x 时代的 `ec` |
 | `poseidon` | `v0.3.0` | eddsa 库的 hasher（`PoseidonHasher`） |
 | `sha256` | `v0.3.0` | `agent_commit` 承诺哈希（链下 Rust `sha2` 复现同一规范，见下） |
@@ -33,9 +33,13 @@ barretenberg `v6.0.0-nightly.20260724`。升级任何一侧都要重查此配对
 > **eddsa tag 陷阱（S-05 CI 首跑实测失败 → 决策记录）**：eddsa 最新 tag `v0.1.3` 仍是 Noir 0.x
 > API（内部用已被移除的 `u1` 类型 + 0.x comptime-global 模式），与 nargo v1.0.0-beta.26 不兼容
 > （CI run 31903435847：44 个编译错误，全数来自 `ec` v0.1.2 / `poseidon` v0.1.1 两个传递依赖）。
-> 修复：改用 eddsa@main 的 1.0 端口（commit `7e206c9`，2026-04-08，`compiler_version = ">=1.0.0"`，
+> 修复一：改用 eddsa@main 的 1.0 端口（commit `7e206c9`，2026-04-08，`compiler_version = ">=1.0.0"`，
 > 0 个 `u1`）——`eddsa_verify` / `eddsa_to_pub` API 与测试向量完全一致；其 `ec` 依赖换成
-> `noir-edwards` v0.2.5，`poseidon` 升到 v0.3.0。按 **commit** 而非 tag 锁定，杜绝上游分支漂移。
+> `noir-edwards` v0.2.5，`poseidon` 升到 v0.3.0。
+> 修复二（CI run 31904604734 实测）：nargo 1.0 的 git 依赖**只认 `tag` 键**，`rev = ...` 直接
+> "Git dependencies must have a `tag` key" 解析失败。上游没有 1.0 兼容 tag → 把 7e206c9 fork
+> 到 `changshenhan/eddsa` 并打 tag `v1.0-7e206c9` 锁定。tag 指向的 SHA 由我们控制（永不移位），
+> 比上游 rev 更稳；该 fork 只是"git tag 锁定"机制的载体，不 fork 维护、不改一行源码。
 
 > 锁定方式：`Nargo.toml` 里按 git + tag 引用。升级必须改 tag + CI 全绿 + 约束数记录更新，
 > 不允许 "latest" 漂移。`nargo fetch` 按 lockfile 固化。
