@@ -78,3 +78,42 @@ jobs:
         run: |
           export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"
           bash scripts/smoke_zk.sh
+
+  # Solidity 合约（S-06）—— forge test + alloy 链上冒烟。
+  # foundry 版本与本机对齐（1.7.1 / commit 4072e48）以确保产物稳定；
+  # forge-std 通过 foundry.lock（v1.9.6, rev 3b20d60）锁定，CI 侧 forge install 拉取。
+  # 注：contracts/lib/、out/ 在 .gitignore 中，CI 各自构建。
+  solidity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install foundry (pinned to local 1.7.1)
+        run: |
+          export PATH="$HOME/.foundry/bin:$PATH"
+          curl -sSfL https://foundry.paradigm.xyz | bash
+          foundryup --version v1.7.1
+          forge --version
+
+      - name: Install forge-std (pinned by foundry.lock)
+        working-directory: contracts
+        run: |
+          export PATH="$HOME/.foundry/bin:$PATH"
+          forge install forge-std=foundry-rs/forge-std@v1.9.6
+
+      - name: forge build + test
+        working-directory: contracts
+        run: |
+          export PATH="$HOME/.foundry/bin:$PATH"
+          forge build
+          forge test
+
+      # 链上冒烟：spawn anvil → 部署三合约 → register→revoke→commit→settle 全链路。
+      # 交叉实现契约：Solidity sha256(delegationABI) == meridian-core delegation_hash。
+      - name: alloy smoke — anvil deploy + full chain
+        working-directory: contracts/rust-smoke
+        run: |
+          export PATH="$HOME/.foundry/bin:$PATH"
+          cargo run
+
