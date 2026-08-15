@@ -1,0 +1,13 @@
+{
+  "suite": "meridian-bench",
+  "commit": "local",
+  "machine": "windows x86_64",
+  "metrics": {
+    "check_budget_ops": 3096765634.411455,
+    "intent_sign_ops": 90239.67658099913,
+    "intent_verify_ops": 42808.182527240984,
+    "sign_delegation_ops": 33265.09553402787,
+    "verify_delegation_ops": 18638.099182272035
+  },
+  "recorded_at_unix": 1786816338
+}

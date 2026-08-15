@@ -1,0 +1,12 @@
+# Rust 构建产物
+/target
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地基准（CI 每次自记录，不提交本机噪声基线）
+# 注：bench/baseline.json 保留为参考基线，不 ignore

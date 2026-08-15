@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: bench (compile only)
+        run: cargo bench -p meridian-bench --no-run
+
+      # 性能门禁（TECH_SPEC §8.3）：同一 runner 上先记录再比对，机器无关。
+      # GitHub Actions runner 共享 CPU，噪声可到 ±10%，此处用 10% 抓灾难性回归；
+      # 精确的 1% 回归基线（§6.5）在受控参考平台上手动执行：
+      #   cargo run --release -p meridian-bench --bin gate -- --record
+      #   cargo run --release -p meridian-bench --bin gate            # 默认 --fail-over 1
+      - name: perf gate (release)
+        run: |
+          cargo run --release -p meridian-bench --bin gate -- --record
+          cargo run --release -p meridian-bench --bin gate -- --fail-over 10

@@ -1,0 +1,27 @@
+[package]
+name = "meridian-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+meridian-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "dsa_bench"
+path = "benches/dsa_bench.rs"
+harness = false
+
+[[bench]]
+name = "ledger_bench"
+path = "benches/ledger_bench.rs"
+harness = false
+
+[[bin]]
+name = "gate"
+path = "src/bin/gate.rs"
