@@ -54,10 +54,13 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash
           "$HOME/.nargo/bin/noirup" --version 1.0.0-beta.26
 
-      - name: Install barretenberg (bbup)
+      - name: Install barretenberg (bbup, pinned)
         run: |
           curl -sSfL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/refs/heads/next/barretenberg/bbup/install | bash
-          "$HOME/.bb/bbup"
+          # nargo v1.0.0-beta.26 未入 bbup 的 bb-versions.json（最细到 beta.22），须显式给版本。
+          # 配对依据：noir v1.0.0-beta.26 的 EXTERNAL_NOIR_LIBRARIES.yml 钉 aztec-packages
+          # commit 0e7787a（2026-07-24）→ barretenberg v6.0.0-nightly.20260724。
+          "$HOME/.bb/bbup" --version 6.0.0-nightly.20260724
           "$HOME/.bb/bb" --version
 
       # S-05 验收：电路编译通过；约束数记录在案；正/负向测试框架就位。

@@ -8,7 +8,7 @@
 | 组件 | 版本 | 安装 | 说明 |
 |---|---|---|---|
 | `nargo` | `v1.0.0-beta.26` | `noirup --version 1.0.0-beta.26` | Noir 编译器。**无 prove/verify 子命令**（proving 外移到 `bb`） |
-| `bb`（Barretenberg） | bbup 默认（CI 记录 `bb --version`） | `bbup` | UltraPlonk 后端；`write_vk` / `prove` / `verify` |
+| `bb`（Barretenberg） | `6.0.0-nightly.20260724` | `bbup --version 6.0.0-nightly.20260724` | UltraPlonk 后端；`write_vk` / `prove` / `verify` |
 | Rust 工具链 | `rust-toolchain.toml` | — | smoke-gen（TEMPORARY）在 Windows 本地即可构建 |
 
 **平台事实（S-05 决策）**：nargo v1.0.0-beta.26 无法在 Windows 构建（`termion` 仅 unix 的硬依赖，
@@ -16,8 +16,10 @@
 （core + smoke-gen）；ZK 电路的 compile / test / 约束数 / prove-verify-回读 全部在 CI 跑**
 （`.github/workflows/ci.yml` 的 `noir` job，ubuntu-latest）。电路改动后请 push 到 CI 验证。
 
-**字节码版本配对**：nargo 与 bb 的 bytecode 必须匹配。CI 首次运行如报不匹配，按报错
-调整 bb 版本一次并回写本表（bbup 默认通常即配 beta.26）。
+**字节码版本配对（已解析）**：nargo v1.0.0-beta.26 未入 bbup 的 `bb-versions.json`（最细到
+beta.22），bbup 默认（查询 nargo）会失败。配对依据 = noir v1.0.0-beta.26 的
+`EXTERNAL_NOIR_LIBRARIES.yml` 钉的 aztec-packages commit `0e7787a`（2026-07-24）→
+barretenberg `v6.0.0-nightly.20260724`。升级任何一侧都要重查此配对。
 
 ## 外部库清单（git tag 锁定，Noir 1.0 已把下列移出 stdlib）
 
