@@ -1,0 +1,16 @@
+# Foundry 配置（S-06，决策记录见 contracts/README.md）
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.24"
+# Base（OP Stack，EIP-4844 支持 Cancun）与 Anvil 都按 Cancun 对齐。
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+# DelegationHelper 的 bytes.concat 多参数在经典编译下 stack-too-deep → via-ir 解决。
+via_ir = true
+
+[fmt]
+line_length = 100
+tab_width = 4

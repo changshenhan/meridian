@@ -340,18 +340,20 @@ mod tests {
     fn sign_delegation_always_low_s() {
         // S-06：DSA.sol 拒绝高位 s，签发侧必须产出规范低位 s（任何私钥下都成立）。
         // secp256k1 群阶 n 的一半，大端 32 字节（s <= n/2 即低位）。
-        let n_half: [u8; 32] = hex::decode(
-            "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
+        let n_half: [u8; 32] =
+            hex::decode("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0")
+                .unwrap()
+                .try_into()
+                .unwrap();
         for seed in [7u8, 9u8, 0xAB, 0xCD] {
             let owner_key = owner_signing_key_from_bytes([seed; 32]);
             let sd = sign_delegation(&sample_delegation(), &owner_key);
             let s: [u8; 32] = sd.signature.0[32..].try_into().unwrap();
             // [u8] 按字节字典序比较 = 大端整数比较，s 必须 <= n/2。
-            assert!(s.as_slice() <= n_half.as_slice(), "signature s must be low-s");
+            assert!(
+                s.as_slice() <= n_half.as_slice(),
+                "signature s must be low-s"
+            );
         }
     }
 

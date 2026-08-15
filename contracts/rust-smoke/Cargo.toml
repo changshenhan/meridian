@@ -1,0 +1,18 @@
+[package]
+name = "contract-smoke"
+version = "0.1.0"
+edition = "2021"
+
+# S-06c：链上集成冒烟（TEMPORARY，S-08 前并入正式部署/测试脚本）。
+# 独立 workspace：不污染主仓 fmt/clippy/test 门禁（同 circuits/smoke-gen 惯例）。
+# 依赖 meridian-core 走 path；alloy 做链上交互（版本锁定见 contracts/README.md）。
+[workspace]
+
+[dependencies]
+meridian-core = { path = "../../core" }
+alloy = { version = "2.4", features = ["sol-types", "signer-local", "provider-anvil-api"] }
+url = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
+anyhow = "1"
+hex = "0.4"
+serde_json = "1"

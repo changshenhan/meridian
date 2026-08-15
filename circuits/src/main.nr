@@ -55,8 +55,8 @@ fn budget_and_window_ok(
 /// 断言 1：attestation 公钥承诺解承诺 = sha256(pub_x_le_bytes || pub_y_le_bytes)。
 /// 链下 Rust 侧（core/src/attestation.rs）必须用同一规范计算 agent_commit。
 fn agent_commit_ok(agent_commit: [u8; 32], pub_x: Field, pub_y: Field) -> bool {
-    let xb = pub_x.to_le_bytes();
-    let yb = pub_y.to_le_bytes();
+    let xb: [u8; 32] = pub_x.to_le_bytes();
+    let yb: [u8; 32] = pub_y.to_le_bytes();
     let mut pk = [0u8; 64];
     for i in 0..32 {
         pk[i] = xb[i];
@@ -173,8 +173,8 @@ mod tests {
     fn agent_commit_matches_pubkey() {
         // 用 eddsa_to_pub 生成曲线上的点，正向验证承诺；再篡改一点验证失败。
         let (pub_x, pub_y) = eddsa_to_pub(1234);
-        let xb = pub_x.to_le_bytes();
-        let yb = pub_y.to_le_bytes();
+        let xb: [u8; 32] = pub_x.to_le_bytes();
+        let yb: [u8; 32] = pub_y.to_le_bytes();
         let mut pk = [0u8; 64];
         for i in 0..32 {
             pk[i] = xb[i];
