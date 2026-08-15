@@ -156,6 +156,13 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// 规范序列化的公开导出（S-06，Contract 模式）：把规范字节原样上链
+/// （`DSA.sol::registerDelegation` 用 `sha256(delegationABI)` 复算 delegation_hash，
+/// 保证链上与链下同一哈希）。
+pub fn delegation_abi(d: &Delegation) -> Vec<u8> {
+    canonical_delegation(d)
+}
+
 /// Delegation 的规范哈希（owner 签名对象）。
 pub fn delegation_hash(d: &Delegation) -> [u8; 32] {
     sha256(&canonical_delegation(d))

@@ -4,15 +4,16 @@ version = "0.1.0"
 type = "bin"
 authors = ["Meridian Labs"]
 
-# 依赖版本锁定（S-05 决策记录：Noir 1.0 移出 stdlib 的库按 git tag 锁定）
-# 锁定工具链：nargo v1.0.0-beta.26（见 meridian/rust-toolchain.toml 与 circuits/README.md）
+# 依赖版本锁定（S-05 决策记录，2026-08-16 修订）：
+#   Noir 1.0 移出 stdlib 的库按 git 锁定。eddsa 的最新 tag v0.1.3 仍是 Noir 0.x
+#   API（`u1`），与 nargo v1.0.0-beta.26 不兼容（CI 首跑实测失败）→ 改用 eddsa@main
+#   的 1.0 端口（commit 7e206c9，`compiler_version = ">=1.0.0"`），按 commit 锁定
+#   （比 tag 更严格，无漂移）。eddsa@main 弃用 `ec`、改用 `noir-edwards` v0.2.5。
+# 详见 circuits/README.md。
 [dependencies]
-# 外部库清单（EXTERNAL_NOIR_LIBRARIES.yml）：
-#   eddsa   v0.1.3  — BabyJubJub + Poseidon 的 EdDSA（attestation key 验签）
-#   ec      v0.1.2  — eddsa 的下游依赖；测试里构造在曲线上的 R8 点（仅 #[cfg(test)] 使用）
-#   poseidon        — eddsa 库的 hasher 依赖（PoseidonHasher）
-#   sha256  v0.3.0  — agent_commit 承诺哈希（链下用 Rust sha2 复现，保持一致）
-eddsa = { tag = "v0.1.3", git = "https://github.com/noir-lang/eddsa" }
-ec = { tag = "v0.1.2", git = "https://github.com/noir-lang/ec" }
-poseidon = { tag = "v0.1.1", git = "https://github.com/noir-lang/poseidon" }
+eddsa = { rev = "7e206c95f850346a84faf78e3430cd2bc3f6aabf", git = "https://github.com/noir-lang/eddsa" }
+# 测试专用：构造在曲线上的 R8 点（eddsa@main 的测试同一套 API）。
+edwards = { tag = "v0.2.5", git = "https://github.com/noir-lang/noir-edwards" }
+# 与 eddsa@main 的传递依赖同 tag，保证 PoseidonHasher 是同一个类型。
+poseidon = { tag = "v0.3.0", git = "https://github.com/noir-lang/poseidon" }
 sha256 = { tag = "v0.3.0", git = "https://github.com/noir-lang/sha256" }

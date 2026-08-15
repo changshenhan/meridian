@@ -22,7 +22,8 @@ use poseidon::poseidon::PoseidonHasher;
 use sha256;
 
 /// 类别白名单容量（Noir 数组定长；多余槽位填零，用 categories_len 约束有效长度）。
-const MAX_CATEGORIES: usize = 8;
+/// Noir 1.0 模块级常量用 `global`（`const` 是函数内局部常量）。
+global MAX_CATEGORIES: usize = 8;
 
 /// 断言 3+4+5：预算与有效期约束（拆出以便黑箱测试覆盖正/负两态）。
 fn budget_and_window_ok(
@@ -119,12 +120,19 @@ pub fn main(
     assert(delegation_hash[0] > 0);
 }
 
-#[cfg(test)]
+// Noir 1.0 没有 `#[cfg(test)]`（`cfg` 不在作用域）；测试函数用 `#[test]` 标记，
+// `nargo test` 收集执行，`nargo compile` 亦会做类型检查（edwards 为测试专用依赖）。
 mod tests {
     use crate::{budget_and_window_ok, agent_commit_ok, agent_sig_ok, MAX_CATEGORIES};
-    use ec::{consts::te::baby_jubjub, tecurve::affine::Point as TEPoint};
+    use edwards::{bjj::BabyJubJub, Curve, CurveTrait, ScalarField};
     use eddsa::eddsa_to_pub;
     use sha256;
+
+    // eddsa@main 的 BASE8 常量（模块级 global 未 `pub`，测试侧复制一份；见 eddsa/src/lib.nr）。
+    global BASE8_X: Field =
+        5299619240641551281634865583518297030282874472190772894086521144482721001553;
+    global BASE8_Y: Field =
+        16950150798460657717958625567821834550301663161624707787222815936182638968203;
 
     #[test]
     fn budget_accepts_valid_spend() {
@@ -180,17 +188,17 @@ mod tests {
     fn agent_sig_rejects_forged() {
         // 注意：eddsa_verify 对「不在曲线上」的 R8/公钥 和 s >= suborder 会 **panic**（assert），
         // 不会返回 false。因此负向测试必须用「在曲线上」的点和 s < suborder 的值。
-        // r_a / s_a 取自 noir-lang/eddsa v0.1.3 自带测试的手工预计算有效签名（priv_a=123, msg=789）。
+        // r_a / s_a 取自 eddsa@main 自带测试的手工预计算有效签名（priv_a=123, msg=789）。
         let priv_a = 123;
         let priv_b = 456;
         let msg = 789;
         let (pub_a_x, pub_a_y) = eddsa_to_pub(priv_a);
         let (pub_b_x, pub_b_y) = eddsa_to_pub(priv_b);
 
-        let bjj = baby_jubjub();
+        let base8: BabyJubJub = Curve { x: BASE8_X, y: BASE8_Y };
         let r_a = 1414770703199880747815475415092878800081323795074043628810774576767372531818;
         let s_a = 30333430637424319196043722294837632681219980330991241982145549329256671548;
-        let r8_a = bjj.curve.mul(r_a, bjj.base8);
+        let r8_a = base8.mul(ScalarField::<63>::from(r_a));
 
         // 正例：有效签名通过
         assert(agent_sig_ok(pub_a_x, pub_a_y, s_a, r8_a.x, r8_a.y, msg));

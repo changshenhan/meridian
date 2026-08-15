@@ -23,12 +23,19 @@ barretenberg `v6.0.0-nightly.20260724`。升级任何一侧都要重查此配对
 
 ## 外部库清单（git tag 锁定，Noir 1.0 已把下列移出 stdlib）
 
-| 库 | tag | 用途 |
+| 库 | 锁定 | 用途 |
 |---|---|---|
-| `eddsa` | `v0.1.3` | BabyJubJub + Poseidon 的 EdDSA：agent attestation key 验签（`eddsa_verify`） |
-| `ec` | `v0.1.2` | eddsa 下游依赖；**仅测试用**——构造在曲线上的 R8 点（`baby_jubjub().curve.mul(...)`） |
-| `poseidon` | `v0.1.1` | eddsa 库的 hasher（`PoseidonHasher`） |
+| `eddsa` | @main rev `7e206c9`（git commit，比 tag 更严格） | BabyJubJub + Poseidon 的 EdDSA：agent attestation key 验签（`eddsa_verify`） |
+| `edwards` | `v0.2.5` | **仅测试用**——构造在曲线上的 R8 点（`Curve { x, y }.mul(ScalarField::<63>::from(...))`）。替代 eddsa 0.x 时代的 `ec` |
+| `poseidon` | `v0.3.0` | eddsa 库的 hasher（`PoseidonHasher`） |
 | `sha256` | `v0.3.0` | `agent_commit` 承诺哈希（链下 Rust `sha2` 复现同一规范，见下） |
+
+> **eddsa tag 陷阱（S-05 CI 首跑实测失败 → 决策记录）**：eddsa 最新 tag `v0.1.3` 仍是 Noir 0.x
+> API（内部用已被移除的 `u1` 类型 + 0.x comptime-global 模式），与 nargo v1.0.0-beta.26 不兼容
+> （CI run 31903435847：44 个编译错误，全数来自 `ec` v0.1.2 / `poseidon` v0.1.1 两个传递依赖）。
+> 修复：改用 eddsa@main 的 1.0 端口（commit `7e206c9`，2026-04-08，`compiler_version = ">=1.0.0"`，
+> 0 个 `u1`）——`eddsa_verify` / `eddsa_to_pub` API 与测试向量完全一致；其 `ec` 依赖换成
+> `noir-edwards` v0.2.5，`poseidon` 升到 v0.3.0。按 **commit** 而非 tag 锁定，杜绝上游分支漂移。
 
 > 锁定方式：`Nargo.toml` 里按 git + tag 引用。升级必须改 tag + CI 全绿 + 约束数记录更新，
 > 不允许 "latest" 漂移。`nargo fetch` 按 lockfile 固化。
@@ -81,7 +88,7 @@ S-02 的 Ed25519（NodeId）**保持传输层身份，不改已验收代码**。
 ```
 circuits/
   Nargo.toml        spend_authorization 包（外部库 git-tag 锁定）
-  src/main.nr       电路 + 正/负向黑箱测试（#[cfg(test)]）
+  src/main.nr       电路 + 正/负向黑箱测试（Noir 1.0：mod tests + #[test]，无 cfg）
   smoke/            TEMPORARY 冒烟电路（仅 stdlib）
   smoke-gen/        独立 Rust workspace；生成 smoke 的 Prover.toml（k256，确定性）
 ```
