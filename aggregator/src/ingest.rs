@@ -324,6 +324,29 @@ impl WindowManager {
     fn pending_sealed(&self) -> usize {
         self.sealed.lock().expect("sealed poisoned").len()
     }
+
+    /// S-10c 恢复：把未密封尾（已接受但未承诺的意图）种子进当前窗口，并把 epoch 编号接到
+    /// 最后一个已密封 epoch 之后（避免恢复后 epoch_id 与已上链的重复 / 被拒）。
+    /// `tail` 必须按 seq 升序、长度 ≤ 容量（一窗内；撕裂点在「WAL 追加」与「满窗即封」之间时
+    /// 可达整窗）。当前窗口由 `build` 新建为空窗，直接填入即可。
+    fn restore_tail(&self, last_epoch_id: i64, tail: &[WindowEntry]) {
+        assert!(
+            tail.len() <= self.capacity,
+            "unsealed tail {} exceeds window capacity {}",
+            tail.len(),
+            self.capacity
+        );
+        self.next_epoch
+            .store((last_epoch_id + 1) as u64, Ordering::Relaxed);
+        let w = self.current();
+        for e in tail {
+            let slot = w
+                .reserve(e.intent_hash)
+                .expect("restore tail fits one window");
+            w.finalize(slot, e.seq, true);
+        }
+        // current.created_at = build 时的 now_fn()（本进程启动时刻）；时间密封以恢复点为界。
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +471,23 @@ impl Aggregator {
                 agg.state.provision(&dh, cfg.nonce_capacity_per_delegation);
             }
         }
-        // 2. 意图按 seq 排序重放（重建 nonce 集 + 账本 + seq + 意图索引）。
+        // 2. 已密封边界：最后一个 EpochSeal 的**累计**接受数 = 已承诺/已结算意图的上界。
+        //    seq >= 该值 的意图是「未密封尾」——已接受、已落 WAL、但还没进任何 epoch 承诺，
+        //    恢复后必须重建进当前窗口（S-10c，否则这些意图永远不会被净额结算）。
+        let mut sealed_accepted_count: u64 = 0;
+        let mut last_epoch_id: i64 = -1;
+        for rec in &records {
+            if let DecodedRecord::EpochSeal {
+                epoch_id,
+                accepted_count,
+                ..
+            } = rec
+            {
+                last_epoch_id = last_epoch_id.max(*epoch_id as i64);
+                sealed_accepted_count = sealed_accepted_count.max(*accepted_count);
+            }
+        }
+        // 3. 意图按 seq 排序重放（重建 nonce 集 + 账本 + seq + 意图索引）。
         let mut intents: Vec<ReplayIntent> = Vec::new();
         for rec in &records {
             if let DecodedRecord::Intent {
@@ -473,6 +512,15 @@ impl Aggregator {
             }
         }
         intents.sort_by_key(|t| t.0);
+        // 未密封尾（按 seq 升序，已排序）：重建当前窗口用。
+        let tail: Vec<WindowEntry> = intents
+            .iter()
+            .filter(|t| t.0 >= sealed_accepted_count)
+            .map(|(seq, ih, ..)| WindowEntry {
+                seq: *seq,
+                intent_hash: *ih,
+            })
+            .collect();
         for (seq, ih, dh, spend_nonce, amount, now, recipient) in intents {
             let reg = agg.registry.lookup(&dh).ok_or_else(|| {
                 std::io::Error::other("WAL replay: intent for unregistered delegation")
@@ -482,11 +530,17 @@ impl Aggregator {
                 .try_commit(&dh, &reg.delegation, spend_nonce, amount, now, &agg.seq)
                 .map_err(std::io::Error::other)?;
             debug_assert_eq!(got, seq, "replay seq must match WAL seq");
-            agg.intents
-                .lock()
-                .expect("intents poisoned")
-                .insert(ih, (recipient, amount));
+            // 意图索引只收未密封意图：已提交的（seq < 边界）由 EpochSeal/Netting 覆盖，
+            // 恢复后不再引用，不入索引避免驻留泄漏。
+            if seq >= sealed_accepted_count {
+                agg.intents
+                    .lock()
+                    .expect("intents poisoned")
+                    .insert(ih, (recipient, amount));
+            }
         }
+        // 4. 重建未密封窗口 + epoch 编号接到已密封序列之后。
+        agg.windows.restore_tail(last_epoch_id, &tail);
         Ok((agg, truncated))
     }
 
@@ -611,11 +665,14 @@ impl Aggregator {
         let res =
             crate::lattice::build_epoch(se.epoch_id, se.sealed_at, &se.entries, &mut resolve)?;
         // WAL 记录（崩溃重放按 epoch_id 跳过已承诺 / 已结算的 epoch）。
+        // accepted_count = **累计**接受数（截至本 epoch 末，含此前全部）：max(seq)+1。
+        // 恢复时用它区分已密封 vs 未密封尾（seq >= 该值 → 未密封，需重建窗口，S-10c）。
+        let cumulative_accepted = se.entries.last().map(|e| e.seq + 1).unwrap_or(0);
         self.wal
             .append_epoch_seal(
                 se.epoch_id,
                 res.commitment_root,
-                se.entries.len() as u64,
+                cumulative_accepted,
                 se.sealed_at,
             )
             .expect("WAL failure (durability backbone)");
@@ -678,6 +735,7 @@ mod tests {
     use meridian_core::zk::SpendProof;
 
     use crate::proof::FormatVerifier;
+    use proptest::prelude::*;
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -1099,5 +1157,357 @@ mod tests {
         assert_eq!(r.seq, 3);
         assert_eq!(agg2.total_spent(&dh), Some(20));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 结算全部已封 epoch 并校验不变量（S-10c 的 fuzz 断言）：Σnet == Σaccepted；
+    /// 每个 accepted 的 intent_hash 恰出现在一个 epoch 里一次；无 rejected 的 intent_hash
+    /// 入承诺（无双重记账、无丢失）。
+    fn settle_all_and_check(agg: &Aggregator, expected: &[(bool, [u8; 32], u64)]) {
+        let now = (agg.now_fn)();
+        let mut sum_accepted: u64 = 0;
+        for (ok, _, amt) in expected {
+            if *ok {
+                sum_accepted = sum_accepted.saturating_add(*amt);
+            }
+        }
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut sum_net: u64 = 0;
+        let mut total_entries = 0usize;
+        // 反复封当前窗 + 取走密封队列结算，直到无新已封 epoch。
+        loop {
+            let sealed = agg.seal_expired(now + 10_000, 1);
+            if sealed.is_empty() {
+                break;
+            }
+            for se in &sealed {
+                let res = agg.settle_epoch(se).expect("settle must succeed");
+                total_entries += se.entries.len();
+                for e in &se.entries {
+                    assert!(
+                        seen.insert(e.intent_hash),
+                        "double entry: {:?}",
+                        e.intent_hash
+                    );
+                }
+                for l in &res.net {
+                    sum_net = sum_net.saturating_add(l.amount);
+                }
+            }
+        }
+        assert_eq!(total_entries, seen.len(), "each entry exactly once");
+        assert_eq!(sum_net, sum_accepted, "Σnet must equal Σaccepted");
+        for (ok, ih, _) in expected {
+            assert_eq!(
+                seen.contains(ih),
+                *ok,
+                "accepted iff in commitment (no double-entry / no loss)"
+            );
+        }
+    }
+
+    /// S-10c 故障注入：撕裂尾（头完整、payload 残缺 + 错 crc）→ 恢复截断 → 账本与 accepted
+    /// 前缀一致，继续摄取 seq 接着来，且全部意图可完整结算。
+    #[test]
+    fn restore_after_torn_tail_matches_accepted_prefix() {
+        use std::fs::OpenOptions;
+        use std::io::Write as _;
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("torntail");
+        let now = clock.load(Ordering::Relaxed);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let d = delegation([1u8; 20], 100, 1_000_000); // max_per_spend=100
+        let dh = meridian_core::dsa::delegation_hash(&d);
+        let mut expected: Vec<(bool, [u8; 32], u64)> = Vec::new();
+        {
+            let agg = test_aggregator(&clock, &path);
+            let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
+            agg.register(sd, agent_key.verifying_key());
+            // 3 笔有效 + 1 笔超预算（101 > 100）+ 1 笔重复 nonce（2 已用）。
+            for (amt, nonce) in [(10u64, 1u64), (20, 2), (30, 3)] {
+                let env = make_env(dh, [1u8; 20], &agent_key, [nonce as u8; 20], amt, nonce, now);
+                let r = agg.submit(&env);
+                assert!(r.accepted);
+                expected.push((true, meridian_core::dsa::intent_hash(&env.intent), amt));
+            }
+            let over = make_env(dh, [1u8; 20], &agent_key, [0xEE; 20], 101, 4, now);
+            let r = agg.submit(&over);
+            assert_eq!(r.reject_reason, Some(Error::EBudgetPerSpend));
+            expected.push((false, meridian_core::dsa::intent_hash(&over.intent), 101));
+            let dup = make_env(dh, [1u8; 20], &agent_key, [0xDD; 20], 5, 2, now);
+            let r = agg.submit(&dup);
+            assert_eq!(r.reject_reason, Some(Error::ENonce));
+            expected.push((false, meridian_core::dsa::intent_hash(&dup.intent), 5));
+            agg.wal.flush().unwrap();
+            // 手工追加撕裂尾：一条头完整、payload 残缺 + 错 crc 的 Intent 记录。
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            let mut header = [0u8; 12];
+            header[0..2].copy_from_slice(&0x4D4Du16.to_le_bytes());
+            header[2] = 1; // version
+            header[3] = 2; // RecordKind::Intent
+            header[4..8].copy_from_slice(&116u32.to_le_bytes());
+            header[8..12].copy_from_slice(&0u32.to_le_bytes()); // 错 crc
+            f.write_all(&header).unwrap();
+            f.write_all(&[0u8; 10]).unwrap();
+        } // 崩溃：聚合器丢弃，WAL 带撕裂尾
+
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            test_cfg(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(truncated, "torn tail must be detected and truncated");
+        // 账本与 accepted 前缀一致（拒绝不占用）。
+        assert_eq!(agg2.total_spent(&dh), Some(60));
+        assert_eq!(agg2.nonce_count(&dh), Some(3));
+        assert_eq!(agg2.accepted_count(), 3);
+        // 继续摄取 seq 接着来，且全部意图能完整结算。
+        let r = agg2.submit(&make_env(dh, [1u8; 20], &agent_key, [0x11; 20], 40, 5, now));
+        assert!(r.accepted);
+        assert_eq!(r.seq, 3);
+        expected.push((true, r.intent_hash, 40));
+        settle_all_and_check(&agg2, &expected);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-10c 未密封尾重建：崩溃时窗口未满未封 → 恢复后当前窗口重建全部尾意图 →
+    /// 再提交到满 → 封 → 净额覆盖尾 + 新意图，Σnet == Σaccepted。
+    #[test]
+    fn restore_rebuilds_unsealed_window_tail() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("tail");
+        let now = clock.load(Ordering::Relaxed);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let d = delegation([1u8; 20], 1_000, 1_000_000);
+        let dh = meridian_core::dsa::delegation_hash(&d);
+        let mut cfg = test_cfg();
+        cfg.epoch_capacity = 4;
+        {
+            let c = Arc::clone(&clock);
+            let wal = Wal::open(&path, 100_000).unwrap();
+            let agg = Aggregator::with_clock(
+                cfg.clone(),
+                Box::new(FormatVerifier),
+                wal,
+                Box::new(move || c.load(Ordering::Relaxed)),
+            );
+            let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
+            agg.register(sd, agent_key.verifying_key());
+            for amt in [10u64, 20, 30] {
+                let env = make_env(dh, [1u8; 20], &agent_key, [amt as u8; 20], amt, amt, now);
+                assert!(agg.submit(&env).accepted);
+            }
+            agg.wal.flush().unwrap();
+        } // 崩溃：3 笔已接受但窗口未满未封（未密封尾）
+
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            cfg.clone(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+        // 恢复后注册表/账本已重建；当前窗口含 3 笔尾意图。
+        assert_eq!(agg2.registry_len(), 1);
+        assert_eq!(agg2.total_spent(&dh), Some(60));
+        // 提交第 4 笔 → 满窗自动封 → 承诺覆盖尾(3) + 新(1)。
+        let r4 = agg2.submit(&make_env(dh, [1u8; 20], &agent_key, [0x44; 20], 40, 4, now));
+        assert!(r4.accepted);
+        assert_eq!(r4.seq, 3);
+        let sealed = agg2.take_sealed();
+        assert_eq!(sealed.len(), 1, "window sealed after 4th intent");
+        assert_eq!(sealed[0].epoch_id, 0, "no prior seal → epoch 0");
+        assert_eq!(sealed[0].entries.len(), 4, "tail (3) + new (1) all in commitment");
+        assert_eq!(
+            sealed[0].entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        let res = agg2.settle_epoch(&sealed[0]).expect("settle ok");
+        let sum_net: u64 = res.net.iter().map(|l| l.amount).sum();
+        assert_eq!(sum_net, 100, "Σnet == Σaccepted (10+20+30+40)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-10c epoch 编号续接：崩溃前已封已结算 epoch 0 → 恢复后从 epoch 1 继续，
+    /// 已提交意图不进当前窗口（无双重承诺）。
+    #[test]
+    fn restore_continues_epoch_numbering_after_prior_seal() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("epocont");
+        let now = clock.load(Ordering::Relaxed);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let d = delegation([1u8; 20], 1_000, 1_000_000);
+        let dh = meridian_core::dsa::delegation_hash(&d);
+        let mut cfg = test_cfg();
+        cfg.epoch_capacity = 4;
+        {
+            let c = Arc::clone(&clock);
+            let wal = Wal::open(&path, 100_000).unwrap();
+            let agg = Aggregator::with_clock(
+                cfg.clone(),
+                Box::new(FormatVerifier),
+                wal,
+                Box::new(move || c.load(Ordering::Relaxed)),
+            );
+            let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
+            agg.register(sd, agent_key.verifying_key());
+            for i in 1..=4u64 {
+                let env = make_env(dh, [1u8; 20], &agent_key, [i as u8; 20], 1, i, now);
+                assert!(agg.submit(&env).accepted);
+            }
+            // 第 4 笔后满窗自动封（epoch 0）。
+            let sealed = agg.take_sealed();
+            assert_eq!(sealed.len(), 1);
+            assert_eq!(sealed[0].epoch_id, 0);
+            agg.settle_epoch(&sealed[0]).expect("settle epoch 0");
+            agg.wal.flush().unwrap();
+        } // 崩溃：epoch 0 已封已结算
+
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            cfg.clone(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+        // 恢复后当前窗口为空（epoch 0 意图已提交，不入索引/窗口）；epoch 编号从 1 续。
+        for i in 5..=8u64 {
+            let env = make_env(dh, [1u8; 20], &agent_key, [i as u8; 20], 1, i, now);
+            assert!(agg2.submit(&env).accepted);
+        }
+        let sealed = agg2.take_sealed();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].epoch_id, 1, "epoch numbering continues after restore");
+        assert_eq!(sealed[0].entries.len(), 4);
+        assert_eq!(sealed[0].entries[0].seq, 4, "post-restore intents start at seq 4");
+        for e in &sealed[0].entries {
+            assert!(e.seq >= 4, "no epoch-0 intent re-enters commitment");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-10c 并发 fuzz（确定性）：8 线程并发提交混入重复 nonce / 超预算的批次，结算全部
+    /// epoch 后不变量保持——无双重记账、每个 accepted 恰一次、Σnet == Σaccepted。
+    #[test]
+    fn concurrent_batch_no_double_entry_and_net_equals_accepted() {
+        use std::thread;
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("conc");
+        let now = clock.load(Ordering::Relaxed);
+        let mut cfg = test_cfg();
+        cfg.epoch_capacity = 8;
+        let c = Arc::clone(&clock);
+        let wal = Wal::open(&path, 100_000).unwrap();
+        let agg = Arc::new(Aggregator::with_clock(
+            cfg,
+            Box::new(FormatVerifier),
+            wal,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        ));
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        const THREADS: usize = 8;
+        const PER: usize = 200;
+        // 每 5 笔超预算（max_per_spend=1000 → EBudgetPerSpend）；每 7 笔跨线程重复 nonce
+        // （→ ENonce）；其余有效。并发乱序提交。
+        let envs: Vec<IntentEnvelope> = (0..THREADS * PER)
+            .map(|i| {
+                let t = i / PER;
+                let n = i % PER;
+                let amount = if n.is_multiple_of(5) { 5_000 } else { 1 };
+                let nonce = if n.is_multiple_of(7) {
+                    100_000 + t as u64
+                } else {
+                    (t * 1000 + n) as u64
+                };
+                let recipient = [(n % 250 + 1) as u8; 20];
+                make_env(dh, [1u8; 20], &agent_key, recipient, amount, nonce, now)
+            })
+            .collect();
+        let mut expected: Vec<(bool, [u8; 32], u64)> = envs
+            .iter()
+            .map(|env| {
+                (
+                    true,
+                    meridian_core::dsa::intent_hash(&env.intent),
+                    env.intent.amount,
+                )
+            })
+            .collect();
+        let threads: Vec<_> = envs
+            .chunks(PER)
+            .map(|chunk| {
+                let agg = Arc::clone(&agg);
+                let chunk = chunk.to_vec();
+                thread::spawn(move || {
+                    chunk.iter().map(|env| agg.submit(env)).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for (ti, t) in threads.into_iter().enumerate() {
+            let receipts = t.join().unwrap();
+            for (j, r) in receipts.into_iter().enumerate() {
+                expected[ti * PER + j].0 = r.accepted;
+            }
+        }
+        settle_all_and_check(&agg, &expected);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // S-10c 随机 fuzz（proptest）：任意 (金额, nonce, 收款方, 时间偏移) 组合提交后结算，
+    // 不变量保持：Σnet == Σaccepted、每 accepted 恰一次、无 rejected 入承诺。
+    // 32 例 × ≤40 笔：覆盖随机碰撞/拒绝路径，CI 时间可控（全量 256 例在 S-10d 手动跑）。
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+        #[test]
+        fn fuzz_random_batch_preserves_invariants(
+            ops in proptest::collection::vec(
+                (any::<u16>(), any::<u16>(), any::<u16>(), any::<u8>()),
+                0..40,
+            ),
+        ) {
+            let clock = Arc::new(AtomicU64::new(1_700_000_000));
+            let path = tmp_path("fuzz");
+            let now = clock.load(Ordering::Relaxed);
+            let mut cfg = test_cfg();
+            cfg.epoch_capacity = 8;
+            let c = Arc::clone(&clock);
+            let wal = Wal::open(&path, 100_000).unwrap();
+            let agg = Aggregator::with_clock(
+                cfg,
+                Box::new(FormatVerifier),
+                wal,
+                Box::new(move || c.load(Ordering::Relaxed)),
+            );
+            let (dh, _) = register_default(&agg, [1u8; 20]);
+            let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+            let mut expected: Vec<(bool, [u8; 32], u64)> = Vec::new();
+            for (amt, nonce, recip, off) in ops {
+                let amount = amt as u64 % 1200; // 部分超 max_per_spend=1000
+                let env = make_env(
+                    dh,
+                    [1u8; 20],
+                    &agent_key,
+                    [recip as u8; 20],
+                    amount,
+                    nonce as u64,
+                    now + off as u64,
+                );
+                let r = agg.submit(&env);
+                expected.push((
+                    r.accepted,
+                    meridian_core::dsa::intent_hash(&env.intent),
+                    amount,
+                ));
+            }
+            settle_all_and_check(&agg, &expected);
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
