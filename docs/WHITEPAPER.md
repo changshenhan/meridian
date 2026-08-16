@@ -53,18 +53,21 @@ L5  Orchestration   Agent frameworks (MCP), SDKs
 
 The core primitive. The **owner** (a human or enterprise, ECDSA — the EVM ecosystem) issues
 a `Delegation`: "this agent may spend, per spend at most X, per window at most Y, in total at
-most Z, until time T." The **agent** holds a separate Ed25519 key — cheap, fast, ideal for
-high-frequency signing.
+most Z, until time T." The **agent** holds a transport Ed25519 key (NodeId) for the
+S-02 fast path, plus a **BabyJubJub attestation key** whose signature on the spend intent is
+checked inside the ZK circuit (S-09).
 
-Two keys, deliberately different curves:
+Three keys, deliberately different curves:
 
-| Role | Key | Why |
+| Role | Key | Verified where |
 |---|---|---|
-| Owner | ECDSA/secp256k1 | The EVM wallet ecosystem; humans are already there |
-| Agent | Ed25519 | High-frequency signing; ~5× faster to verify; small keys |
+| Owner | ECDSA/secp256k1 | Off-circuit: on-chain `registerDelegation` + S-02 (EVM wallet ecosystem) |
+| Agent (transport) | Ed25519 NodeId | Off-circuit fast path (S-02) |
+| Agent (ZK authorization) | BabyJubJub + Poseidon EdDSA | **In-circuit** (`eddsa_verify` over `encode_field(intent_hash)`) |
 
-The two keys are **bound** at registration: the owner's Ed25519 key is itself signed by the
-owner's ECDSA key, and the binding is checked outside the circuit.
+The keys are **bound** at registration: the owner's Ed25519(NodeId) key signs a binding to the
+agent's BabyJubJub public key, and the binding is checked outside the circuit
+(`core/src/attestation.rs`). The circuit anchors the already-bound `delegation_hash`.
 
 ### 3.2 Budget ledger (L2)
 
@@ -86,14 +89,17 @@ Authorization is a **zero-knowledge proof** that the intent satisfies the delega
 budget rules, without revealing the delegation to every counterparty. The `spend_authorization`
 circuit (Noir/Barretenberg) enforces:
 
-- the intent is signed by the agent key bound to the delegation,
+- the intent (`intent_hash`, field-bound) is signed by the agent's BabyJubJub attestation key,
 - the delegation is valid (not expired, not revoked — via a sparse-Merkle non-membership root),
 - amount and category are within bounds,
-- the budget ledger state transition is correct.
+- the budget ledger state transition is correct (checked at the ledger, §3.2).
 
-Measured constraint budget (S-05): **6,880 ACIR + 1,289 Brillig** constraints for `main`,
-far under the 2^18 ceiling — proof generation and verification stay interactive for a
-per-transaction workflow.
+Owner ECDSA is verified **off-circuit** (S-09 decision): on-chain `registerDelegation` + the
+S-02 fast path; the circuit anchors the already-bound `delegation_hash`.
+
+Measured constraint budget (S-09): **66,736** gates (`bb gates` circuit_size; 9,044 ACIR
+opcodes), far under the 2^18 ceiling — proof generation and verification stay interactive
+for a per-transaction workflow (see §5.5 of the spec for prove/verify latency).
 
 ### 3.4 Aggregator (L3)
 
@@ -176,8 +182,9 @@ the received side shows `200 OK` + ack, and the server identity matches the deli
 
 | Phase | Status | Content |
 |---|---|---|
-| Phase 0 — standards | **Done** (2026-08-16) | Three PoCs green; spec v1.0 frozen; repo open-sourced |
-| Phase 1 — reference impl | Next | Full ZK (ECDSA + revocation), aggregator kernel, EVM verifier, milestone M1 end-to-end |
+| Phase 0 — standards | **Done** (2026-08-16) | Three PoCs green; spec v1.0 frozen; repo ready for open-source (launch deferred, per S-08e) |
+| S-09 (ZK circuit) | **Done** (2026-08-16) | Full `spend_authorization`: intent_hash field binding + sparse-Merkle revocation non-membership; owner ECDSA verified off-circuit (on-chain + S-02); EVM verifier (`UltraVerifier.sol`, keccak-flavor) generated |
+| Phase 1 — reference impl | Next | Aggregator kernel (S-10, WAL / commitment lattice), in-process proving/verification wrapper (true B4), milestone M1 end-to-end |
 | Phase 2 — operator | Later | Multi-operator, bond economy, Base mainnet, recursive aggregation |
 
 Phase 0 exit criteria are all met. Phase 1 is in progress against `MASTER_PLAN.md` (linear,

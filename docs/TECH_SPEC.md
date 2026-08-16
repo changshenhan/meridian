@@ -100,13 +100,17 @@ pub fn delegation_hash(d: &Delegation) -> [u8; 32];
 
 ### 4.2 签名方案（决策）
 
-| 角色 | 方案 | 理由 |
+| 角色 | 方案 | 验证位置 |
 |---|---|---|
-| owner 签名 Delegation | **ECDSA secp256k1** | 人类=EVM 钱包，原生可验；SDK 与钱包生态成熟 |
-| agent 签名 SpendIntent | **Ed25519** | agent 侧高频快速；Noir stdlib 支持好 |
+| owner 签名 Delegation | **ECDSA secp256k1**（人类=EVM 钱包，原生可验） | **电路外**（S-09 决策）：链上 `DSA.sol::registerDelegation` + S-02 `verify_delegation`；电路只锚定 `delegation_hash` |
+| agent 签名 SpendIntent（传输身份） | **Ed25519**（NodeId，S-02） | 电路外快路径验签 |
+| agent 签 intent_hash（ZK 授权） | **BabyJubJub + Poseidon EdDSA**（attestation key） | **电路内** `eddsa_verify`（§5.2 断言 2） |
 | 批量证明/批次承诺 | Blake2b-256 | 快速、无 SHA-2 扩展攻击面 |
 
-> 记录在案：secp256k1 进电路贵（~2^18 约束）。v1 接受该成本换钱包生态；Phase 2 评估 BLS/曲线切换 + 批验证优化（§5.6）。
+> 双钥绑定（D-05 扩展，S-05/S-09 决策记录）：NodeId 是传输层身份，注册时绑定
+> attestation key（`core/src/attestation.rs`）；ZK 电路用后者签 intent_hash。记录在案：
+> secp256k1 进电路贵（~2^18 约束）→ **v1 直接电路外验证**（链上 + S-02），不付该成本；
+> Phase 2 再评估 BLS/曲线切换 + 批验证优化（§5.4）。
 
 ### 4.3 SpendIntent
 
@@ -136,7 +140,6 @@ pub fn verify_delegation(sd: &SignedDelegation, owner_pub: &PublicKey) -> Result
 pub struct SpendProofRequest<'a> {
     pub sd: &'a SignedDelegation,
     pub intent: &'a SpendIntent,
-    pub owner_pub: &'a PublicKey,      // 公共输入 owner_commit 由其导出
     pub agent_keypair: &'a Keypair,    // agent 签名 possession 证明
     pub revocation_root: [u8; 32],     // 当前撤销根（链上观测）
     pub now: u64,
@@ -147,16 +150,18 @@ pub struct SpendProof {
     pub public_inputs: SpendPublicInputs,
 }
 
+// 对齐电路 §5.1（S-09）：owner 的 ECDSA 电路外（§5.2 断言 2），无 owner_commit；
+// intent_hash 电路内派生，不作为公共输入；recipient/now 为 S-09 新增公共输入。
 pub struct SpendPublicInputs {
-    pub agent_commit: [u8; 32],        // hash(agent_pubkey)
-    pub owner_commit: [u8; 32],        // hash(owner_pubkey)
+    pub agent_commit: [u8; 32],        // sha256(pub_x_le || pub_y_le)
     pub delegation_hash: [u8; 32],
+    pub recipient: [u8; 20],
     pub amount: u64,
     pub category: [u8; 32],
     pub spend_nonce: u64,
     pub expires_at: u64,
-    pub revocation_root: [u8; 32],
-    pub intent_hash: [u8; 32],
+    pub revocation_root: [u8; 32],     // 撤销树根（公共锚点）
+    pub now: u64,                      // 当前时间（断言 5）
 }
 
 pub trait SpendProver {
@@ -221,84 +226,119 @@ pub fn check_budget(
 
 | 类别 | 名称 | 说明 |
 |---|---|---|
-| **Public** | `owner_commit` | `hash(owner_pubkey)` |
-| | `agent_commit` | `hash(agent_pubkey)` |
-| | `delegation_hash` | 绑定的委托哈希 |
-| | `amount` / `category` / `spend_nonce` / `expires_at` | 本笔消费字段 |
+| **Public** | `agent_commit` | `sha256(agent_pub_x_le ‖ agent_pub_y_le)` attestation 公钥承诺 |
+| | `delegation_hash` | 绑定的委托哈希（公共锚点，断言 6 强制非零） |
+| | `recipient` | 收款地址（20B，S-09 新增，绑定进 intent_hash） |
+| | `amount` / `category` / `spend_nonce` / `expires_at` | 本笔消费字段（全部绑定进 intent_hash） |
 | | `revocation_root` | 撤销树根（未撤销证明） |
-| | `intent_hash` | 绑定的意图哈希 |
-| **Private** | `owner_pubkey` | 解承诺，验 owner 签名 |
-| | `owner_sig` | owner 对 `delegation_hash` 的 ECDSA |
-| | `agent_pubkey` | 解承诺，验 agent 签名 |
-| | `agent_sig` | agent 对 `intent_hash` 的 Ed25519 |
-| | `delegation` | 相关字段：`max_per_spend`、`categories`、`not_before`、`expires_at` |
-| | `revocation_proof` | 稀疏 Merkle 非成员证明（叶子=EMPTY） |
+| | `now` | 当前时间（断言 5 有效期窗口） |
+| **Private** | `agent_pub_x` / `agent_pub_y` | 解承诺，验 agent EdDSA（断言 1） |
+| | `sig_s` / `sig_r8_x` / `sig_r8_y` | agent 对 `encode_field(intent_hash)` 的 EdDSA（断言 2） |
+| | `max_per_spend` / `categories` / `categories_len` / `not_before` | 委托相关字段（预算/白名单/有效期，断言 3-5） |
+| | `revocation_path` | 稀疏 Merkle 非成员证明路径（叶子=EMPTY，深度 32，断言 8） |
+
+**不存在的输入（S-09 决策）**：`owner_commit` / `owner_pubkey` / `owner_sig` 不进入电路
+（owner ECDSA 电路外，见 §5.2 断言 2）；`intent_hash` 不再是公共输入——断言 9 在电路内
+派生它（防止电路只验「签名对象」而不验「字段绑定」；聚合器以回读的公共输入为准登记）。
 
 ### 5.2 电路断言（证明即通过以下全部）
 
 ```
-1. hash(owner_pubkey) == owner_commit
-2. ecdsa_secp256k1_verify(owner_sig, owner_pubkey, delegation_hash) == true
-3. hash(agent_pubkey) == agent_commit
-4. ed25519_verify(agent_sig, agent_pubkey, intent_hash) == true
-5. amount <= delegation.max_per_spend
-6. category ∈ delegation.categories          // 白名单为空则不要求
-7. delegation.not_before <= now <= delegation.expires_at
-8. merkle_non_membership(delegation_hash, revocation_root, revocation_proof)
-9. intent_hash == hash(agent_commit, delegation_hash, recipient, amount,
-                        category, spend_nonce, expires_at)
-   // 注意：intent_hash 由公共输入显式给出，电路只断言"签名对象"一致性；
-   // recipient 已含在 intent_hash 中（公共可见）。
+1. sha256(pub_x_le ‖ pub_y_le) == agent_commit            // attestation 公钥承诺解承诺
+2. [owner ECDSA —— 电路外]                                  // 见下方决策记录
+3. amount <= delegation.max_per_spend                       // 单笔限额
+4. categories_len == 0，或 category ∈ categories            // 类别白名单（空白名单不要求）
+5. delegation.not_before <= now <= delegation.expires_at    // 有效期
+6. delegation_hash[0] > 0                                   // 公共锚点非零（S-05）
+7. spend_nonce > 0                                          // 防零 nonce 误用
+8. compute_merkle_root(EMPTY, index, path) == revocation_root  // 撤销非成员，叶子=EMPTY
+9. intent_hash == sha256(agent_commit ‖ delegation_hash ‖ recipient ‖ amount_le ‖
+                          category ‖ spend_nonce_le ‖ expires_at_le)  // 字段级绑定
+   // intent_hash 电路内派生（不再作为公共输入），签名对象 = encode_field(intent_hash)。
+   // encode_field = 低 31 字节 LE 截断 → Field（248-bit < BN254 域，单射）；
+   // 断言 9 钉死完整 32B 哈希 → 无 mod-p 碰撞可乘。
 ```
 
-**安全要点**：`intent_hash` 作为公共输入，且证明绑定它——聚合器登记账本时必须以 `SpendVerifier::verify` 返回的公共输入为准（接口已设计成"返回即登记"，杜绝漂移）。
+**断言 2（owner ECDSA）电路外决策（S-09）**：owner 对 `delegation_hash` 的 secp256k1
+签名**不进电路**。三层电路外强制：① 链上 `DSA.sol::registerDelegation` 校验委托签名并
+存 `delegation_hash`；② S-02 `verify_delegation`（Ed25519 NodeId 绑定 + 委托验签，已验收）；
+③ `core/src/attestation.rs` 双钥绑定（NodeId ↔ attestation key）。电路只锚定
+`delegation_hash` 这一已链上登记、已验证绑定的公共锚点。secp256k1 blackbox 仅作 TEMPORARY
+smoke 脚手架，**不作为设计**（见 §5.3 / `circuits/README.md`）。
+
+**安全要点**：`intent_hash` 在电路内由 7 个公共输入（agent_commit、delegation_hash、
+recipient、amount、category、spend_nonce、expires_at）按断言 9 的规范字节派生并绑定，签名对象经
+`encode_field` 单射编码（断言 2）。聚合器登记账本时必须以 `SpendVerifier::verify` 返回的
+公共输入（agent_commit / delegation_hash / recipient / amount / category / spend_nonce /
+expires_at / revocation_root / now）为准（接口已设计成"返回即登记"，杜绝漂移）。
 
 ### 5.3 证明系统与工具链
 
-- **Proving**：Noir（`nargo`）+ Barretenberg 后端（`bb`，UltraPlonk）。版本**固定锁定**，
-  nargo = v1.0.0-beta.26、bb = bbup 默认（nargo/bb 字节码必须配对）；完整工具链与平台事实见
-  `circuits/README.md`（S-05 决策记录）。
+- **Proving**：Noir（`nargo`）+ Barretenberg 后端（`bb`，**UltraHonk**）。版本**固定锁定**：
+  nargo = v1.0.0-beta.26、bb = v6.0.0-nightly.20260724（字节码配对依据 = noir beta.26 的
+  `EXTERNAL_NOIR_LIBRARIES.yml` 钉 aztec-packages commit 0e7787a）；完整工具链与平台事实见
+  `circuits/README.md`（S-05/S-09 决策记录）。
 - **验证路径**：nargo v1.0.0-beta.26 无法在 Windows 构建（`termion` 仅 unix，无 feature 可关），
-  本地 Windows 只做 Rust 侧；电路 compile / test / 约束数 / prove-verify-回读 全部在 CI
-  （ubuntu，`.github/workflows/ci.yml` 的 `noir` job）执行。电路改动以 CI 绿为验收。
+  本地 Windows 只做 Rust 侧；电路 compile / test / 约束数 / prove-verify-回读 / 计时 / EVM
+  验证器 全部在 CI（ubuntu，`.github/workflows/ci.yml` 的 `noir` job）执行。电路改动以 CI 绿为验收。
 - **外部库（git 锁定；Noir 1.0 已把下列移出 stdlib）**：`eddsa` fork tag `v1.0-7e206c9`
   （changshenhan/eddsa，指向 1.0 端口 commit 7e206c9；v0.1.3 仍是 Noir 0.x `u1` API，与 beta.26 不兼容；
   nargo 1.0 git 依赖只认 `tag` → fork+tag 锁定）、`edwards` v0.2.5（测试构造曲线点，替代 `ec`）、
   `poseidon` v0.3.0、`sha256` v0.3.0（`agent_commit` 承诺哈希，链下 Rust `sha2` 同一规范）。
   清单与锁定方式见 `circuits/README.md`。
-- **Verifier**：BB 生成验证器 → Rust 侧用 `bb_rs` 或 stdlib 封装；目标是聚合器侧单验证 < 10ms、批验证摊薄 ≤ 100μs/笔（§5.5）。
-- **S-09 完整版依赖**：owner 签名用 stdlib `std::ecdsa_secp256k1`（§5.2 断言 2）；撤销根用稀疏
-  Merkle 非成员证明（叶子=EMPTY）。S-05 最小版暂不含 owner ECDSA 与 Merkle。
-- **S-05 验收（CI 全绿，run 31926682045）**：`prove → verify → 公共输入回读` 全链路已在 CI
-  跑通（TEMPORARY `smoke/` 脚手架，secp256k1 blackbox，验证后删除；字节序等坑记在
+- **签名标量 s 的 mod-n 归约（S-09c 决策）**：Noir 1.0 移除 Field 模运算且 `ScalarField` 无算符
+  → `s = (r + h·secret) % SUBORDER` 由 build 脚本（`scripts/formal_gen_to_prover.py`，Python
+  大整数）计算；该归约是纯整数逻辑（R8/h/公钥仍在 Noir 内），端到端由正式电路
+  `eddsa_verify`（CI prove）把关：s 错则证明失败。
+- **撤销树**：内联 `compute_merkle_root`（`std::merkle` 已移出 Noir 1.0 stdlib，merkle_insert
+  官方模式 + `std::hash::pedersen_hash`），深度 32，叶子=EMPTY(0)，index =
+  `delegation_hash[0..4]` LE。原型级碰撞属性（两 delegation 同 32-bit 前缀共享叶子→撤销共享）
+  ——真实树 S-11 对接 RevocationRegistry 时再设计。
+- **EVM 验证器（Phase 4 复用）**：`bb write_solidity_verifier -t evm-no-zk -k vk -o UltraVerifier.sol`
+  编译 Solidity 验证器（CI 产物 `circuits/artifacts/UltraVerifier.sol`）。**Flavor 一致性
+  约束**：bb 6.0.0-nightly 的 `CircuitWriteSolidityVerifier` 硬编码 `UltraKeccakFlavor::
+  VerificationKey`（oracle_hash=keccak + disable_zk，1888B），因此 `write_vk` / `prove` /
+  `verify` 必须统一 `-t evm-no-zk`（默认 poseidon2 的 UltraFlavor VK 3680B 尺寸不匹配，
+  CI run 31933941769 → 修复 31934410549 全绿）。
+- **Rust 侧封装**：聚合器用 `bb_rs` 或 stdlib 封装验证器；目标单验证 < 10ms、批验证摊薄 ≤
+  100μs/笔（§5.5）。真批验证/递归聚合见 §5.4。
+- **S-09 验收（CI 全绿，run 31934410549）**：正式管线 8 步全通——`gen-witness`（Noir 内
+  确定性 eddsa_sign + 撤销树）→ `formal_gen_to_prover.py` 交叉校验 → 正式电路 prove/verify
+  /公共输入回读(121)/负向篡改/B2-B4 计时基线/约束门禁(<2^18)/EVM 验证器。TEMPORARY `smoke/`
+  （secp256k1 blackbox）保持原状，仅作脚手架，**不进文档/SPEC**（字节序等坑记在
   `scripts/smoke_readback.py` docstring）。**已知提示（非阻断）**：nargo soundness 检查对
   `noir-edwards` 的 `__add_unconstrained`（BabyJubJub 点加，`unsafe`）报 "Brillig function
-  call isn't properly covered by a manual constraint" —— 警告而非错误；S-05 的公共输入断言仍
-  绑定；S-09 完整版需评估该库约束覆盖或换实现。
-- **EVM 集成预留**：电路同时编译 `Verifier.sol` 供 Phase 4 的 L3 预编译使用。
+  call isn't properly covered by a manual constraint" —— 警告而非错误；gen-witness 与正式
+  电路共享该库约束覆盖，prove/verify 端到端兜底。
+- **EVM 集成预留**：`circuits/artifacts/UltraVerifier.sol`（UltraHonk keccak-flavor）供
+  Phase 4 的 L3 预编译使用。
 
 ### 5.4 批验证策略（100μs/笔 预算的达成路径）
 
 | 阶段 | 手段 | 摊薄效果 |
 |---|---|---|
 | v1 | 单证明 + 非阻塞异步并发验证 | 并行吞吐提升 |
-| v1.1 | UltraPlonk 批验证（BB 原生 batch verify） | 验证成本均摊 |
+| v1.1 | UltraHonk 批验证（BB 原生 batch verify） | 验证成本均摊 |
 | Phase 2 | 电路内"递归聚合"：N 笔 → 1 个聚合证明 | 摊销到近乎固定成本 |
 
-> 诚实预算：100μs/笔是**目标线**。ECDSA 进电路后单验证 ~ms 级，v1.1 批验证先达摊薄线，递归聚合（Phase 2）才真正击穿。基准（§8）会产生真实数字回填预算表。
+> 诚实预算：100μs/笔是**目标线**。owner ECDSA 电路外（§5.2），电路内是 BabyJubJub EdDSA +
+> pedersen Merkle + sha256——单验证 ~ms 级（§5.5 实测），v1.1 批验证先达摊薄线，递归聚合
+> （Phase 2）才真正击穿。基准（§8）会产生真实数字回填预算表。
 
-### 5.5 约束预算（目标）
+### 5.5 约束预算（目标 + S-09 实测）
 
-| 项 | 目标 |
-|---|---|
-| 电路约束数 | < 2^18（含 ECDSA+Ed25519+merkle） |
-| 证明生成（agent 侧，桌面级） | p50 < 1s |
-| 单证明验证（聚合器） | < 10ms |
-| 批验证摊薄（≥256 笔/批） | ≤ 100μs / 笔 |
+| 项 | 目标 | S-09 实测（CI run 31934410549） |
+|---|---|---|
+| 电路约束数 | < 2^18 | **66736**（`bb gates` circuit_size；含 sha256 intent_hash + pedersen Merkle + Jubjub EdDSA） |
+| 证明生成（agent 侧，桌面级） | p50 < 1s | 1.8457s（CI 2 核共享 runner，`bb prove` 进程含 witness 加载；桌面级/优化留待 Phase 4） |
+| 单证明验证（聚合器） | < 10ms | **7.62ms p99 PASS**（`bb verify` CLI 进程含启动开销，纯验证数学更小） |
+| 批验证摊薄（≥256 笔/批） | ≤ 100μs / 笔 | 7.62ms/笔 CLI 上界；真批验证摊薄待 Phase 4 in-process wrapper |
 
-**S-05 实测（nargo v1.0.0-beta.26，CI run 31926682045 全绿）**：spend_authorization
-最小版 `main` = **6880 ACIR opcodes + 1289 Brillig opcodes**（`nargo info`）。远低于
-2^18 上限，为 S-09 的 owner ECDSA（secp256k1，~2^18 级）+ 撤销 Merkle 预留充足余量。
+**S-05 基线**（run 31926682045）：最小版 = 6880 ACIR opcodes + 1289 Brillig opcodes。
+**S-09 完整版**（run 31934410549）：circuit_size = **66736**，ACIR opcodes = 9044（`bb gates`
+输出）——owner ECDSA 移出电路（§5.2 断言 2）省下 ~2^18 级预算，其余（intent_hash sha256 +
+撤销 Merkle + Jubjub EdDSA）仍在 2^18 预算内，为后续安全增强（如字段级类别解析）留有余量。
+证明/验证时延见 `circuits/bench/baseline_s09.json`（CI upload-artifact 交付）。
 
 ---
 
@@ -550,7 +590,7 @@ contract BatchSettler {
 
 | PoC | 内容 | 结果 | 证据 |
 |---|---|---|---|
-| ① ZK 授权凭证 | `spend_authorization` 三断言 + 正/负向 + 双钥绑定 | **PASS**（约束回填 §5.5） | CI run 31926682045；§5.5 |
+| ① ZK 授权凭证 | `spend_authorization` 完整版（§5.2 九断言 + 正/负向 + 双钥绑定 + 撤销非成员 + intent_hash 字段级绑定） | **PASS**（约束 66736 < 2^18，回填 §5.5） | CI run 31934410549；§5.5 |
 | ② 聚合器吞吐 | 验签→nonce 去重→预算记账，固定输入满核 | **PASS** 488,738 笔/s（目标 ≥10 万） | `docs/poc/poc-02-aggregator-throughput.md` |
 | ③ 交付证明 | TLSNotary 2-party MPC-TLS 选择性披露见证交付 | **PASS** 四条断言 | `docs/poc/poc-03-delivery-proof.md` |
 
@@ -560,8 +600,10 @@ contract BatchSettler {
 
 - **性能预算表（§8.2）是活的**：每个数字以 `bench/` 实测为准回填；偏差须在本文件记录原因与修订线。
 - **本规格绑定 Phase 0/1**；任何接口签名变更走 PR 评审，先改 spec 后改码。
-- 下一位要开工的模块（S-09 起）：**ZK 电路完整版**（secp256k1 ECDSA + 撤销非成员）与
-  **聚合器内核**（S-10，WAL / commitment lattice / 崩溃恢复）。
+- 下一位要开工的模块：**聚合器内核**（S-10，WAL / commitment lattice / 崩溃恢复）。
+  S-09（ZK 电路完整版：intent_hash 字段级绑定 + 撤销非成员，owner ECDSA 电路外）已完成；
+  S-10 起 Phase 2 级联。EVM 验证器（`circuits/artifacts/UltraVerifier.sol`，keccak-flavor）
+  供 Phase 4 L3 预编译复用。
 
 ---
 
