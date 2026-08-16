@@ -47,27 +47,15 @@ def le32(v: int) -> bytes:
     return v.to_bytes(32, "little")
 
 
-def read_return(data):
-    if "return" not in data:
-        print("ERROR: gen-witness/Prover.toml has no `return` key "
-              "(did nargo execute --overwrite-return run?)", file=sys.stderr)
-        print("--- file head ---\n" + str(data)[:2000], file=sys.stderr)
-        sys.exit(1)
-    ret = data["return"]
-    if isinstance(ret, dict):
-        get = ret.get
-        fields = {k: get(k) for k in (
-            "agent_pub_x", "agent_pub_y", "sig_s", "sig_r8_x", "sig_r8_y",
-            "revocation_root", "revocation_index", "revocation_path", "intent_hash")}
-    elif isinstance(ret, list):
-        # 位置映射（WitnessOut 字段顺序）防御性兜底
-        (px, py, s, r8x, r8y, root, idx, path, ih) = ret
-        fields = {"agent_pub_x": px, "agent_pub_y": py, "sig_s": s,
-                  "sig_r8_x": r8x, "sig_r8_y": r8y, "revocation_root": root,
-                  "revocation_index": idx, "revocation_path": path, "intent_hash": ih}
-    else:
-        print(f"ERROR: unexpected `return` type {type(ret)}", file=sys.stderr)
-        sys.exit(1)
+WITNESS_KEYS = (
+    "agent_pub_x", "agent_pub_y", "sig_s", "sig_r8_x", "sig_r8_y",
+    "revocation_root", "revocation_index", "revocation_path", "intent_hash",
+)
+# 扁平返回的顺序 = WitnessOut 字段顺序：5 标量 + 1 root + 1 index + 32 path + 32 ih = 71
+FLAT_HEAD = 7  # agent_pub_x..revocation_index 共 7 个标量
+
+
+def parse_fields(fields):
     if any(v is None for v in fields.values()):
         print(f"ERROR: incomplete `return` keys: {list(fields.keys())}", file=sys.stderr)
         sys.exit(1)
@@ -82,6 +70,43 @@ def read_return(data):
         "revocation_path": [to_int(x) for x in fields["revocation_path"]],
         "intent_hash": bytes(to_int(x) for x in fields["intent_hash"]),
     }
+
+
+def read_return(data):
+    # nargo --overwrite-return 的序列化形态未在本地可见，三种都解析：
+    #   a) `return` 键为表（struct → [return] 嵌套表）
+    #   b) `return` 键为列表（嵌套 9 元素或扁平 71 值）
+    #   c) 整个文件被覆盖成返回值本身（顶层即 WitnessOut 字段）
+    ret = data.get("return")
+    if isinstance(ret, dict):
+        return parse_fields({k: ret.get(k) for k in WITNESS_KEYS})
+    if isinstance(ret, list):
+        if len(ret) == 9:
+            # 嵌套形态：[5 标量, root, index, path[32], ih[32]]
+            (px, py, s, r8x, r8y, root, idx, path, ih) = ret
+            return parse_fields({"agent_pub_x": px, "agent_pub_y": py, "sig_s": s,
+                                 "sig_r8_x": r8x, "sig_r8_y": r8y, "revocation_root": root,
+                                 "revocation_index": idx, "revocation_path": path,
+                                 "intent_hash": ih})
+        if len(ret) == 71:
+            # 扁平形态：字段顺序 5 标量 + 1 root + 1 index + 32 path + 32 ih
+            head, path, ih = ret[:FLAT_HEAD], ret[FLAT_HEAD:FLAT_HEAD + 32], ret[FLAT_HEAD + 32:]
+            return parse_fields({"agent_pub_x": head[0], "agent_pub_y": head[1], "sig_s": head[2],
+                                 "sig_r8_x": head[3], "sig_r8_y": head[4], "revocation_root": head[5],
+                                 "revocation_index": head[6], "revocation_path": path,
+                                 "intent_hash": ih})
+        print(f"ERROR: `return` list length {len(ret)} (expected 9 nested or 71 flat)",
+              file=sys.stderr)
+        print("--- first 3 values ---", file=sys.stderr)
+        print(str(ret[:3])[:500], file=sys.stderr)
+        sys.exit(1)
+    if all(k in data for k in WITNESS_KEYS):
+        # 顶层即返回值（--overwrite-return 直接覆盖了输入文件）
+        return parse_fields({k: data[k] for k in WITNESS_KEYS})
+    print("ERROR: gen-witness/Prover.toml has no parseable `return` (did "
+          "nargo execute --overwrite-return run?)", file=sys.stderr)
+    print("--- file head ---\n" + str(data)[:2000], file=sys.stderr)
+    sys.exit(1)
 
 
 def main() -> int:
