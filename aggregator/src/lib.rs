@@ -14,6 +14,7 @@
 //! - 自写追加式 WAL（`wal.rs`），零重型 DB。
 
 pub mod ingest;
+pub mod lattice;
 pub mod merkle;
 pub mod proof;
 pub mod receipt;

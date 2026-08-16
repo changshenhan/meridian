@@ -4,7 +4,8 @@
 //! 意图有效期 → 委托查表（未注册拒 `E_DELEG_UNKNOWN`）→ agent 绑定 → Ed25519 验签（证明前
 //! 的廉价 DoS 闸门）→ 验证明（`SpendVerifier`，登记以返回值为准）→ 公共输入与信封一致性 →
 //! 预留窗口槽 → nonce 去重 + 预算检查记账（分片锁内**分配 seq**）→ 定稿（accepted 才入承诺）
-//! → WAL 追加 → 满窗即封。
+//! → WAL 追加 → 满窗即封。已封 epoch 由 `process_pending` 结算（`lattice::build_epoch`：
+//! 承诺根/净额/净额根 + WAL EpochSeal/Netting 记录 + 上链 seam）。
 //!
 //! 并发一致性（关键不变量）：
 //! - **同委托内 seq 序 == 账本应用序**：seq 在 `try_commit` 的分片锁内 `fetch_add`——同委托
@@ -31,10 +32,17 @@ use meridian_core::error::Error;
 use meridian_core::ledger::{check_budget, BudgetState};
 use meridian_core::zk::SpendVerifier;
 
+use crate::lattice::{ChainPublisher, EpochResult, NoopPublisher};
 use crate::proof::check_public_inputs_consistent;
 use crate::receipt::{IntentEnvelope, Receipt};
 use crate::wal::{DecodedRecord, Wal};
 use crate::window::{EpochWindow, WindowEntry};
+
+/// 意图索引条目：intent_hash → (recipient, amount)。净额解析源（§6.3 步骤 D）。
+type IntentRef = ([u8; 20], u64);
+/// WAL 重放的已接受意图元组：
+/// (seq, intent_hash, delegation_hash, spend_nonce, amount, now, recipient)。
+type ReplayIntent = (u64, [u8; 32], [u8; 32], u64, u64, u64, [u8; 20]);
 
 /// 摄取配置。
 #[derive(Debug, Clone)]
@@ -339,6 +347,11 @@ pub struct Aggregator {
     windows: WindowManager,
     verifier: Box<dyn SpendVerifier + Send + Sync>,
     wal: Wal,
+    /// 意图索引：intent_hash → (recipient, amount)。已接受意图在 WAL 落盘后插入；
+    /// `settle_epoch` 净额后按 epoch 修剪。崩溃后由 WAL 重放重建（§6.3 步骤 D 的解析源）。
+    intents: Mutex<HashMap<[u8; 32], IntentRef>>,
+    /// 链上发布 seam（S-10 用 `NoopPublisher` 只算不发布；S-11 换真实交易后端）。
+    publisher: Box<dyn ChainPublisher + Send + Sync>,
     /// 全局接受序号（accepted 计数）。在分片锁内递增。
     seq: AtomicU64,
     now_fn: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -394,6 +407,8 @@ impl Aggregator {
             windows: WindowManager::new(epoch_capacity, now),
             verifier,
             wal,
+            intents: Mutex::new(HashMap::new()),
+            publisher: Box::new(NoopPublisher),
             seq: AtomicU64::new(0),
             now_fn,
         }
@@ -433,23 +448,32 @@ impl Aggregator {
                 agg.state.provision(&dh, cfg.nonce_capacity_per_delegation);
             }
         }
-        // 2. 意图按 seq 排序重放。
-        let mut intents: Vec<(u64, [u8; 32], u64, u64, u64)> = Vec::new();
+        // 2. 意图按 seq 排序重放（重建 nonce 集 + 账本 + seq + 意图索引）。
+        let mut intents: Vec<ReplayIntent> = Vec::new();
         for rec in &records {
             if let DecodedRecord::Intent {
                 seq,
+                intent_hash,
                 delegation_hash,
                 spend_nonce,
                 amount,
                 now,
-                ..
+                recipient,
             } = rec
             {
-                intents.push((*seq, *delegation_hash, *spend_nonce, *amount, *now));
+                intents.push((
+                    *seq,
+                    *intent_hash,
+                    *delegation_hash,
+                    *spend_nonce,
+                    *amount,
+                    *now,
+                    *recipient,
+                ));
             }
         }
         intents.sort_by_key(|t| t.0);
-        for (seq, dh, spend_nonce, amount, now) in intents {
+        for (seq, ih, dh, spend_nonce, amount, now, recipient) in intents {
             let reg = agg.registry.lookup(&dh).ok_or_else(|| {
                 std::io::Error::other("WAL replay: intent for unregistered delegation")
             })?;
@@ -458,6 +482,10 @@ impl Aggregator {
                 .try_commit(&dh, &reg.delegation, spend_nonce, amount, now, &agg.seq)
                 .map_err(std::io::Error::other)?;
             debug_assert_eq!(got, seq, "replay seq must match WAL seq");
+            agg.intents
+                .lock()
+                .expect("intents poisoned")
+                .insert(ih, (recipient, amount));
         }
         Ok((agg, truncated))
     }
@@ -532,9 +560,15 @@ impl Aggregator {
             pi.spend_nonce,
             pi.amount,
             pi.now,
+            pi.recipient,
         ) {
             panic!("WAL failure (durability backbone): {e}");
         }
+        // WAL 落盘后登记意图索引（崩溃后可重放重建；settle 后按 epoch 修剪）。
+        self.intents
+            .lock()
+            .expect("intents poisoned")
+            .insert(ih, (pi.recipient, pi.amount));
         // 10. 满窗即封。
         self.windows.maybe_rotate(now);
         Receipt::accepted(ih, seq)
@@ -558,6 +592,55 @@ impl Aggregator {
     /// 到时未满也封（lattice 驱动轮询）。返回取走的全部已封 epoch。
     pub fn seal_expired(&self, now: u64, epoch_secs: u64) -> Vec<SealedEpoch> {
         self.windows.seal_expired(now, epoch_secs)
+    }
+
+    /// 结算一个已封 epoch（TECH_SPEC §6.3 步骤 A-E）：承诺根 → 确定性重排 → 净额 →
+    /// 净额根 → WAL EpochSeal/Netting 记录 → 上链 seam → 修剪意图索引。
+    ///
+    /// 返回 `None` 仅当某 accepted 意图不在索引（不该发生：正常路径已接受意图必在索引；
+    /// 此时放弃本 epoch 并保留索引，避免带洞净额）。调用方应只结算每个 epoch 一次
+    /// （`process_pending` 从密封队列取走即不会重复）。
+    pub fn settle_epoch(&self, se: &SealedEpoch) -> Option<EpochResult> {
+        let mut resolve = |ih: &[u8; 32]| -> Option<([u8; 20], u64)> {
+            self.intents
+                .lock()
+                .expect("intents poisoned")
+                .get(ih)
+                .copied()
+        };
+        let res =
+            crate::lattice::build_epoch(se.epoch_id, se.sealed_at, &se.entries, &mut resolve)?;
+        // WAL 记录（崩溃重放按 epoch_id 跳过已承诺 / 已结算的 epoch）。
+        self.wal
+            .append_epoch_seal(
+                se.epoch_id,
+                res.commitment_root,
+                se.entries.len() as u64,
+                se.sealed_at,
+            )
+            .expect("WAL failure (durability backbone)");
+        self.wal
+            .append_netting(se.epoch_id, res.netting_root, res.net.len() as u64)
+            .expect("WAL failure (durability backbone)");
+        // 上链 seam（S-11 真实交易后端；失败由运营者重试）。
+        self.publisher
+            .commit(se.epoch_id, res.commitment_root, se.sealed_at)
+            .expect("publisher commit failed");
+        self.publisher
+            .settle(se.epoch_id, res.netting_root, res.net.len() as u64)
+            .expect("publisher settle failed");
+        // 修剪已净额意图的索引。
+        let mut idx = self.intents.lock().expect("intents poisoned");
+        for e in &se.entries {
+            idx.remove(&e.intent_hash);
+        }
+        Some(res)
+    }
+
+    /// 取走并结算全部已封 epoch（lattice 驱动轮询入口）。
+    pub fn process_pending(&self) -> Vec<EpochResult> {
+        let sealed = self.windows.take_sealed();
+        sealed.iter().filter_map(|se| self.settle_epoch(se)).collect()
     }
 
     /// 当前已密封但未取走的 epoch 数（测试 / 观测）。
@@ -921,6 +1004,59 @@ mod tests {
         let sealed = agg.seal_expired(now + 61, 60);
         assert_eq!(sealed.len(), 1);
         assert_eq!(sealed[0].entries.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn settle_epoch_produces_net_and_prunes_index() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("settle");
+        let mut cfg = test_cfg();
+        cfg.epoch_capacity = 4;
+        let c = Arc::clone(&clock);
+        let wal = Wal::open(&path, 100_000).unwrap();
+        let agg = Aggregator::with_clock(
+            cfg,
+            Box::new(FormatVerifier),
+            wal,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        );
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        // 3 笔 → 0xAA，1 笔 → 0xBB；第 4 笔填满窗口 → 封 epoch。
+        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now)).accepted);
+        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 20, 2, now)).accepted);
+        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 5, 3, now)).accepted);
+        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 30, 4, now)).accepted);
+        let sealed = agg.take_sealed();
+        assert_eq!(sealed.len(), 1);
+        let res = agg.settle_epoch(&sealed[0]).expect("settle ok");
+        // 净额：AA=10+20+30=60，BB=5；规范序 AA（0xAA）在前。
+        assert_eq!(res.net.len(), 2);
+        assert_eq!(res.net[0].recipient, [0xAA; 20]);
+        assert_eq!(res.net[0].amount, 60);
+        assert_eq!(res.net[1].recipient, [0xBB; 20]);
+        assert_eq!(res.net[1].amount, 5);
+        // 承诺根 / 净额根非零；净额根 = keccak256(abi.encode(net))（lattice 单测锁定字节布局）。
+        assert_ne!(res.commitment_root, [0u8; 32]);
+        assert_ne!(res.netting_root, [0u8; 32]);
+        // WAL 已记录 EpochSeal + Netting（先 flush 缓冲到盘，replay 读文件）。
+        agg.wal.flush().unwrap();
+        let (records, _, truncated) = agg.wal.replay().unwrap();
+        assert!(!truncated);
+        let seal = records
+            .iter()
+            .find(|r| matches!(r, DecodedRecord::EpochSeal { .. }))
+            .expect("epoch seal recorded");
+        assert!(matches!(seal, DecodedRecord::EpochSeal { epoch_id: 0, accepted_count: 4, .. }));
+        let net = records
+            .iter()
+            .find(|r| matches!(r, DecodedRecord::Netting { .. }))
+            .expect("netting recorded");
+        assert!(matches!(net, DecodedRecord::Netting { epoch_id: 0, net_count: 2, .. }));
+        // 索引已修剪：再 settle 同 epoch → 缺失解析 → None（不会重复记账 / 记录）。
+        assert!(agg.settle_epoch(&sealed[0]).is_none());
         let _ = std::fs::remove_file(&path);
     }
 

@@ -14,6 +14,8 @@ pub mod ingest;
 thread_local! {
     static GUARD_DEPTH: Cell<usize> = const { Cell::new(0) };
     static SECTION_ALLOCS: Cell<usize> = const { Cell::new(0) };
+    /// 守卫段内累计分配字节数（B7 内存上界：累计 ≥ 峰值，作保守上界断言 <1GB）。
+    static SECTION_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// 计数分配器：统计当前线程在守卫段内的堆分配次数。
@@ -23,6 +25,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if GUARD_DEPTH.with(|d| d.get()) > 0 {
             SECTION_ALLOCS.with(|c| c.set(c.get() + 1));
+            SECTION_BYTES.with(|b| b.set(b.get() + layout.size()));
         }
         System.alloc(layout)
     }
@@ -34,6 +37,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if GUARD_DEPTH.with(|d| d.get()) > 0 {
             SECTION_ALLOCS.with(|c| c.set(c.get() + 1));
+            SECTION_BYTES.with(|b| b.set(b.get() + layout.size()));
         }
         System.alloc_zeroed(layout)
     }
@@ -41,6 +45,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if GUARD_DEPTH.with(|d| d.get()) > 0 {
             SECTION_ALLOCS.with(|c| c.set(c.get() + 1));
+            SECTION_BYTES.with(|b| b.set(b.get() + new_size));
         }
         System.realloc(ptr, layout, new_size)
     }
@@ -56,6 +61,7 @@ impl NoAllocGuard {
     pub fn new() -> Self {
         GUARD_DEPTH.with(|d| d.set(d.get() + 1));
         SECTION_ALLOCS.with(|c| c.set(0));
+        SECTION_BYTES.with(|b| b.set(0));
         NoAllocGuard
     }
 }
@@ -75,4 +81,9 @@ impl Drop for NoAllocGuard {
 /// 当前守卫段内发生的堆分配次数。
 pub fn section_allocs() -> usize {
     SECTION_ALLOCS.with(|c| c.get())
+}
+
+/// 当前守卫段内累计分配字节数（≥ 峰值驻留；B7 用保守上界）。
+pub fn section_alloc_bytes() -> usize {
+    SECTION_BYTES.with(|b| b.get())
 }

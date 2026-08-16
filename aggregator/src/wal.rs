@@ -12,9 +12,11 @@
 //! 账本一致——未 sync 的尾巴在崩溃中丢失属标准 WAL 语义（agent 幂等重试：nonce 不在重放集
 //! → 重接受，无双重记账）。
 //!
-//! 热路径（`append_intent`）零分配：payload 固定 96B，写在栈上；缓冲**固定预置 8MB**，
-//! `append_raw` 在 extend 前检查剩余容量，不够先 flush——缓冲永不 realloc，内存上界与
-//! `sync_every` 无关（B8 口径，见 TECH_SPEC §8.1 容量预置注记）。
+//! 热路径（`append_intent`）零分配：payload 固定 116B（seq8+intent_hash32+dh32+nonce8+
+//! amount8+now8+recipient20），写在栈上；缓冲**固定预置 8MB**，`append_raw` 在 extend 前检查
+//! 剩余容量，不够先 flush——缓冲永不 realloc，内存上界与 `sync_every` 无关（B8 口径，见
+//! TECH_SPEC §8.1 容量预置注记）。含 recipient：净额指令（按 recipient 聚合）崩溃后必须可从
+//! WAL 重建，intent_hash 只提交 recipient、不含明文。
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -29,8 +31,9 @@ const MAGIC: u16 = 0x4D4D;
 const VERSION: u8 = 1;
 /// 头长度 = magic2 + version1 + kind1 + len4 + crc4。
 const HEADER_LEN: usize = 12;
-/// Intent 记录 payload 固定长度（96B）：seq8 + intent_hash32 + dh32 + nonce8 + amount8 + now8。
-const INTENT_PAYLOAD_LEN: usize = 96;
+/// Intent 记录 payload 固定长度（116B）：seq8 + intent_hash32 + dh32 + nonce8 + amount8 + now8
+/// + recipient20（净额恢复所需）。
+const INTENT_PAYLOAD_LEN: usize = 116;
 /// 单记录最大长度（含头）。Register（JSON 委托）最大规模。
 const MAX_RECORD_LEN: usize = 64 * 1024;
 /// 缓冲固定预置容量（8MB）：append 前检查，不够先 flush → 永不 realloc。
@@ -65,7 +68,7 @@ pub enum DecodedRecord {
     /// 委托注册（DSA 登记事件落 WAL，重放重建注册表）。
     /// 携带 agent 的 Ed25519 公钥（验签快路径密钥；链上事件不含传输层密钥，必须落盘）。
     Register(SignedDelegation, [u8; 32]),
-    /// 已接受意图（重放重建 nonce 集 + 账本 + seq）。
+    /// 已接受意图（重放重建 nonce 集 + 账本 + seq + 意图索引）。
     Intent {
         seq: u64,
         intent_hash: [u8; 32],
@@ -73,6 +76,8 @@ pub enum DecodedRecord {
         spend_nonce: u64,
         amount: u64,
         now: u64,
+        /// 收款方（净额按 recipient 聚合，崩溃后必须可恢复）。
+        recipient: [u8; 20],
     },
     /// epoch 密封（承诺根上链前的记录；重放时用于跳过已承诺 epoch）。
     EpochSeal {
@@ -170,7 +175,7 @@ impl Wal {
         Ok(wal)
     }
 
-    /// 热路径：追加一条已接受意图。payload 固定 96B、零分配。
+    /// 热路径：追加一条已接受意图。payload 固定 116B、零分配。
     #[allow(clippy::too_many_arguments)]
     pub fn append_intent(
         &self,
@@ -180,6 +185,7 @@ impl Wal {
         spend_nonce: u64,
         amount: u64,
         now: u64,
+        recipient: [u8; 20],
     ) -> std::io::Result<()> {
         let mut payload = [0u8; INTENT_PAYLOAD_LEN];
         payload[0..8].copy_from_slice(&seq.to_le_bytes());
@@ -188,6 +194,7 @@ impl Wal {
         payload[72..80].copy_from_slice(&spend_nonce.to_le_bytes());
         payload[80..88].copy_from_slice(&amount.to_le_bytes());
         payload[88..96].copy_from_slice(&now.to_le_bytes());
+        payload[96..116].copy_from_slice(&recipient);
         self.inner.lock().expect("wal poisoned").append_raw(RecordKind::Intent, &payload)
     }
 
@@ -295,6 +302,7 @@ impl Wal {
                     let spend_nonce = u64::from_le_bytes(payload[72..80].try_into().unwrap());
                     let amount = u64::from_le_bytes(payload[80..88].try_into().unwrap());
                     let now = u64::from_le_bytes(payload[88..96].try_into().unwrap());
+                    let recipient: [u8; 20] = payload[96..116].try_into().unwrap();
                     records.push(DecodedRecord::Intent {
                         seq,
                         intent_hash,
@@ -302,6 +310,7 @@ impl Wal {
                         spend_nonce,
                         amount,
                         now,
+                        recipient,
                     });
                 }
                 RecordKind::EpochSeal => {
@@ -398,7 +407,7 @@ mod tests {
         let path = tmp_path("roundtrip");
         let w = Wal::open(&path, 1000).unwrap();
         w.append_register(&sample_sd(), &[0x11; 32]).unwrap();
-        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000).unwrap();
+        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000, [0xEE; 20]).unwrap();
         w.flush().unwrap();
         let (records, valid, truncated) = w.replay().unwrap();
         assert!(!truncated);
@@ -411,6 +420,7 @@ mod tests {
                 spend_nonce,
                 amount,
                 now,
+                recipient,
                 ..
             } => {
                 assert_eq!(*seq, 1);
@@ -418,6 +428,7 @@ mod tests {
                 assert_eq!(*spend_nonce, 5);
                 assert_eq!(*amount, 42);
                 assert_eq!(*now, 1_700_000_000);
+                assert_eq!(*recipient, [0xEE; 20]);
             }
             other => panic!("expected Intent, got {other:?}"),
         }
@@ -429,7 +440,7 @@ mod tests {
         let path = tmp_path("buffered");
         let w = Wal::open(&path, 100_000).unwrap(); // 不自动 fsync
         for seq in 1..=100u64 {
-            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0).unwrap();
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20]).unwrap();
         }
         // 未 flush：内存缓冲，文件未落盘。
         assert_eq!(w.file_len().unwrap(), 0);
@@ -445,7 +456,7 @@ mod tests {
         let path = tmp_path("torn");
         let w = Wal::open(&path, 1000).unwrap();
         for seq in 1..=10u64 {
-            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0).unwrap();
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20]).unwrap();
         }
         w.flush().unwrap();
         let valid = w.file_len().unwrap();
