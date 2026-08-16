@@ -10,14 +10,24 @@ Meridian 做"AI Agent 之间怎么互相花钱、互相信任"的标准 + 参考
 | 文件 | 层级 |
 |---|---|
 | `../Meridian_架构蓝图.md` | 战略 |
-| `../TECH_SPEC.md` | 代码契约 |
+| `../TECH_SPEC.md` | 代码契约（v1.0，Phase 0 定稿） |
 | `../MASTER_PLAN.md` | 总执行计划（单一事实源） |
+| `docs/WHITEPAPER.md` | 对外白皮书（英文，引用 PoC 实测） |
+
+## Phase 0 PoC（已全绿）
+
+| PoC | 内容 | 结果 | 报告 |
+|---|---|---|---|
+| ① ZK 授权凭证 | `spend_authorization` 电路 | 约束 6880 ACIR + 1289 Brillig | TECH_SPEC §5.5 |
+| ② 聚合器吞吐 | 验签→nonce→预算，满核 | **488,738 笔/s**（目标 ≥10 万，4.9×） | `docs/poc/poc-02-aggregator-throughput.md` |
+| ③ 交付证明 | TLSNotary MPC-TLS 选择性披露 | 四条断言 PASS | `docs/poc/poc-03-delivery-proof.md` |
 
 ## Workspace
 
 ```
-core/     DSA 授权原语 + 预算账本（meridian-core）
-bench/    基准基座 + 零分配门禁 + CI gate（meridian-bench）
+core/          DSA 授权原语 + 预算账本（meridian-core）
+bench/         基准基座 + 零分配门禁 + CI gate（meridian-bench）
+poc-delivery/  PoC ③ 交付证明（独立 workspace：tlsn 拉 mpz 大图，不进主 workspace）
 ```
 
 ## 命令
@@ -30,6 +40,10 @@ cargo test --workspace
 cargo run -p meridian-bench --bin gate -- --record          # 记录 baseline
 cargo run -p meridian-bench --bin gate                       # 与 baseline 比较，回归 >1% 退出码 1
 cargo bench -p meridian-bench --no-run                        # criterion 基准编译
+# 吞吐验收
+cargo run -p meridian-bench --bin poc_aggregator -- --check 100000
+# 交付证明复现（首次编译拉 tlsn/mpz 框架，较久）
+cd poc-delivery && cargo run --release
 ```
 
 ## 许可
