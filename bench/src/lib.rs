@@ -3,9 +3,13 @@
 //! 提供：计数分配器 + `NoAllocGuard`（热路径零分配断言，B8）。
 //! 设计：线程本地计数；守卫包裹的代码段内若发生堆分配，`section_allocs()` 可观测。
 //! 由全局分配器计数，测试只读线程本地计数，不做估计。
+//!
+//! `ingest`：PoC ② 聚合器 ingest 原型（验签 → nonce 去重 → 预算记账的吞吐管线）。
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+
+pub mod ingest;
 
 thread_local! {
     static GUARD_DEPTH: Cell<usize> = const { Cell::new(0) };

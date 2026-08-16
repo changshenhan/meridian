@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 meridian-core.workspace = true
+# PoC ② ingest 夹具要用 agent 签名原语现场造意图（与 core 同版本）。
+ed25519-dalek.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
@@ -20,6 +22,11 @@ harness = false
 [[bench]]
 name = "ledger_bench"
 path = "benches/ledger_bench.rs"
+harness = false
+
+[[bench]]
+name = "aggregator_bench"
+path = "benches/aggregator_bench.rs"
 harness = false
 
 [[bin]]

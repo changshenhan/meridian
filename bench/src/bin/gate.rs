@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use meridian_bench::ingest::{measure_single_threaded, Batch, FixtureParams};
 use meridian_core::dsa::{self, AgentSigningKey, Delegation, RateLimit, SpendIntent};
 use meridian_core::ledger::{check_budget, BudgetState};
 
@@ -134,6 +135,16 @@ fn main() {
             bench_per_sec(|| {
                 std::hint::black_box(check_budget(&delegation, &mut state, 1, 0)).ok();
             }),
+        ),
+        // PoC ②（S-08a）：聚合器完整 ingest 快路径（验签→nonce→预算记账）。
+        // 单线程基线；多线程吞吐见 bin/poc_aggregator（10 万笔/秒验收）。
+        // 固定批次一次性处理（nonce 不能跨次复用），见 ingest.rs。
+        (
+            "aggregator_ingest_ops".to_string(),
+            measure_single_threaded(&Batch::build(FixtureParams {
+                n_agents: 32,
+                per_agent: 200,
+            })),
         ),
     ]);
 

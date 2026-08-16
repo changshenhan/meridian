@@ -756,6 +756,7 @@ name = "meridian-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "ed25519-dalek",
  "meridian-core",
  "serde",
  "serde_json",

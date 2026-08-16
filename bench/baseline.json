@@ -3,11 +3,12 @@
   "commit": "local",
   "machine": "windows x86_64",
   "metrics": {
-    "check_budget_ops": 3096765634.411455,
-    "intent_sign_ops": 90239.67658099913,
-    "intent_verify_ops": 42808.182527240984,
-    "sign_delegation_ops": 33265.09553402787,
-    "verify_delegation_ops": 18638.099182272035
+    "aggregator_ingest_ops": 43178.70857879979,
+    "check_budget_ops": 3395397736.4015093,
+    "intent_sign_ops": 92916.8839889342,
+    "intent_verify_ops": 49623.02627514429,
+    "sign_delegation_ops": 34147.903105324935,
+    "verify_delegation_ops": 18294.94079025363
   },
-  "recorded_at_unix": 1786816338
+  "recorded_at_unix": 1786856782
 }
