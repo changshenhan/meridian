@@ -5,14 +5,14 @@ Agent 经济基础设施层 —— 机器商务的结算与信任铁轨。
 Meridian 做"AI Agent 之间怎么互相花钱、互相信任"的标准 + 参考实现 + 基础设施：
 **DSA 授权原语**（Delegated Spend Authority）+ **结算聚合器**。代码以最顶级性能为标准，每一行按"要发表 benchmark"的要求写。
 
-## 文档（三层绑定）
+## 文档
 
 | 文件 | 层级 |
 |---|---|
-| `../Meridian_架构蓝图.md` | 战略 |
-| `../TECH_SPEC.md` | 代码契约（v1.0，Phase 0 定稿） |
-| `../MASTER_PLAN.md` | 总执行计划（单一事实源） |
+| `docs/TECH_SPEC.md` | 代码契约（v1.0，Phase 0 定稿） |
 | `docs/WHITEPAPER.md` | 对外白皮书（英文，引用 PoC 实测） |
+| `docs/why-no-new-chain.md` | 立场文《为什么机器商务不需要新链》 |
+| `docs/poc/*.md` | Phase 0 三个 PoC 实测报告 |
 
 ## Phase 0 PoC（已全绿）
 
