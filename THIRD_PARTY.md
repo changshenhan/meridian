@@ -15,7 +15,22 @@
 | rand | 测试密钥生成 | Apache-2.0 OR MIT |
 | criterion | 基准 | Apache-2.0 OR MIT |
 
-结论：**全部为宽松许可（Apache-2.0 / MIT / BSD-3-Clause），无 GPL 系污染。** 可自由复制、修改、商用；分发时保留各 crate 许可证文本（Cargo 会在 crate 包内自带 LICENSE 文件，遵守即可）。
+**poc-delivery 直接依赖（S-08b，PoC ③ 交付证明）**：
+
+| crate | 用途 | 许可证 |
+|---|---|---|
+| tlsn | 2-party MPC-TLS（TLSNotary） | MIT OR Apache-2.0 |
+| mpz-*（tlsn 底层 MPC 框架） | garbled circuits / OT / cointoss | MIT OR Apache-2.0 |
+| rcgen | 本地测试证书生成（CA+叶） | MIT OR Apache-2.0 |
+| rustls / rustls-webpki | TLS 栈 | Apache-2.0 OR ISC OR MIT / ISC |
+| tokio-rustls | TLS acceptor | MIT OR Apache-2.0 |
+| aws-lc-rs | 密码学 provider（rustls 后端） | ISC AND (Apache-2.0 OR ISC) |
+| hyper / hyper-util / http-body-util | HTTP/1.1 请求-响应 | MIT |
+| bytes / tokio-util / futures | 异步基础 | MIT / MIT OR Apache-2.0 |
+| anyhow | 错误处理 | MIT OR Apache-2.0 |
+| tracing / tracing-subscriber | 日志 | MIT |
+
+结论：**全部为宽松许可（Apache-2.0 / MIT / BSD-3-Clause / ISC），无 GPL 系污染。** 可自由复制、修改、商用；分发时保留各 crate 许可证文本（Cargo 会在 crate 包内自带 LICENSE 文件，遵守即可）。tlsn 与 mpz 为 git 依赖（未上 crates.io），其 LICENSE 声明在各自仓库根（MIT OR Apache-2.0）。
 
 ## 借鉴设计/思路（非代码复制，无需许可证，但记录出处）
 
@@ -26,7 +41,7 @@
 | 意图交易模型 | CoW Protocol | SpendIntent 语义 |
 | 状态通道批量结算 | Lightning / Raiden | 聚合器 epoch 批量净额 |
 | attestation 图 | EAS | L4 信任层（Phase 3） |
-| web 数据交付证明 | TLSNotary / Reclaim | L4 履约证明（Phase 3） |
+| web 数据交付证明 | Reclaim | L4 履约证明备选（Phase 3；TLSNotary 已升级为直接依赖，见上表） |
 | 迭代声誉 | EigenTrust | L4 声誉函数（Phase 3） |
 
 ## 约束
