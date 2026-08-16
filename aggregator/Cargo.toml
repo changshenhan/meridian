@@ -1,17 +1,19 @@
 [package]
-name = "meridian-core"
+name = "meridian-aggregator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
-ed25519-dalek.workspace = true
+meridian-core.workspace = true
 sha2.workspace = true
+sha3.workspace = true
+crc32fast.workspace = true
+rayon.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 rand.workspace = true
-serde_json.workspace = true

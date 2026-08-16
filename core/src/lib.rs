@@ -6,3 +6,4 @@ pub mod attestation;
 pub mod dsa;
 pub mod error;
 pub mod ledger;
+pub mod zk;

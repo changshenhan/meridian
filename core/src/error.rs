@@ -20,6 +20,8 @@ pub enum Error {
     EOrdering,
     /// 双钥绑定验证失败（S-05：Ed25519 对 attestation 公钥的绑定签名 / 承诺不匹配）。
     EAttestBind,
+    /// 委托未注册（S-10：聚合器按 delegation_hash 查注册表，未注册拒绝）。
+    EDelegUnknown,
 }
 
 impl Error {
@@ -41,6 +43,7 @@ impl Error {
             Error::ESeq => "E_SEQ",
             Error::EOrdering => "E_ORDERING",
             Error::EAttestBind => "E_ATTEST_BIND",
+            Error::EDelegUnknown => "E_DELEG_UNKNOWN",
         }
     }
 }

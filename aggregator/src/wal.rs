@@ -1,0 +1,476 @@
+//! 自写追加式 WAL（MASTER_PLAN S-10：`sled` 或自写，不引重型 DB → 自写）。
+//!
+//! 记录格式（固定头 + payload）：
+//! ```text
+//! [magic u16 LE = 0x4D4D][version u8 = 1][kind u8][len u32 LE][crc32 u32 LE][payload len 字节]
+//! ```
+//! 12 字节头 + payload。重放：顺序读、逐条校验和，尾部撕裂（校验和错 / 记录残缺）即停并
+//! 截断到最后一个合法字节（S-10c 的 torn-write 语义）。
+//!
+//! **持久化模型（诚实口径）**：`append_*` 写入内存缓冲，满 `sync_every` 条、缓冲将满、
+//! 或显式 `flush` 才 `sync_data`（批量 fsync）。崩溃恢复保证的是**最后一个 fsync 前缀**的
+//! 账本一致——未 sync 的尾巴在崩溃中丢失属标准 WAL 语义（agent 幂等重试：nonce 不在重放集
+//! → 重接受，无双重记账）。
+//!
+//! 热路径（`append_intent`）零分配：payload 固定 96B，写在栈上；缓冲**固定预置 8MB**，
+//! `append_raw` 在 extend 前检查剩余容量，不够先 flush——缓冲永不 realloc，内存上界与
+//! `sync_every` 无关（B8 口径，见 TECH_SPEC §8.1 容量预置注记）。
+
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::sync::Mutex;
+
+use meridian_core::dsa::SignedDelegation;
+
+/// 记录魔法数（"MM"）。
+const MAGIC: u16 = 0x4D4D;
+/// 格式版本。
+const VERSION: u8 = 1;
+/// 头长度 = magic2 + version1 + kind1 + len4 + crc4。
+const HEADER_LEN: usize = 12;
+/// Intent 记录 payload 固定长度（96B）：seq8 + intent_hash32 + dh32 + nonce8 + amount8 + now8。
+const INTENT_PAYLOAD_LEN: usize = 96;
+/// 单记录最大长度（含头）。Register（JSON 委托）最大规模。
+const MAX_RECORD_LEN: usize = 64 * 1024;
+/// 缓冲固定预置容量（8MB）：append 前检查，不够先 flush → 永不 realloc。
+/// 上界固定，与 `sync_every` 解耦（避免 sync_every 大时天文内存）。
+const WAL_BUFFER_CAP: usize = 8 * 1024 * 1024;
+
+/// 记录类型。
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordKind {
+    Register = 1,
+    Intent = 2,
+    EpochSeal = 3,
+    Netting = 4,
+}
+
+impl RecordKind {
+    fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1 => RecordKind::Register,
+            2 => RecordKind::Intent,
+            3 => RecordKind::EpochSeal,
+            4 => RecordKind::Netting,
+            _ => return None,
+        })
+    }
+}
+
+/// 重放解码后的记录（恢复侧用）。
+#[derive(Debug, Clone)]
+pub enum DecodedRecord {
+    /// 委托注册（DSA 登记事件落 WAL，重放重建注册表）。
+    /// 携带 agent 的 Ed25519 公钥（验签快路径密钥；链上事件不含传输层密钥，必须落盘）。
+    Register(SignedDelegation, [u8; 32]),
+    /// 已接受意图（重放重建 nonce 集 + 账本 + seq）。
+    Intent {
+        seq: u64,
+        intent_hash: [u8; 32],
+        delegation_hash: [u8; 32],
+        spend_nonce: u64,
+        amount: u64,
+        now: u64,
+    },
+    /// epoch 密封（承诺根上链前的记录；重放时用于跳过已承诺 epoch）。
+    EpochSeal {
+        epoch_id: u64,
+        commitment_root: [u8; 32],
+        accepted_count: u64,
+        sealed_at: u64,
+    },
+    /// 净额结果（settle 记录；重放时用于跳过已结算 epoch）。
+    Netting {
+        epoch_id: u64,
+        netting_root: [u8; 32],
+        net_count: u64,
+    },
+}
+
+struct WalInner {
+    file: File,
+    buf: Vec<u8>,
+    buf_len: usize,
+    records_buffered: usize,
+    sync_every: usize,
+}
+
+impl WalInner {
+    fn flush_locked(&mut self) -> std::io::Result<()> {
+        if self.buf_len > 0 {
+            self.file.write_all(&self.buf[..self.buf_len])?;
+            self.file.sync_data()?;
+            self.buf_len = 0;
+            self.records_buffered = 0;
+        }
+        Ok(())
+    }
+
+    fn append_raw(&mut self, kind: RecordKind, payload: &[u8]) -> std::io::Result<()> {
+        debug_assert!(payload.len() <= MAX_RECORD_LEN, "record too large");
+        let added = HEADER_LEN + payload.len();
+        // 缓冲将满先 flush——保证 extend 永不超出预置容量 → 永不 realloc（B8）。
+        if self.buf_len + added > self.buf.capacity() {
+            self.flush_locked()?;
+        }
+        let mut header = [0u8; HEADER_LEN];
+        header[0..2].copy_from_slice(&MAGIC.to_le_bytes());
+        header[2] = VERSION;
+        header[3] = kind as u8;
+        header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let crc = crc32fast::hash(payload);
+        header[8..12].copy_from_slice(&crc.to_le_bytes());
+        self.buf.extend_from_slice(&header);
+        self.buf.extend_from_slice(payload);
+        self.buf_len += added;
+        self.records_buffered += 1;
+        if self.records_buffered >= self.sync_every {
+            self.flush_locked()?;
+        }
+        Ok(())
+    }
+}
+
+/// 追加式 WAL。线程安全（内部 Mutex）；热路径零分配。
+pub struct Wal {
+    inner: Mutex<WalInner>,
+}
+
+impl Wal {
+    /// 打开（不存在则创建）追加式 WAL。`sync_every` 条记录批量 fsync 一次。
+    ///
+    /// 用 `write(true)` 而非 `append(true)`：Windows 上 append 只给 `FILE_APPEND_DATA`，
+    /// `set_len`（撕裂尾截断）需要 `FILE_WRITE_DATA`。写入位置由内部 Mutex 串行化维护——
+    /// 所有会移动位置的操作用完都 seek 回文件尾（见各方法）。
+    pub fn open(path: &Path, sync_every: usize) -> std::io::Result<Self> {
+        // truncate(false)：恢复 WAL 必须保留既有记录（重放的前提），绝不可在打开时清空。
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let buf = Vec::with_capacity(WAL_BUFFER_CAP);
+        let wal = Wal {
+            inner: Mutex::new(WalInner {
+                file,
+                buf,
+                buf_len: 0,
+                records_buffered: 0,
+                sync_every: sync_every.max(1),
+            }),
+        };
+        wal.inner
+            .lock()
+            .expect("wal poisoned")
+            .file
+            .seek(SeekFrom::End(0))?; // 追加位置（对既有文件）
+        Ok(wal)
+    }
+
+    /// 热路径：追加一条已接受意图。payload 固定 96B、零分配。
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_intent(
+        &self,
+        seq: u64,
+        intent_hash: [u8; 32],
+        delegation_hash: [u8; 32],
+        spend_nonce: u64,
+        amount: u64,
+        now: u64,
+    ) -> std::io::Result<()> {
+        let mut payload = [0u8; INTENT_PAYLOAD_LEN];
+        payload[0..8].copy_from_slice(&seq.to_le_bytes());
+        payload[8..40].copy_from_slice(&intent_hash);
+        payload[40..72].copy_from_slice(&delegation_hash);
+        payload[72..80].copy_from_slice(&spend_nonce.to_le_bytes());
+        payload[80..88].copy_from_slice(&amount.to_le_bytes());
+        payload[88..96].copy_from_slice(&now.to_le_bytes());
+        self.inner.lock().expect("wal poisoned").append_raw(RecordKind::Intent, &payload)
+    }
+
+    /// 冷路径：委托注册（serde_json，确定性）。`agent_pub` 是 agent 的 Ed25519 公钥
+    /// （验签快路径密钥）；与委托绑定为一条记录（无 agent_pub 的登记无法恢复验签能力）。
+    pub fn append_register(
+        &self,
+        sd: &SignedDelegation,
+        agent_pub: &[u8; 32],
+    ) -> std::io::Result<()> {
+        let payload = serde_json::to_vec(&(sd, agent_pub)).expect("SignedDelegation serializable");
+        self.inner.lock().expect("wal poisoned").append_raw(RecordKind::Register, &payload)
+    }
+
+    /// 冷路径：epoch 密封记录。
+    pub fn append_epoch_seal(
+        &self,
+        epoch_id: u64,
+        commitment_root: [u8; 32],
+        accepted_count: u64,
+        sealed_at: u64,
+    ) -> std::io::Result<()> {
+        let mut payload = [0u8; 56];
+        payload[0..8].copy_from_slice(&epoch_id.to_le_bytes());
+        payload[8..40].copy_from_slice(&commitment_root);
+        payload[40..48].copy_from_slice(&accepted_count.to_le_bytes());
+        payload[48..56].copy_from_slice(&sealed_at.to_le_bytes());
+        self.inner.lock().expect("wal poisoned").append_raw(RecordKind::EpochSeal, &payload)
+    }
+
+    /// 冷路径：净额结果记录。
+    pub fn append_netting(
+        &self,
+        epoch_id: u64,
+        netting_root: [u8; 32],
+        net_count: u64,
+    ) -> std::io::Result<()> {
+        let mut payload = [0u8; 48];
+        payload[0..8].copy_from_slice(&epoch_id.to_le_bytes());
+        payload[8..40].copy_from_slice(&netting_root);
+        payload[40..48].copy_from_slice(&net_count.to_le_bytes());
+        self.inner.lock().expect("wal poisoned").append_raw(RecordKind::Netting, &payload)
+    }
+
+    /// 批量 fsync 到盘。
+    pub fn flush(&self) -> std::io::Result<()> {
+        self.inner.lock().expect("wal poisoned").flush_locked()
+    }
+
+    /// 从文件头重放全部合法记录。返回 `(记录, valid_bytes, 是否截断了撕裂尾部)`。
+    ///
+    /// 遇到第一个校验和错 / 记录残缺即停，`valid_bytes` = 该处字节偏移（合法前缀长度），
+    /// 调用方用 `truncate_to(valid_bytes)` 截掉尾部（恢复路径做）。
+    pub fn replay(&self) -> std::io::Result<(Vec<DecodedRecord>, u64, bool)> {
+        let mut inner = self.inner.lock().expect("wal poisoned");
+        inner.file.seek(SeekFrom::Start(0))?;
+        let mut raw = Vec::new();
+        inner.file.read_to_end(&mut raw)?;
+        inner.file.seek(SeekFrom::End(0))?; // 恢复 append 位置
+        drop(inner);
+
+        let mut records = Vec::new();
+        let mut pos = 0usize;
+        let mut truncated = false;
+        while pos + HEADER_LEN <= raw.len() {
+            let magic = u16::from_le_bytes([raw[pos], raw[pos + 1]]);
+            let version = raw[pos + 2];
+            let kind = raw[pos + 3];
+            let len = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let crc = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap());
+            if magic != MAGIC || version != VERSION || len > MAX_RECORD_LEN {
+                truncated = true;
+                break;
+            }
+            if pos + HEADER_LEN + len > raw.len() {
+                truncated = true; // 记录残缺（撕裂尾）
+                break;
+            }
+            let payload = &raw[pos + HEADER_LEN..pos + HEADER_LEN + len];
+            if crc32fast::hash(payload) != crc {
+                truncated = true;
+                break;
+            }
+            let kind = match RecordKind::from_u8(kind) {
+                Some(k) => k,
+                None => {
+                    truncated = true;
+                    break;
+                }
+            };
+            match kind {
+                RecordKind::Register => {
+                    let (sd, agent_pub): (SignedDelegation, [u8; 32]) =
+                        serde_json::from_slice(payload).map_err(std::io::Error::other)?;
+                    records.push(DecodedRecord::Register(sd, agent_pub));
+                }
+                RecordKind::Intent => {
+                    if len != INTENT_PAYLOAD_LEN {
+                        truncated = true;
+                        break;
+                    }
+                    let seq = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                    let intent_hash = payload[8..40].try_into().unwrap();
+                    let dh = payload[40..72].try_into().unwrap();
+                    let spend_nonce = u64::from_le_bytes(payload[72..80].try_into().unwrap());
+                    let amount = u64::from_le_bytes(payload[80..88].try_into().unwrap());
+                    let now = u64::from_le_bytes(payload[88..96].try_into().unwrap());
+                    records.push(DecodedRecord::Intent {
+                        seq,
+                        intent_hash,
+                        delegation_hash: dh,
+                        spend_nonce,
+                        amount,
+                        now,
+                    });
+                }
+                RecordKind::EpochSeal => {
+                    if len != 56 {
+                        truncated = true;
+                        break;
+                    }
+                    let epoch_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                    let commitment_root = payload[8..40].try_into().unwrap();
+                    let accepted_count = u64::from_le_bytes(payload[40..48].try_into().unwrap());
+                    let sealed_at = u64::from_le_bytes(payload[48..56].try_into().unwrap());
+                    records.push(DecodedRecord::EpochSeal {
+                        epoch_id,
+                        commitment_root,
+                        accepted_count,
+                        sealed_at,
+                    });
+                }
+                RecordKind::Netting => {
+                    if len != 48 {
+                        truncated = true;
+                        break;
+                    }
+                    let epoch_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                    let netting_root = payload[8..40].try_into().unwrap();
+                    let net_count = u64::from_le_bytes(payload[40..48].try_into().unwrap());
+                    records.push(DecodedRecord::Netting {
+                        epoch_id,
+                        netting_root,
+                        net_count,
+                    });
+                }
+            }
+            pos += HEADER_LEN + len;
+        }
+        let valid_bytes = if truncated { pos as u64 } else { raw.len() as u64 };
+        Ok((records, valid_bytes, truncated))
+    }
+
+    /// 截断到 `valid_bytes`（去掉撕裂尾部）。返回实际截断到的字节数。
+    ///
+    /// 不先 flush：缓冲中未落盘的记录比 `valid_bytes` 新，应保留在内存缓冲里，截断后随下次
+    /// flush 写到新文件尾。截断后 seek 回文件尾（Windows 上 set_len 不动位置指针）。
+    pub fn truncate_to(&self, valid_bytes: u64) -> std::io::Result<u64> {
+        let mut inner = self.inner.lock().expect("wal poisoned");
+        let cur = inner.file.metadata()?.len();
+        let target = valid_bytes.min(cur);
+        inner.file.set_len(target)?;
+        inner.file.seek(SeekFrom::End(0))?;
+        Ok(target)
+    }
+
+    pub fn file_len(&self) -> std::io::Result<u64> {
+        Ok(self.inner.lock().expect("wal poisoned").file.metadata()?.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use meridian_core::dsa::{sign_delegation, Delegation, RateLimit, owner_signing_key_from_bytes};
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("meridian-wal-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn sample_sd() -> SignedDelegation {
+        let d = Delegation {
+            agent: [1u8; 20],
+            owner: [2u8; 20],
+            nonce: 7,
+            max_per_spend: 100,
+            rate: RateLimit {
+                window_secs: 60,
+                max_per_window: 1_000,
+            },
+            total_cap: 10_000,
+            categories: vec![],
+            not_before: 0,
+            expires_at: u64::MAX,
+            version: 1,
+        };
+        let key = owner_signing_key_from_bytes([7u8; 32]);
+        sign_delegation(&d, &key)
+    }
+
+    #[test]
+    fn append_and_replay_roundtrip() {
+        let path = tmp_path("roundtrip");
+        let w = Wal::open(&path, 1000).unwrap();
+        w.append_register(&sample_sd(), &[0x11; 32]).unwrap();
+        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000).unwrap();
+        w.flush().unwrap();
+        let (records, valid, truncated) = w.replay().unwrap();
+        assert!(!truncated);
+        assert_eq!(valid, w.file_len().unwrap());
+        assert_eq!(records.len(), 2);
+        match &records[1] {
+            DecodedRecord::Intent {
+                seq,
+                intent_hash,
+                spend_nonce,
+                amount,
+                now,
+                ..
+            } => {
+                assert_eq!(*seq, 1);
+                assert_eq!(*intent_hash, [0xAB; 32]);
+                assert_eq!(*spend_nonce, 5);
+                assert_eq!(*amount, 42);
+                assert_eq!(*now, 1_700_000_000);
+            }
+            other => panic!("expected Intent, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn buffered_records_replay_after_flush() {
+        let path = tmp_path("buffered");
+        let w = Wal::open(&path, 100_000).unwrap(); // 不自动 fsync
+        for seq in 1..=100u64 {
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0).unwrap();
+        }
+        // 未 flush：内存缓冲，文件未落盘。
+        assert_eq!(w.file_len().unwrap(), 0);
+        w.flush().unwrap();
+        let (records, _, truncated) = w.replay().unwrap();
+        assert!(!truncated);
+        assert_eq!(records.len(), 100);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn torn_tail_is_truncated_on_replay() {
+        let path = tmp_path("torn");
+        let w = Wal::open(&path, 1000).unwrap();
+        for seq in 1..=10u64 {
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0).unwrap();
+        }
+        w.flush().unwrap();
+        let valid = w.file_len().unwrap();
+
+        // 手工追加一条残缺记录（头完整、payload 只写一半 → crc 不过/长度不足）。
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        let mut header = [0u8; HEADER_LEN];
+        header[0..2].copy_from_slice(&MAGIC.to_le_bytes());
+        header[2] = VERSION;
+        header[3] = RecordKind::Intent as u8;
+        header[4..8].copy_from_slice(&(INTENT_PAYLOAD_LEN as u32).to_le_bytes());
+        header[8..12].copy_from_slice(&0u32.to_le_bytes()); // 错 crc
+        f.write_all(&header).unwrap();
+        f.write_all(&[0u8; 10]).unwrap(); // payload 残缺
+        drop(f);
+
+        let (records, valid_bytes, truncated) = w.replay().unwrap();
+        assert!(truncated);
+        assert_eq!(records.len(), 10, "撕裂尾前的 10 条完好");
+        assert_eq!(valid_bytes, valid);
+        let new_len = w.truncate_to(valid).unwrap();
+        assert_eq!(new_len, valid);
+        let (records2, _, truncated2) = w.replay().unwrap();
+        assert!(!truncated2);
+        assert_eq!(records2.len(), 10);
+        let _ = std::fs::remove_file(&path);
+    }
+}
