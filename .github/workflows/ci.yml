@@ -83,7 +83,7 @@ jobs:
 
       # S-09 正式电路端到端：gen-witness（Noir 内确定性签名 + 撤销树）→ 正式电路
       # prove/verify/公共输入回读(121)/负向篡改 → B2/B3/B4 计时基线 + 约束门禁(<2^18)
-      # → bb contract EVM 验证器（Phase 4 复用）。smoke 保持 TEMPORARY 原状不动。
+      # → bb write_solidity_verifier EVM 验证器（Phase 4 复用）。smoke 保持 TEMPORARY 原状不动。
       - name: formal — gen-witness → prove → verify → readback → negative → bench → EVM verifier
         run: |
           bash scripts/formal_zk.sh

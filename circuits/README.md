@@ -89,9 +89,12 @@ BN254 域，单射；断言 9 在电路内钉死完整 intent_hash → 无 mod-p
 
 ## 约束数记录（S-05 验收 + S-09 正式门禁）
 
-- **位置**：CI `noir` job 的 `nargo info` 输出 + 正式管线 `bb info`（formal_bench.py）。
+- **位置**：CI `noir` job 的 `nargo info` 输出 + 正式管线 `bb gates`（formal_bench.py）。
 - 记录方式：首次 CI 绿后，把约束数回填到 TECH_SPEC §5.5 预算表（约束目标 < 2^18）。
-- **硬门禁**：formal_bench.py 断言 `bb info` gate count < 2^18，超了 CI 红。
+- **硬门禁**：formal_bench.py 断言 `bb gates` 的 circuit_size < 2^18，超了 CI 红。
+- **bb 子命令名（CI run 31933654531 实测）**：bb 6.0.0-nightly.20260724 无 `info` / `contract`
+  子命令，门数用 `bb gates -b <acir>`（输出 `{"functions":[{"circuit_size":G}]}`），
+  EVM 验证器用 `bb write_solidity_verifier -k vk -o out.sol`。升级 bb 需复查子命令名。
 - 每次电路改动：约束数变化需在 PR 描述里说明，避免无解释的膨胀。
 
 ## `gen-witness/` — 正式电路 witness 生成器（S-09c）
@@ -117,7 +120,7 @@ modulo"），且 `ScalarField` 无算符、`base4_slices` 为 `pub(crate)`——
 
 `gen-witness → Prover.toml → nargo execute → bb write_vk/prove/verify → 公共输入回读
 （121 fields，formal_readback.py）→ 负向篡改（spend_nonce → 求解必失败）→ B2/B3/B4 计时
-基线 + 约束门禁（formal_bench.py）→ `bb contract` EVM 验证器（`circuits/artifacts/`，
+基线 + 约束门禁（formal_bench.py）→ `bb write_solidity_verifier` EVM 验证器（`circuits/artifacts/`，
 Phase 4 复用）。B2 证明 p50<1s / B3 单验证 p99<10ms（bb CLI 进程含开销上界）/ B4 批验证
 摊薄待 Phase 4 in-process wrapper。基线报告 `circuits/bench/baseline_s09.json` 由 CI
 upload-artifact 交付。smoke 保持 TEMPORARY 原状，不作为正式基线。

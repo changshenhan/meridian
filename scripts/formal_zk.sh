@@ -3,7 +3,7 @@
 #   gen-witness（Noir 内确定性 EdDSA 挑战 eddsa_challenge + 撤销稀疏树）→
 #   build 脚本（Python 大整数算签名标量 s）→ circuits/Prover.toml →
 #   nargo execute → bb write_vk/prove/verify → 公共输入回读(121) → 负向篡改 →
-#   B2/B3/B4 计时基线 + 约束门禁 → bb contract（EVM 验证器，Phase 4 复用）。
+#   B2/B3/B4 计时基线 + 约束门禁 → bb write_solidity_verifier（EVM 验证器，Phase 4 复用）。
 # 非 TEMPORARY：正式电路的回归 + 基准管线（区别于 smoke 的 S-05 冒烟脚手架）。
 set -euo pipefail
 
@@ -50,8 +50,8 @@ echo "[formal] negative OK"
 echo "[formal] 7/8 B2/B3/B4 timing baseline + constraint gate"
 python3 "$ROOT/scripts/formal_bench.py" "$ROOT/circuits"
 
-echo "[formal] 8/8 EVM verifier (bb contract, Phase 4 reuse)"
+echo "[formal] 8/8 EVM verifier (bb write_solidity_verifier, Phase 4 reuse)"
 mkdir -p "$ROOT/circuits/artifacts"
-( cd "$ROOT/circuits" && bb contract -k target/vk -o artifacts/UltraVerifier.sol )
+( cd "$ROOT/circuits" && bb write_solidity_verifier -k target/vk -o artifacts/UltraVerifier.sol )
 ls -la "$ROOT/circuits/artifacts"
 echo "[formal] pipeline OK"
