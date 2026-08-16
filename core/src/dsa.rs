@@ -130,26 +130,6 @@ fn canonical_delegation(d: &Delegation) -> Vec<u8> {
     out
 }
 
-fn canonical_intent(i: &SpendIntent) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6 + 20 + 32 + 20 + 8 + 32 + 8 + 1 + 32 + 8);
-    out.extend_from_slice(INTENT_PREFIX);
-    out.extend_from_slice(&i.agent);
-    out.extend_from_slice(&i.delegation_hash);
-    out.extend_from_slice(&i.recipient);
-    push_u64(&mut out, i.amount);
-    out.extend_from_slice(&i.category);
-    push_u64(&mut out, i.spend_nonce);
-    match i.memo {
-        Some(m) => {
-            push_u8(&mut out, 0x01);
-            out.extend_from_slice(&m);
-        }
-        None => push_u8(&mut out, 0x00),
-    }
-    push_u64(&mut out, i.expires_at);
-    out
-}
-
 fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -169,8 +149,28 @@ pub fn delegation_hash(d: &Delegation) -> [u8; 32] {
 }
 
 /// SpendIntent 的规范哈希（agent 签名对象）。
+///
+/// 零分配实现：规范字节直接流入 Sha256（与 `canonical_intent` 的字节序列逐字节一致，
+/// golden vector 不变）——`submit` 热路径每笔调用两次（管线 + `verify_intent`），
+/// Vec 中转会破坏 B8 零分配验收。
 pub fn intent_hash(i: &SpendIntent) -> [u8; 32] {
-    sha256(&canonical_intent(i))
+    let mut h = Sha256::new();
+    h.update(INTENT_PREFIX);
+    h.update(i.agent);
+    h.update(i.delegation_hash);
+    h.update(i.recipient);
+    h.update(i.amount.to_le_bytes());
+    h.update(i.category);
+    h.update(i.spend_nonce.to_le_bytes());
+    match &i.memo {
+        Some(m) => {
+            h.update([0x01u8]);
+            h.update(m);
+        }
+        None => h.update([0x00u8]),
+    }
+    h.update(i.expires_at.to_le_bytes());
+    h.finalize().into()
 }
 
 /// ZK 授权绑定哈希（S-09，电路内断言 9 的意图字段级绑定对象）。

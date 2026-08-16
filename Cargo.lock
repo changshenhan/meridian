@@ -818,8 +818,10 @@ dependencies = [
  "ed25519-dalek",
  "meridian-aggregator",
  "meridian-core",
+ "rayon",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

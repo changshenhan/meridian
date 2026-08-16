@@ -387,7 +387,7 @@ impl Aggregator {
         verifier: Box<dyn SpendVerifier + Send + Sync>,
         wal: Wal,
     ) -> Self {
-        Self::build(cfg, verifier, wal, default_now(), None)
+        Self::build(cfg, verifier, wal, default_now(), None, 0)
     }
 
     /// 可控时钟构造（测试）。
@@ -397,17 +397,46 @@ impl Aggregator {
         wal: Wal,
         now_fn: Box<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
-        Self::build(cfg, verifier, wal, now_fn, None)
+        Self::build(cfg, verifier, wal, now_fn, None, 0)
     }
 
-    /// B8 容量预置构造：分片桶位按预期委托数预分配（`register` 再逐委托 provision）。
+    /// B8 验收用构造：可控时钟（agg_sim 固定 now 做时间密封）+ 容量预置
+    /// （委托数 / 接受数，稳态插入零分配）。基准专用；测试与运维用上面两个即可。
+    pub fn with_capacity_and_clock(
+        cfg: IngestConfig,
+        verifier: Box<dyn SpendVerifier + Send + Sync>,
+        wal: Wal,
+        now_fn: Box<dyn Fn() -> u64 + Send + Sync>,
+        delegations_expected: usize,
+        intents_expected: usize,
+    ) -> Self {
+        Self::build(
+            cfg,
+            verifier,
+            wal,
+            now_fn,
+            Some(delegations_expected),
+            intents_expected,
+        )
+    }
+
+    /// B8 容量预置构造：分片桶位按预期委托数预分配（`register` 再逐委托 provision），
+    /// 意图索引按预期接受数预分配（`submit` 的 HashMap insert 在稳态零分配的关键）。
     pub fn with_capacity(
         cfg: IngestConfig,
         verifier: Box<dyn SpendVerifier + Send + Sync>,
         wal: Wal,
         delegations_expected: usize,
+        intents_expected: usize,
     ) -> Self {
-        Self::build(cfg, verifier, wal, default_now(), Some(delegations_expected))
+        Self::build(
+            cfg,
+            verifier,
+            wal,
+            default_now(),
+            Some(delegations_expected),
+            intents_expected,
+        )
     }
 
     fn build(
@@ -416,6 +445,7 @@ impl Aggregator {
         wal: Wal,
         now_fn: Box<dyn Fn() -> u64 + Send + Sync>,
         delegations_expected: Option<usize>,
+        intents_expected: usize,
     ) -> Self {
         let now = now_fn();
         let epoch_capacity = cfg.epoch_capacity;
@@ -430,7 +460,7 @@ impl Aggregator {
             windows: WindowManager::new(epoch_capacity, now),
             verifier,
             wal,
-            intents: Mutex::new(HashMap::new()),
+            intents: Mutex::new(HashMap::with_capacity(intents_expected)),
             publisher: Box::new(NoopPublisher),
             seq: AtomicU64::new(0),
             now_fn,
@@ -453,7 +483,7 @@ impl Aggregator {
         if truncated {
             wal.truncate_to(valid_bytes)?;
         }
-        let agg = Self::build(cfg.clone(), verifier, wal, now_fn, None);
+        let agg = Self::build(cfg.clone(), verifier, wal, now_fn, None, 0);
 
         // 1. 注册表 + provision。
         for rec in &records {
@@ -551,9 +581,15 @@ impl Aggregator {
         self.wal
             .append_register(&sd, &agent_pub.to_bytes())
             .expect("WAL failure (durability backbone)");
-        self.registry
-            .register(dh, RegisteredDelegation { delegation: sd.delegation, agent_pub });
-        self.state.provision(&dh, self.cfg.nonce_capacity_per_delegation);
+        self.registry.register(
+            dh,
+            RegisteredDelegation {
+                delegation: sd.delegation,
+                agent_pub,
+            },
+        );
+        self.state
+            .provision(&dh, self.cfg.nonce_capacity_per_delegation);
     }
 
     /// 摄取单条意图（TECH_SPEC §6.2 管线，见模块文档）。永远返回 `Receipt`（不 panic，除非 WAL 失败）。
@@ -629,11 +665,7 @@ impl Aggregator {
     }
 
     /// 批量摄取（rayon 有界线程池，MASTER_PLAN 技术源）。返回与输入等长的回执数组。
-    pub fn submit_batch(
-        &self,
-        pool: &rayon::ThreadPool,
-        envs: &[IntentEnvelope],
-    ) -> Vec<Receipt> {
+    pub fn submit_batch(&self, pool: &rayon::ThreadPool, envs: &[IntentEnvelope]) -> Vec<Receipt> {
         use rayon::prelude::*;
         pool.install(|| envs.par_iter().map(|env| self.submit(env)).collect())
     }
@@ -697,7 +729,10 @@ impl Aggregator {
     /// 取走并结算全部已封 epoch（lattice 驱动轮询入口）。
     pub fn process_pending(&self) -> Vec<EpochResult> {
         let sealed = self.windows.take_sealed();
-        sealed.iter().filter_map(|se| self.settle_epoch(se)).collect()
+        sealed
+            .iter()
+            .filter_map(|se| self.settle_epoch(se))
+            .collect()
     }
 
     /// 当前已密封但未取走的 epoch 数（测试 / 观测）。
@@ -739,7 +774,11 @@ mod tests {
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("meridian-ingest-test-{}-{}", name, std::process::id()));
+        p.push(format!(
+            "meridian-ingest-test-{}-{}",
+            name,
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -854,7 +893,12 @@ mod tests {
         assert_eq!(agg.total_spent(&dh), Some(60));
         assert_eq!(agg.nonce_count(&dh), Some(3));
         // 回执的 intent_hash 与意图一致。
-        assert_eq!(r1.intent_hash, meridian_core::dsa::intent_hash(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now).intent));
+        assert_eq!(
+            r1.intent_hash,
+            meridian_core::dsa::intent_hash(
+                &make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now).intent
+            )
+        );
         let _ = agent_pub;
         let _ = std::fs::remove_file(&path);
     }
@@ -937,8 +981,14 @@ mod tests {
         agg.register(sd, agent_key.verifying_key());
         let dh = meridian_core::dsa::delegation_hash(&d);
         let now = clock.load(Ordering::Relaxed);
-        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 60, 1, now)).accepted);
-        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 40, 2, now)).accepted);
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 60, 1, now))
+                .accepted
+        );
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 40, 2, now))
+                .accepted
+        );
         let r3 = agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xCC; 20], 10, 3, now));
         assert!(!r3.accepted);
         assert_eq!(r3.reject_reason, Some(Error::EBudgetTotal));
@@ -1035,7 +1085,15 @@ mod tests {
         let now = clock.load(Ordering::Relaxed);
         // 第 4 笔填满窗口 → 第 5 笔前自动封窗。
         for i in 0..6 {
-            let r = agg.submit(&make_env(dh, [1u8; 20], &agent_key, [i as u8; 20], 1, i + 1, now));
+            let r = agg.submit(&make_env(
+                dh,
+                [1u8; 20],
+                &agent_key,
+                [i as u8; 20],
+                1,
+                i + 1,
+                now,
+            ));
             assert!(r.accepted, "intent {i} should accept");
         }
         let sealed = agg.take_sealed();
@@ -1043,7 +1101,10 @@ mod tests {
         assert_eq!(sealed[0].epoch_id, 0);
         assert_eq!(sealed[0].entries.len(), 4);
         // 条目按 seq 升序。
-        assert_eq!(sealed[0].entries.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            sealed[0].entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1055,7 +1116,10 @@ mod tests {
         let (dh, _) = register_default(&agg, [1u8; 20]);
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let now = clock.load(Ordering::Relaxed);
-        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 1, 1, now)).accepted);
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 1, 1, now))
+                .accepted
+        );
         assert!(agg.pending_sealed() == 0);
         // 时间到点（epoch_secs=60）。
         clock.store(now + 61, Ordering::Relaxed);
@@ -1083,10 +1147,22 @@ mod tests {
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let now = clock.load(Ordering::Relaxed);
         // 3 笔 → 0xAA，1 笔 → 0xBB；第 4 笔填满窗口 → 封 epoch。
-        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now)).accepted);
-        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 20, 2, now)).accepted);
-        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 5, 3, now)).accepted);
-        assert!(agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 30, 4, now)).accepted);
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now))
+                .accepted
+        );
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 20, 2, now))
+                .accepted
+        );
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 5, 3, now))
+                .accepted
+        );
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 30, 4, now))
+                .accepted
+        );
         let sealed = agg.take_sealed();
         assert_eq!(sealed.len(), 1);
         let res = agg.settle_epoch(&sealed[0]).expect("settle ok");
@@ -1107,12 +1183,26 @@ mod tests {
             .iter()
             .find(|r| matches!(r, DecodedRecord::EpochSeal { .. }))
             .expect("epoch seal recorded");
-        assert!(matches!(seal, DecodedRecord::EpochSeal { epoch_id: 0, accepted_count: 4, .. }));
+        assert!(matches!(
+            seal,
+            DecodedRecord::EpochSeal {
+                epoch_id: 0,
+                accepted_count: 4,
+                ..
+            }
+        ));
         let net = records
             .iter()
             .find(|r| matches!(r, DecodedRecord::Netting { .. }))
             .expect("netting recorded");
-        assert!(matches!(net, DecodedRecord::Netting { epoch_id: 0, net_count: 2, .. }));
+        assert!(matches!(
+            net,
+            DecodedRecord::Netting {
+                epoch_id: 0,
+                net_count: 2,
+                ..
+            }
+        ));
         // 索引已修剪：再 settle 同 epoch → 缺失解析 → None（不会重复记账 / 记录）。
         assert!(agg.settle_epoch(&sealed[0]).is_none());
         let _ = std::fs::remove_file(&path);
@@ -1132,7 +1222,15 @@ mod tests {
             let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
             agg.register(sd, agent_key.verifying_key());
             for i in 0..3 {
-                let r = agg.submit(&make_env(dh, [1u8; 20], &agent_key, [i as u8; 20], 5, i + 1, now));
+                let r = agg.submit(&make_env(
+                    dh,
+                    [1u8; 20],
+                    &agent_key,
+                    [i as u8; 20],
+                    5,
+                    i + 1,
+                    now,
+                ));
                 assert!(r.accepted);
             }
             agg.wal.flush().unwrap();
@@ -1224,7 +1322,15 @@ mod tests {
             agg.register(sd, agent_key.verifying_key());
             // 3 笔有效 + 1 笔超预算（101 > 100）+ 1 笔重复 nonce（2 已用）。
             for (amt, nonce) in [(10u64, 1u64), (20, 2), (30, 3)] {
-                let env = make_env(dh, [1u8; 20], &agent_key, [nonce as u8; 20], amt, nonce, now);
+                let env = make_env(
+                    dh,
+                    [1u8; 20],
+                    &agent_key,
+                    [nonce as u8; 20],
+                    amt,
+                    nonce,
+                    now,
+                );
                 let r = agg.submit(&env);
                 assert!(r.accepted);
                 expected.push((true, meridian_core::dsa::intent_hash(&env.intent), amt));
@@ -1321,7 +1427,11 @@ mod tests {
         let sealed = agg2.take_sealed();
         assert_eq!(sealed.len(), 1, "window sealed after 4th intent");
         assert_eq!(sealed[0].epoch_id, 0, "no prior seal → epoch 0");
-        assert_eq!(sealed[0].entries.len(), 4, "tail (3) + new (1) all in commitment");
+        assert_eq!(
+            sealed[0].entries.len(),
+            4,
+            "tail (3) + new (1) all in commitment"
+        );
         assert_eq!(
             sealed[0].entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
             vec![0, 1, 2, 3]
@@ -1383,9 +1493,15 @@ mod tests {
         }
         let sealed = agg2.take_sealed();
         assert_eq!(sealed.len(), 1);
-        assert_eq!(sealed[0].epoch_id, 1, "epoch numbering continues after restore");
+        assert_eq!(
+            sealed[0].epoch_id, 1,
+            "epoch numbering continues after restore"
+        );
         assert_eq!(sealed[0].entries.len(), 4);
-        assert_eq!(sealed[0].entries[0].seq, 4, "post-restore intents start at seq 4");
+        assert_eq!(
+            sealed[0].entries[0].seq, 4,
+            "post-restore intents start at seq 4"
+        );
         for e in &sealed[0].entries {
             assert!(e.seq >= 4, "no epoch-0 intent re-enters commitment");
         }
@@ -1445,9 +1561,7 @@ mod tests {
             .map(|chunk| {
                 let agg = Arc::clone(&agg);
                 let chunk = chunk.to_vec();
-                thread::spawn(move || {
-                    chunk.iter().map(|env| agg.submit(env)).collect::<Vec<_>>()
-                })
+                thread::spawn(move || chunk.iter().map(|env| agg.submit(env)).collect::<Vec<_>>())
             })
             .collect();
         for (ti, t) in threads.into_iter().enumerate() {

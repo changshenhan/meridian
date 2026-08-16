@@ -44,7 +44,10 @@ fn build_entries() -> Vec<WindowEntry> {
             for b in ih.iter_mut() {
                 *b = rng.next() as u8;
             }
-            WindowEntry { seq, intent_hash: ih }
+            WindowEntry {
+                seq,
+                intent_hash: ih,
+            }
         })
         .collect()
 }
@@ -84,10 +87,17 @@ fn main() {
     let bytes_mib = alloc_bytes as f64 / 1_048_576.0;
     println!("lattice_b7: n = {N}");
     println!("  wall best   = {:.3} ms", best * 1e3);
-    println!("  cum alloc   = {:.3} MiB  (累计 ≥ 峰值，作 <1 GiB 保守上界)", bytes_mib);
+    println!(
+        "  cum alloc   = {:.3} MiB  (累计 ≥ 峰值，作 <1 GiB 保守上界)",
+        bytes_mib
+    );
     println!("  bounds      = wall < {MAX_WALL_SECS}s, alloc < 1 GiB");
 
-    assert!(best < MAX_WALL_SECS, "B7 FAIL: wall {:.3} ms ≥ 1s", best * 1e3);
+    assert!(
+        best < MAX_WALL_SECS,
+        "B7 FAIL: wall {:.3} ms ≥ 1s",
+        best * 1e3
+    );
     assert!(
         alloc_bytes < MAX_ALLOC_BYTES,
         "B7 FAIL: alloc {alloc_bytes} B ≥ 1 GiB"

@@ -129,9 +129,10 @@ impl EpochWindow {
                 (*self.slots[slot].entry.get()).seq = seq;
             }
         }
-        self.slots[slot]
-            .state
-            .store(if accepted { ACCEPTED } else { REJECTED }, Ordering::Release);
+        self.slots[slot].state.store(
+            if accepted { ACCEPTED } else { REJECTED },
+            Ordering::Release,
+        );
         self.inflight.fetch_sub(1, Ordering::Release);
     }
 

@@ -44,8 +44,7 @@ pub struct EpochResult {
 pub trait ChainPublisher {
     fn commit(&self, epoch_id: u64, commitment_root: [u8; 32], sealed_at: u64)
         -> Result<(), Error>;
-    fn settle(&self, epoch_id: u64, netting_root: [u8; 32], net_count: u64)
-        -> Result<(), Error>;
+    fn settle(&self, epoch_id: u64, netting_root: [u8; 32], net_count: u64) -> Result<(), Error>;
 }
 
 /// 占位发布者：只算不发布（S-10 用；S-11 换真实交易后端）。
@@ -53,10 +52,20 @@ pub trait ChainPublisher {
 pub struct NoopPublisher;
 
 impl ChainPublisher for NoopPublisher {
-    fn commit(&self, _epoch_id: u64, _commitment_root: [u8; 32], _sealed_at: u64) -> Result<(), Error> {
+    fn commit(
+        &self,
+        _epoch_id: u64,
+        _commitment_root: [u8; 32],
+        _sealed_at: u64,
+    ) -> Result<(), Error> {
         Ok(())
     }
-    fn settle(&self, _epoch_id: u64, _netting_root: [u8; 32], _net_count: u64) -> Result<(), Error> {
+    fn settle(
+        &self,
+        _epoch_id: u64,
+        _netting_root: [u8; 32],
+        _net_count: u64,
+    ) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -227,7 +236,10 @@ mod tests {
         );
         // 并列：同 intent_hash 按 seq。
         let tie = vec![entry(9, [0x01; 32]), entry(3, [0x01; 32])];
-        assert_eq!(reorder(&tie).iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 9]);
+        assert_eq!(
+            reorder(&tie).iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3, 9]
+        );
     }
 
     /// 净额按 recipient 聚合，规范序（recipient 升序）。
@@ -272,9 +284,7 @@ mod tests {
     /// B11 确定性：同 entries + 同 resolve → 承诺根 / 净额根一致。
     #[test]
     fn build_epoch_deterministic() {
-        let entries: Vec<WindowEntry> = (0..10)
-            .map(|i| entry(i, [(i as u8) ^ 0x5A; 32]))
-            .collect();
+        let entries: Vec<WindowEntry> = (0..10).map(|i| entry(i, [(i as u8) ^ 0x5A; 32])).collect();
         let mut r1 = |ih: &[u8; 32]| Some(([ih[0]; 20], ih[1] as u64));
         let mut r2 = |ih: &[u8; 32]| Some(([ih[0]; 20], ih[1] as u64));
         let a = build_epoch(7, 1_700_000_000, &entries, &mut r1).unwrap();

@@ -74,7 +74,14 @@ mod tests {
         }
     }
 
-    fn intent(dh: [u8; 32], recipient: [u8; 20], amount: u64, category: [u8; 32], nonce: u64, exp: u64) -> SpendIntent {
+    fn intent(
+        dh: [u8; 32],
+        recipient: [u8; 20],
+        amount: u64,
+        category: [u8; 32],
+        nonce: u64,
+        exp: u64,
+    ) -> SpendIntent {
         SpendIntent {
             agent: [0x00; 20],
             delegation_hash: dh,
@@ -120,21 +127,48 @@ mod tests {
     #[test]
     fn consistency_ok_when_mirror() {
         let p = pi();
-        let i = intent(p.delegation_hash, p.recipient, p.amount, p.category, p.spend_nonce, p.expires_at);
+        let i = intent(
+            p.delegation_hash,
+            p.recipient,
+            p.amount,
+            p.category,
+            p.spend_nonce,
+            p.expires_at,
+        );
         assert_eq!(check_public_inputs_consistent(&p, &i), Ok(()));
     }
 
     #[test]
     fn consistency_rejects_mismatched_delegation_hash() {
         let p = pi();
-        let i = intent([0x99; 32], p.recipient, p.amount, p.category, p.spend_nonce, p.expires_at);
-        assert_eq!(check_public_inputs_consistent(&p, &i), Err(Error::EOrdering));
+        let i = intent(
+            [0x99; 32],
+            p.recipient,
+            p.amount,
+            p.category,
+            p.spend_nonce,
+            p.expires_at,
+        );
+        assert_eq!(
+            check_public_inputs_consistent(&p, &i),
+            Err(Error::EOrdering)
+        );
     }
 
     #[test]
     fn consistency_rejects_mismatched_amount() {
         let p = pi();
-        let i = intent(p.delegation_hash, p.recipient, p.amount + 1, p.category, p.spend_nonce, p.expires_at);
-        assert_eq!(check_public_inputs_consistent(&p, &i), Err(Error::EOrdering));
+        let i = intent(
+            p.delegation_hash,
+            p.recipient,
+            p.amount + 1,
+            p.category,
+            p.spend_nonce,
+            p.expires_at,
+        );
+        assert_eq!(
+            check_public_inputs_consistent(&p, &i),
+            Err(Error::EOrdering)
+        );
     }
 }

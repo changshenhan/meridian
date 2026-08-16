@@ -41,6 +41,15 @@ jobs:
           cargo run --release -p meridian-bench --bin gate -- --record
           cargo run --release -p meridian-bench --bin gate -- --fail-over 15
 
+      # S-10 聚合器内核硬断言回归（确定性，机器无关）：B8 热路径零分配 + B11 确定性
+      # （同 seed 两跑 lattice 输出哈希一致）。全量 B5/B6/B7/B10 验收在参考机跑
+      # `agg_sim` 全量报告（CI runner 共享 CPU，绝对吞吐不可靠，只守硬断言与趋势）。
+      # 复用上方 gate 的 release 构建，无额外编译开销。
+      - name: agg_sim regression (B8 zero-alloc + B11 determinism)
+        run: |
+          cargo run --release -p meridian-bench --bin agg_sim -- --check-alloc
+          cargo run --release -p meridian-bench --bin agg_sim -- --check-determinism
+
   # Noir（S-05）—— Windows 无法构建 nargo_cli v1.0.0-beta.26（termion 仅 unix），
   # 且该版本无 Windows 预编译二进制、无 prove/verify 子命令（proving 已外移到 bb）。
   # 因此本 job 是 ZK 电路**唯一**的验证路径：compile/test/约束数 + 完整 prove/verify/回读。

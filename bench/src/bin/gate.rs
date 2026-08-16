@@ -12,6 +12,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use meridian_bench::agg_fixture::{
+    measure_kernel_single_threaded, KernelBatch, KernelFixtureParams, MASTER_SEED,
+};
+use meridian_bench::b7_measure;
 use meridian_bench::ingest::{measure_single_threaded, Batch, FixtureParams};
 use meridian_core::dsa::{self, AgentSigningKey, Delegation, RateLimit, SpendIntent};
 use meridian_core::ledger::{check_budget, BudgetState};
@@ -146,6 +150,21 @@ fn main() {
                 per_agent: 200,
             })),
         ),
+        // S-10 生产内核（meridian-aggregator）：单线程 ingest 全管线吞吐
+        // （验签 → SpendVerifier → 预算 → 入窗 → WAL），B5 口径的单线程基线。
+        // B8 零分配 / B11 确定性是硬断言，走 agg_sim --check-alloc / --check-determinism
+        // （CI 回归），不进吞吐 baseline。
+        (
+            "agg_kernel_ingest_ops".to_string(),
+            measure_kernel_single_threaded(&KernelBatch::build(KernelFixtureParams {
+                n_agents: 32,
+                per_agent: 200,
+                now: 1_700_000_000,
+                seed: MASTER_SEED,
+            })),
+        ),
+        // B7 排序 + 承诺（100k 笔）最佳墙钟（5 轮取最短），lattice 热路径回归。
+        ("agg_kernel_b7_wall_ms".to_string(), b7_measure().0 * 1e3),
     ]);
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("baseline.json");

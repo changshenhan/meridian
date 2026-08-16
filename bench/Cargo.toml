@@ -10,6 +10,10 @@ meridian-core.workspace = true
 meridian-aggregator.workspace = true
 # PoC ② ingest 夹具要用 agent 签名原语现场造意图（与 core 同版本）。
 ed25519-dalek.workspace = true
+# agg_sim 生产内核 B5：有界 rayon 线程池（submit_batch，MASTER_PLAN 技术源）。
+rayon.workspace = true
+# s10_fixture 规范哈希（sha256）与 B7 承诺根同源。
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

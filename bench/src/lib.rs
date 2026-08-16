@@ -9,6 +9,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+pub mod agg_fixture;
 pub mod ingest;
 
 thread_local! {
@@ -86,4 +87,76 @@ pub fn section_allocs() -> usize {
 /// 当前守卫段内累计分配字节数（≥ 峰值驻留；B7 用保守上界）。
 pub fn section_alloc_bytes() -> usize {
     SECTION_BYTES.with(|b| b.get())
+}
+
+// ---------------------------------------------------------------------------
+// B7 排序 + 承诺（100k 笔，TECH_SPEC §8.1 B7）—— agg_sim 与 lattice_b7 共用内核。
+// ---------------------------------------------------------------------------
+
+/// B7 输入规模。
+pub const B7_N: usize = 100_000;
+
+/// 固定 seed 的 xorshift64*：确定性伪随机（B11 口径，无 rand 依赖）。
+struct Xs(u64);
+
+impl Xs {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+/// B7 测量：commitment_root → reorder → aggregate → netting_root 全管线
+/// （§6.3 步骤 A-E 纯计算侧）。5 轮取最短墙钟；每轮累计分配字节（≥ 峰值，作 <1GiB
+/// 保守上界断言）。确定性夹具，零随机。返回 (best_wall_secs, max_cum_alloc_bytes)。
+pub fn b7_measure() -> (f64, usize) {
+    use meridian_aggregator::lattice;
+    use meridian_aggregator::window::WindowEntry;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    // 确定性构建 100k 个已封窗口条目（seq 升序、intent_hash 伪随机）。
+    let mut rng = Xs(0x4D_45_52_49_44_49_41_4E); // "MERIDIAN"
+    let entries: Vec<WindowEntry> = (0..B7_N as u64)
+        .map(|seq| {
+            let mut ih = [0u8; 32];
+            for b in ih.iter_mut() {
+                *b = rng.next() as u8;
+            }
+            WindowEntry {
+                seq,
+                intent_hash: ih,
+            }
+        })
+        .collect();
+
+    // 一次全管线。resolver 确定性映射 intent_hash → (recipient, amount)。
+    let run = |entries: &[WindowEntry]| -> lattice::EpochResult {
+        let mut resolve = |ih: &[u8; 32]| -> Option<([u8; 20], u64)> {
+            let mut r = [0u8; 20];
+            r.copy_from_slice(&ih[..20]);
+            let amount = u64::from_le_bytes(ih[20..28].try_into().unwrap()) % 1000;
+            Some((r, amount))
+        };
+        lattice::build_epoch(0, 1_700_000_000, entries, &mut resolve).expect("resolver total")
+    };
+
+    // 预热一轮（分配器 / 指令缓存热度），不记录。
+    black_box(run(&entries));
+
+    let mut best = f64::INFINITY;
+    let mut alloc_bytes = 0usize;
+    for _ in 0..5 {
+        let g = NoAllocGuard::new();
+        let t = Instant::now();
+        let res = run(&entries);
+        let secs = t.elapsed().as_secs_f64();
+        drop(g);
+        best = best.min(secs);
+        alloc_bytes = alloc_bytes.max(section_alloc_bytes());
+        black_box(res);
+    }
+    (best, alloc_bytes)
 }

@@ -184,7 +184,8 @@ the received side shows `200 OK` + ack, and the server identity matches the deli
 |---|---|---|
 | Phase 0 — standards | **Done** (2026-08-16) | Three PoCs green; spec v1.0 frozen; repo ready for open-source (launch deferred, per S-08e) |
 | S-09 (ZK circuit) | **Done** (2026-08-16) | Full `spend_authorization`: intent_hash field binding + sparse-Merkle revocation non-membership; owner ECDSA verified off-circuit (on-chain + S-02); EVM verifier (`UltraVerifier.sol`, keccak-flavor) generated |
-| Phase 1 — reference impl | Next | Aggregator kernel (S-10, WAL / commitment lattice), in-process proving/verification wrapper (true B4), milestone M1 end-to-end |
+| S-10 (aggregator kernel) | **Done** (2026-08-16) | Production kernel in `meridian-aggregator`: ingest fast-path (verify → SpendVerifier → budget → window → WAL), commitment lattice, crash recovery; B5 576,406/s @64t (≥100k PASS), B6 p99 0.03ms, B7 46.5ms/33MiB, B8 0-alloc, B10/B11 PASS |
+| Phase 1 — reference impl | Next | In-process proving/verification wrapper (true B4), milestone M1 end-to-end |
 | Phase 2 — operator | Later | Multi-operator, bond economy, Base mainnet, recursive aggregation |
 
 Phase 0 exit criteria are all met. Phase 1 is in progress against `MASTER_PLAN.md` (linear,

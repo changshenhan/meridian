@@ -173,6 +173,11 @@ pub trait SpendVerifier {
 }
 ```
 
+> **已实现（S-10，`meridian-aggregator::proof::FormatVerifier`）**：TEMPORARY 后端口径——
+> proof 非空 + `public_inputs` 与 intent 逐字段一致，返回值为登记 ground truth（§9）。
+> S-09 实测真 ZK 单验证 7.62ms → 进 critical path 物理上到不了 100k/s（§5.4 分阶段）；
+> 真实 in-process bb wrapper 是路线图单独交付物（Phase 2），插此接口即可，B5 口径不变。
+
 ### 4.5 预算账本（BudgetState）—— 确定性状态机
 
 ```rust
@@ -384,7 +389,8 @@ pub trait Ingest {
 ```
 
 - 排序规则公开且由哈希决定 → 摄取顺序不可被"位置/金额"套利（无夹子）。
-- `netting_root = merkle(net[])`；`net[]` 公开，任何人可验证净额正确。
+- `netting_root = keccak256(abi.encode(net[]))`（对齐 `BatchSettler.settle` 的实现——以代码为准）；
+  `net[]` 公开，任何人可复算验证净额正确。
 - 双花防线：意图唯一（intent_hash），账本原子记账，跨 epoch 不重复。
 
 ### 6.4 批量结算（BatchSettler 合约）
@@ -459,8 +465,9 @@ contract BatchSettler {
 ### 8.1 基准平台（基准必须在此描述下运行并随报告附带）
 
 - 参考机（目标平台）：16c/32t，64GB RAM，NVMe，Linux，CPU 支持 `avx2/adx/bmi2`。
-- 实测机（S-08a PoC ②）：32 核 Windows x86_64，release build；PoC ② 吞吐数字按此机
-  回填，S-10 生产内核在参考机复测并回填。
+- 实测机（S-08a / S-10）：32 核 Windows x86_64，release build；PoC ② 与 S-10 生产内核
+  吞吐数字均按此机回填（§8.2 两组实测，`agg_sim` 全量报告）。参考机（Linux 16c/32t）
+  复测作为 S-11 前的复核项。
 - 报告必须含 `git sha`、CPU/内存/OS、`-C target-cpu=native` 是否启用。
 - 一切基准**固定 seed、固定输入集**（`bench/data/*.bin` 入 repo），结果必须可复现。
 
@@ -484,7 +491,16 @@ contract BatchSettler {
 > **S-08a 实测（PoC ②，`docs/poc/poc-02-aggregator-throughput.md`）**：B5 聚合器摄入
 > 吞吐，32 线程满核 **488,738 笔/s**（目标 ≥100k → **PASS**，余量 ~4.9×）；单线程基线
 > ~47.6k/s（瓶颈=Ed25519 验签，无状态 → 并行近线性放大）。口径：TEMPORARY 无 ZK
-> （S-09 挂 `verify_proof`），nonce 分片为原型形态；最终以 S-10 生产内核实测为准。
+> （S-09 挂 `verify_proof`），nonce 分片为原型形态。原型留作历史证据。
+
+> **S-10 实测（生产内核，`docs/poc/poc-04-aggregator-kernel.md`，输入快照
+> `bench/data/s10_fixture.bin`）**：B5 单实例 1t **46,243** | 8t **309,260** | 64t **576,406**
+> 笔/s（目标 ≥100k → **PASS**，余量 ~5.8×）；B6 摄入端到端 p99 **0.030 ms**（≤50ms →
+> **PASS**）；B7 100k 排序+承诺 **46.5 ms / 33.1 MiB** 累计分配（<1s / <1GB → **PASS**）；
+> B8 热路径 **0 分配**（=0 → **PASS**）；B10 100k 笔→1 批→50 条净额（Σnet=100k）
+> **180.9 ms / 0 分配**（基线记录）；B11 同 seed 两跑 lattice 输出一致（**PASS**）。
+> 口径：全管线含 `SpendVerifier`（本阶段 `FormatVerifier`，TEMPORARY，与 PoC ② 同口径）。
+> CI 只跑回归门禁（B8/B11 硬断言 + gate 吞吐基线），全量验收在参考机 `agg_sim`。
 
 ### 8.3 可复现与 CI 门禁
 
@@ -548,7 +564,9 @@ contract BatchSettler {
 | 码 | 含义 |
 |---|---|
 | `E_DELEG_EXPIRED` | 委托未生效或已过期 |
+| `E_DELEG_UNKNOWN` | 委托未注册（聚合器按 delegation_hash 查注册表未命中） |
 | `E_DELEG_SIG` | owner 签名验证失败 |
+| `E_ATTEST_BIND` | 换钥重绑被拒（attestation 双钥绑定，S-05） |
 | `E_INTENT_SIG` | agent 签名验证失败 |
 | `E_PROOF` | ZK 证明无效 |
 | `E_BUDGET_PER_SPEND` | 超过单笔上限 |

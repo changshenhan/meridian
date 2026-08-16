@@ -195,7 +195,10 @@ impl Wal {
         payload[80..88].copy_from_slice(&amount.to_le_bytes());
         payload[88..96].copy_from_slice(&now.to_le_bytes());
         payload[96..116].copy_from_slice(&recipient);
-        self.inner.lock().expect("wal poisoned").append_raw(RecordKind::Intent, &payload)
+        self.inner
+            .lock()
+            .expect("wal poisoned")
+            .append_raw(RecordKind::Intent, &payload)
     }
 
     /// 冷路径：委托注册（serde_json，确定性）。`agent_pub` 是 agent 的 Ed25519 公钥
@@ -206,7 +209,10 @@ impl Wal {
         agent_pub: &[u8; 32],
     ) -> std::io::Result<()> {
         let payload = serde_json::to_vec(&(sd, agent_pub)).expect("SignedDelegation serializable");
-        self.inner.lock().expect("wal poisoned").append_raw(RecordKind::Register, &payload)
+        self.inner
+            .lock()
+            .expect("wal poisoned")
+            .append_raw(RecordKind::Register, &payload)
     }
 
     /// 冷路径：epoch 密封记录。
@@ -222,7 +228,10 @@ impl Wal {
         payload[8..40].copy_from_slice(&commitment_root);
         payload[40..48].copy_from_slice(&accepted_count.to_le_bytes());
         payload[48..56].copy_from_slice(&sealed_at.to_le_bytes());
-        self.inner.lock().expect("wal poisoned").append_raw(RecordKind::EpochSeal, &payload)
+        self.inner
+            .lock()
+            .expect("wal poisoned")
+            .append_raw(RecordKind::EpochSeal, &payload)
     }
 
     /// 冷路径：净额结果记录。
@@ -236,7 +245,10 @@ impl Wal {
         payload[0..8].copy_from_slice(&epoch_id.to_le_bytes());
         payload[8..40].copy_from_slice(&netting_root);
         payload[40..48].copy_from_slice(&net_count.to_le_bytes());
-        self.inner.lock().expect("wal poisoned").append_raw(RecordKind::Netting, &payload)
+        self.inner
+            .lock()
+            .expect("wal poisoned")
+            .append_raw(RecordKind::Netting, &payload)
     }
 
     /// 批量 fsync 到盘。
@@ -346,7 +358,11 @@ impl Wal {
             }
             pos += HEADER_LEN + len;
         }
-        let valid_bytes = if truncated { pos as u64 } else { raw.len() as u64 };
+        let valid_bytes = if truncated {
+            pos as u64
+        } else {
+            raw.len() as u64
+        };
         Ok((records, valid_bytes, truncated))
     }
 
@@ -364,7 +380,13 @@ impl Wal {
     }
 
     pub fn file_len(&self) -> std::io::Result<u64> {
-        Ok(self.inner.lock().expect("wal poisoned").file.metadata()?.len())
+        Ok(self
+            .inner
+            .lock()
+            .expect("wal poisoned")
+            .file
+            .metadata()?
+            .len())
     }
 }
 
@@ -373,7 +395,9 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use meridian_core::dsa::{sign_delegation, Delegation, RateLimit, owner_signing_key_from_bytes};
+    use meridian_core::dsa::{
+        owner_signing_key_from_bytes, sign_delegation, Delegation, RateLimit,
+    };
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -407,7 +431,8 @@ mod tests {
         let path = tmp_path("roundtrip");
         let w = Wal::open(&path, 1000).unwrap();
         w.append_register(&sample_sd(), &[0x11; 32]).unwrap();
-        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000, [0xEE; 20]).unwrap();
+        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000, [0xEE; 20])
+            .unwrap();
         w.flush().unwrap();
         let (records, valid, truncated) = w.replay().unwrap();
         assert!(!truncated);
@@ -440,7 +465,8 @@ mod tests {
         let path = tmp_path("buffered");
         let w = Wal::open(&path, 100_000).unwrap(); // 不自动 fsync
         for seq in 1..=100u64 {
-            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20]).unwrap();
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20])
+                .unwrap();
         }
         // 未 flush：内存缓冲，文件未落盘。
         assert_eq!(w.file_len().unwrap(), 0);
@@ -456,7 +482,8 @@ mod tests {
         let path = tmp_path("torn");
         let w = Wal::open(&path, 1000).unwrap();
         for seq in 1..=10u64 {
-            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20]).unwrap();
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20])
+                .unwrap();
         }
         w.flush().unwrap();
         let valid = w.file_len().unwrap();
