@@ -190,21 +190,24 @@ unconstrained fn subtree_root(
             has = has | (((revoked[j].0 as u64) >> level) == pos);
         }
     }
+    // Noir 1.0 无 `&&`/`||` 运算符（编译器："Noir has no logical-and (&&) operator",
+    // 建议用 `&`）且不支持提前 `return`（"Early 'return' is unsupported"）——两者均为
+    // CI run 31933379072 实测。改为 if/else 表达式 + `&`（brillig 递归保留）。
     if !has {
-        return empty_roots[level as u32];
-    }
-    if level == 0 {
+        empty_roots[level as u32]
+    } else if level == 0 {
         let mut v: Field = 0;
         for j in 0..MAX_REVOKED {
-            if j < revoked_len && (revoked[j].0 as u64) == pos {
+            if (j < revoked_len) & ((revoked[j].0 as u64) == pos) {
                 v = revoked[j].1;
             }
         }
-        return v;
+        v
+    } else {
+        let left = subtree_root(level - 1, pos * 2, revoked, revoked_len, empty_roots);
+        let right = subtree_root(level - 1, pos * 2 + 1, revoked, revoked_len, empty_roots);
+        std::hash::pedersen_hash([left, right])
     }
-    let left = subtree_root(level - 1, pos * 2, revoked, revoked_len, empty_roots);
-    let right = subtree_root(level - 1, pos * 2 + 1, revoked, revoked_len, empty_roots);
-    std::hash::pedersen_hash([left, right])
 }
 
 /// 目标叶子索引的兄弟路径：path[i] = 第 i 层兄弟子树根（撤销树，EMPTY 叶子）。
@@ -228,7 +231,7 @@ unconstrained fn build_path(
 /// 生成器返回值（转 Prover.toml 后喂正式电路）。
 /// 字段顺序 = 扁平序列化顺序：8 标量 ‖ revocation_path[32] ‖ intent_hash[32]（=72）。
 /// sig_s 不在其中：由 build 脚本从 (sig_r, sig_h) 计算（Python 大整数 mod SUBORDER）。
-struct WitnessOut {
+pub struct WitnessOut {
     agent_pub_x: Field,
     agent_pub_y: Field,
     sig_r: Field,
@@ -268,15 +271,18 @@ pub fn main(
     let message = encode_field(intent_hash);
     let (sig_r, sig_h, sig_r8_x, sig_r8_y) = eddsa_challenge(secret, message);
 
-    // 撤销树：目标不在撤销集 → EMPTY 叶子；revoked_a/b 叶子 = encode_field(hash)
-    let empty_roots = compute_empty_roots();
+    // 撤销树：目标不在撤销集 → EMPTY 叶子；revoked_a/b 叶子 = encode_field(hash)。
+    // subtree_root/build_path/compute_empty_roots 为 unconstrained（brillig，只求值不
+    // 证明）→ 约束上下文调用需 unsafe {}（Noir 1.0："Call to unconstrained function from
+    // constrained function is unsafe"，CI run 31933379072 实测）。
+    let empty_roots = unsafe { compute_empty_roots() };
     let revoked: [(u32, Field); MAX_REVOKED] = [
         (revocation_index_u32(revoked_a), encode_field(revoked_a)),
         (revocation_index_u32(revoked_b), encode_field(revoked_b)),
     ];
-    let revocation_root = subtree_root(32, 0, revoked, MAX_REVOKED, empty_roots);
+    let revocation_root = unsafe { subtree_root(32, 0, revoked, MAX_REVOKED, empty_roots) };
     let target_index = revocation_index_u32(delegation_hash);
-    let revocation_path = build_path(target_index, revoked, MAX_REVOKED, empty_roots);
+    let revocation_path = unsafe { build_path(target_index, revoked, MAX_REVOKED, empty_roots) };
 
     WitnessOut {
         agent_pub_x: pub_x,
@@ -296,7 +302,6 @@ mod tests {
     use crate::{
         build_path, compute_empty_roots, compute_intent_hash, compute_merkle_root,
         eddsa_challenge, encode_field, revocation_index_u32, subtree_root, MAX_REVOKED,
-        REVOCATION_DEPTH,
     };
     use eddsa::{eddsa_to_pub, eddsa_verify};
     use edwards::{bjj::BabyJubJub, Curve, CurveTrait, ScalarField};
@@ -343,9 +348,10 @@ mod tests {
     #[test]
     fn challenge_deterministic() {
         // eddsa_challenge 在同一输入下必须确定（r、h、r8 固定）——witness 生成确定性。
-        // 逐项 assert：Noir beta.26 的 `&&` 布尔链在 Field 比较语境报 "Bitwise operations
-        // are invalid on Field"（Field `==` 返回 Field-truth 而非 bool，`&&` 需 bool；
-        // eddsa fork 测试亦规避 `&&`/`||`，CI run 31931723020 实测），故拆成单比较。
+        // 逐项 assert：Noir 1.0 无 `&&`/`||` 运算符（Field `==` 返回 Field-truth，`&&` 在
+        // Field 语境报 "Bitwise operations are invalid on Field"、bool 语境报 "Noir has no
+        // logical-and"；eddsa fork 测试亦规避 `&&`/`||`，CI run 31933379072 实测），
+        // 故拆成单比较。
         let (r1, h1, x1, y1) = eddsa_challenge(4242, 987654321);
         let (r2, h2, x2, y2) = eddsa_challenge(4242, 987654321);
         assert(r1 == r2);
@@ -364,19 +370,19 @@ mod tests {
         let dh = fixture_delegation_hash();
         let ra = revoked_a();
         let rb = revoked_b();
-        let empty_roots = compute_empty_roots();
+        let empty_roots = unsafe { compute_empty_roots() };
         let revoked: [(u32, Field); MAX_REVOKED] = [
             (revocation_index_u32(ra), encode_field(ra)),
             (revocation_index_u32(rb), encode_field(rb)),
         ];
-        let root = subtree_root(32, 0, revoked, MAX_REVOKED, empty_roots);
+        let root = unsafe { subtree_root(32, 0, revoked, MAX_REVOKED, empty_roots) };
         let target = revocation_index_u32(dh);
-        let path = build_path(target, revoked, MAX_REVOKED, empty_roots);
+        let path = unsafe { build_path(target, revoked, MAX_REVOKED, empty_roots) };
         assert(compute_merkle_root(0, target as Field, path) == root);
 
         // 已撤销委托：其叶子非 EMPTY → 同一 root 下 EMPTY 证明必失败。
         let r1 = revoked[0].0;
-        let r1_path = build_path(r1, revoked, MAX_REVOKED, empty_roots);
+        let r1_path = unsafe { build_path(r1, revoked, MAX_REVOKED, empty_roots) };
         assert(compute_merkle_root(0, r1 as Field, r1_path) != root);
     }
 
