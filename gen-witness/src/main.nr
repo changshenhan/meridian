@@ -12,8 +12,14 @@
 //! 关键一致性约束（与 circuits/src/main.nr 零漂移）：
 //!   · compute_intent_hash / encode_field / revocation_index / compute_merkle_root
 //!     与电路同实现（sha256 规范字节、31B LE、delegation_hash[0..4] LE、pedersen_hash）
-//!   · eddsa_sign 镜像电路的 eddsa_verify 的 Poseidon 域（h = Poseidon(R8x,R8y,Ax,Ay,m)，
-//!     s = (r + h*sk) % SUBORDER）——gen 签名必须通过电路验签
+//!   · eddsa_challenge 镜像电路的 eddsa_verify 的 Poseidon 域
+//!     （h = Poseidon(R8x,R8y,Ax,Ay,m)），输出 (r, h, r8x, r8y)。
+//!     签名标量 s = (r + h*sk) % SUBORDER 由 build 脚本（Python 大整数）计算：
+//!     Noir 1.0 移除了 Field 模运算（`%` 编译报错，eddsa fork 自身测试亦注明
+//!     "fields can't use modulo"），且 ScalarField 无算符、base4_slices 为 pub(crate)，
+//!     无法在 Noir 内做 mod-n 归约 → 归约移到可信 Python 层（与 Rust core 的纯字节
+//!     逻辑同级，非曲线数学；R8/h/公钥仍在 Noir）。端到端正确性由正式电路
+//!     eddsa_verify（CI nargo execute + bb prove/verify）把关：s 错则证明失败。
 //!   · 撤销树：稀疏 Merkle，深度 32，叶子=EMPTY(0)；撤销委托的叶子 = encode_field(hash)（非零）；
 //!     目标委托不在撤销集 → 其叶子为 EMPTY → 电路 compute_merkle_root(0, idx, path) == root
 //!
@@ -21,10 +27,12 @@
 //! 值被 witness-hint 进约束系统，避免在生成器里堆约束、也规避约束上下文递归风险。
 //! 树正确性由本包 #[test]（build→compute_merkle_root 自验）与正式电路 prove/verify 双重兜底。
 
-use eddsa::{eddsa_to_pub, eddsa_verify};
+use eddsa::eddsa_to_pub; // eddsa_verify 仅在测试模块用（fork 常量正例）
 use edwards::{bjj::BabyJubJub, Curve, CurveTrait, ScalarField};
 use poseidon::poseidon::PoseidonHasher;
 use sha256;
+// Noir 1.0：Hasher trait 提供 write/finish，需显式导入（CI run 31931011528 实测）。
+use std::hash::Hasher;
 
 /// 撤销稀疏 Merkle 树深度（与电路 REVOCATION_DEPTH 一致）。
 global REVOCATION_DEPTH: u32 = 32;
@@ -32,13 +40,13 @@ global REVOCATION_DEPTH: u32 = 32;
 /// 本生成器支持的最大撤销集大小（固定入参数组定长；不足补零位 + revoked_len）。
 global MAX_REVOKED: u32 = 2;
 
-// eddsa fork 的 BASE8 / SUBORDER 为模块级未 pub 常量，复制一份（见 eddsa/src/lib.nr）。
+// eddsa fork 的 BASE8 为模块级未 pub 常量，复制一份（见 eddsa/src/lib.nr）。
+// SUBORDER 不再在此复制：签名标量归约已移到 build 脚本（formal_gen_to_prover.py），
+// 其 SUBORDER 常量与 eddsa fork 的 eddsa_verify 断言值一致；不一致则证明失败（CI 红）。
 global BASE8_X: Field =
     5299619240641551281634865583518297030282874472190772894086521144482721001553;
 global BASE8_Y: Field =
     16950150798460657717958625567821834550301663161624707787222815936182638968203;
-global SUBORDER: Field =
-    2736030358979909402780800718157159386076813972158567259200215660948447373041;
 
 // ——— 以下 4 个函数与 circuits/src/main.nr 同实现（零漂移）———
 
@@ -60,18 +68,20 @@ fn compute_intent_hash(
     for i in 0..20 {
         preimage[64 + i] = recipient[i];
     }
-    let amount_le: [u8; 8] = amount.to_le_bytes();
+    // Noir 1.0 beta.26 的 u64 无 to_le_bytes（CI run 31931011528 实测）：转 Field 取
+    // 32 字节 LE，低 8 字节即 u64 的 LE 表示（u64 < 2^64；Rust sha2 用 amount.to_le_bytes()）。
+    let amount_le: [u8; 32] = (amount as Field).to_le_bytes();
     for i in 0..8 {
         preimage[84 + i] = amount_le[i];
     }
     for i in 0..32 {
         preimage[92 + i] = category[i];
     }
-    let nonce_le: [u8; 8] = spend_nonce.to_le_bytes();
+    let nonce_le: [u8; 32] = (spend_nonce as Field).to_le_bytes();
     for i in 0..8 {
         preimage[124 + i] = nonce_le[i];
     }
-    let exp_le: [u8; 8] = expires_at.to_le_bytes();
+    let exp_le: [u8; 32] = (expires_at as Field).to_le_bytes();
     for i in 0..8 {
         preimage[132 + i] = exp_le[i];
     }
@@ -128,9 +138,14 @@ fn agent_commit_from_pubkey(pub_x: Field, pub_y: Field) -> [u8; 32] {
     sha256::digest(pk)
 }
 
-/// 确定性 BabyJubJub EdDSA 签名（镜像电路 eddsa_verify 的 Poseidon 域；eddsa fork 无 sign）。
-/// 返回 (s, r8_x, r8_y)；公钥由 eddsa_to_pub 单独取。
-fn eddsa_sign(secret: Field, message: Field) -> (Field, Field, Field) {
+/// 确定性 BabyJubJub EdDSA 挑战（镜像电路 eddsa_verify 的 Poseidon 域；eddsa fork 无 sign，
+/// 且 Noir 1.0 无法做 `% SUBORDER`）。返回 (r, h, r8_x, r8_y)：
+///   r  = Poseidon(secret, message)            ← 确定性 nonce
+///   r8 = [r]B8                                ← 验证方程左点
+///   h  = Poseidon(r8.x, r8.y, A.x, A.y, m)    ← 挑战
+/// 签名标量 s = (r + h*secret) % SUBORDER 由 build 脚本（Python 大整数）计算，
+/// 见 scripts/formal_gen_to_prover.py（文件头注释说明 why）。
+fn eddsa_challenge(secret: Field, message: Field) -> (Field, Field, Field, Field) {
     let mut h1 = PoseidonHasher::default();
     h1.write(secret);
     h1.write(message);
@@ -145,8 +160,7 @@ fn eddsa_sign(secret: Field, message: Field) -> (Field, Field, Field) {
     h2.write(ay);
     h2.write(message);
     let h = h2.finish();
-    let s = (r + h * secret) % SUBORDER;
-    (s, r8.x, r8.y)
+    (r, h, r8.x, r8.y)
 }
 
 /// 空子树根表：empty_roots[k] = 深度 k 的全空树根（pedersen 叠 2 的平方）。
@@ -212,10 +226,13 @@ unconstrained fn build_path(
 }
 
 /// 生成器返回值（转 Prover.toml 后喂正式电路）。
+/// 字段顺序 = 扁平序列化顺序：8 标量 ‖ revocation_path[32] ‖ intent_hash[32]（=72）。
+/// sig_s 不在其中：由 build 脚本从 (sig_r, sig_h) 计算（Python 大整数 mod SUBORDER）。
 struct WitnessOut {
     agent_pub_x: Field,
     agent_pub_y: Field,
-    sig_s: Field,
+    sig_r: Field,
+    sig_h: Field,
     sig_r8_x: Field,
     sig_r8_y: Field,
     revocation_root: Field,
@@ -249,7 +266,7 @@ pub fn main(
         expires_at,
     );
     let message = encode_field(intent_hash);
-    let (sig_s, sig_r8_x, sig_r8_y) = eddsa_sign(secret, message);
+    let (sig_r, sig_h, sig_r8_x, sig_r8_y) = eddsa_challenge(secret, message);
 
     // 撤销树：目标不在撤销集 → EMPTY 叶子；revoked_a/b 叶子 = encode_field(hash)
     let empty_roots = compute_empty_roots();
@@ -264,7 +281,8 @@ pub fn main(
     WitnessOut {
         agent_pub_x: pub_x,
         agent_pub_y: pub_y,
-        sig_s,
+        sig_r,
+        sig_h,
         sig_r8_x,
         sig_r8_y,
         revocation_root,
@@ -276,11 +294,14 @@ pub fn main(
 
 mod tests {
     use crate::{
-        build_path, compute_empty_roots, compute_intent_hash, compute_merkle_root, eddsa_sign,
-        encode_field, revocation_index_u32, subtree_root, MAX_REVOKED, REVOCATION_DEPTH,
+        build_path, compute_empty_roots, compute_intent_hash, compute_merkle_root,
+        eddsa_challenge, encode_field, revocation_index_u32, subtree_root, MAX_REVOKED,
+        REVOCATION_DEPTH,
     };
     use eddsa::{eddsa_to_pub, eddsa_verify};
+    use edwards::{bjj::BabyJubJub, Curve, CurveTrait, ScalarField};
     use poseidon::poseidon::PoseidonHasher;
+    use crate::{BASE8_X, BASE8_Y};
 
     // ——— 固定输入（与正式管线 gen-witness/Prover.toml 一致；除 revoked 外与
     //     circuits/src/main.nr 测试的共享 golden fixture 相同）———
@@ -301,16 +322,33 @@ mod tests {
         [0x02; 32]
     }
 
+    /// 上游 noir-lang/eddsa（commit 7e206c9）测试的预计算签名常量：secret=123, msg=789。
+    /// eddsa fork 自身测试同款模式——"Manually computed as fields can't use modulo"，
+    /// 上游 CI（test.yml 跨版本跑 nargo test）持续验证这些常量在 PoseidonHasher 域下通过
+    /// eddsa_verify。此处复用作为本包验签域的正例；正式管线的签名标量由 build 脚本计算
+    /// （Python 大整数），端到端由正式电路 eddsa_verify 把关。
     #[test]
-    fn sign_verify_roundtrip() {
-        // gen 侧签名必须通过电路同款验签（eddsa_verify::<PoseidonHasher>）。
-        let secret = 4242;
-        let message = 987654321;
-        let (s, r8x, r8y) = eddsa_sign(secret, message);
-        let (px, py) = eddsa_to_pub(secret);
-        assert(eddsa_verify::<PoseidonHasher>(px, py, s, r8x, r8y, message));
-        // 负例：message 篡改 → 验签失败
-        assert(!eddsa_verify::<PoseidonHasher>(px, py, s, r8x, r8y, message + 1));
+    fn fork_signature_constants_verify() {
+        let (px, py) = eddsa_to_pub(123);
+        let r = 1414770703199880747815475415092878800081323795074043628810774576767372531818;
+        let s = 30333430637424319196043722294837632681219980330991241982145549329256671548;
+        let base8: BabyJubJub = Curve { x: BASE8_X, y: BASE8_Y };
+        let r8 = base8.mul(ScalarField::<63>::from(r));
+        let msg: Field = 789;
+        assert(eddsa_verify::<PoseidonHasher>(px, py, s, r8.x, r8.y, msg));
+        // 负例：message 篡改 → 验签失败（同一 r8，改 msg 后 h 变）
+        assert(!eddsa_verify::<PoseidonHasher>(px, py, s, r8.x, r8.y, msg + 1));
+    }
+
+    #[test]
+    fn challenge_deterministic() {
+        // eddsa_challenge 在同一输入下必须确定（r、h、r8 固定）——witness 生成确定性。
+        let (r1, h1, x1, y1) = eddsa_challenge(4242, 987654321);
+        let (r2, h2, x2, y2) = eddsa_challenge(4242, 987654321);
+        assert(r1 == r2 && h1 == h2 && x1 == x2 && y1 == y2);
+        // 换 message → 挑战全变
+        let (r3, h3, _, _) = eddsa_challenge(4242, 987654322);
+        assert(r1 != r3 || h1 != h3);
     }
 
     #[test]

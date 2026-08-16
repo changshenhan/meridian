@@ -102,18 +102,20 @@ fn compute_intent_hash(
     for i in 0..20 {
         preimage[64 + i] = recipient[i];
     }
-    let amount_le: [u8; 8] = amount.to_le_bytes();
+    // Noir 1.0 beta.26 的 u64 无 to_le_bytes（CI run 31931011528 实测）：转 Field 取
+    // 32 字节 LE，低 8 字节即 u64 的 LE 表示（u64 < 2^64；Rust sha2 用 amount.to_le_bytes()）。
+    let amount_le: [u8; 32] = (amount as Field).to_le_bytes();
     for i in 0..8 {
         preimage[84 + i] = amount_le[i];
     }
     for i in 0..32 {
         preimage[92 + i] = category[i];
     }
-    let nonce_le: [u8; 8] = spend_nonce.to_le_bytes();
+    let nonce_le: [u8; 32] = (spend_nonce as Field).to_le_bytes();
     for i in 0..8 {
         preimage[124 + i] = nonce_le[i];
     }
-    let exp_le: [u8; 8] = expires_at.to_le_bytes();
+    let exp_le: [u8; 32] = (expires_at as Field).to_le_bytes();
     for i in 0..8 {
         preimage[132 + i] = exp_le[i];
     }
@@ -256,7 +258,6 @@ mod tests {
     };
     use edwards::{bjj::BabyJubJub, Curve, CurveTrait, ScalarField};
     use eddsa::eddsa_to_pub;
-    use poseidon::poseidon::PoseidonHasher;
     use sha256;
 
     // eddsa@main 的 BASE8 常量（模块级 global 未 `pub`，测试侧复制一份；见 eddsa/src/lib.nr）。
@@ -264,29 +265,18 @@ mod tests {
         5299619240641551281634865583518297030282874472190772894086521144482721001553;
     global BASE8_Y: Field =
         16950150798460657717958625567821834550301663161624707787222815936182638968203;
-    // eddsa 库的 SUBORDER 非 pub，测试侧复制一份（eddsa_verify 断言 s < SUBORDER）。
-    global SUBORDER: Field =
-        2736030358979909402780800718157159386076813972158567259200215660948447373041;
 
-    /// 确定性 BabyJubJub EdDSA 签名（镜像 eddsa_verify 的 Poseidon 域：
-    /// h = Poseidon(R8x, R8y, Ax, Ay, message)，s = (r + h*sk) % suborder）。
-    /// 与 gen-witness（S-09c）同一实现，gen 侧签名必须通过本电路的 eddsa_verify。
-    fn test_sign(secret: Field, message: Field) -> (Field, Field, Field, Field, Field) {
-        let mut h1 = PoseidonHasher::default();
-        h1.write(secret);
-        h1.write(message);
-        let r = h1.finish();
+    // —— 签名正例常量：上游 noir-lang/eddsa（commit 7e206c9）测试的预计算签名
+    // （secret=123, msg=789），eddsa fork 官方模式——"Manually computed as fields can't
+    // use modulo"，上游 CI 跨版本跑 nargo test 持续验证。Noir 1.0 无法在电路内做
+    // mod-n 归约，正式签名标量由 build 脚本（Python 大整数）计算，见
+    // gen-witness / scripts/formal_gen_to_prover.py；端到端由 CI 正式管线把关。
+    fn fork_signature() -> (Field, Field, Field, Field, Field) {
+        let r = 1414770703199880747815475415092878800081323795074043628810774576767372531818;
+        let s = 30333430637424319196043722294837632681219980330991241982145549329256671548;
         let base8: BabyJubJub = Curve { x: BASE8_X, y: BASE8_Y };
-        let r8 = base8.mul(ScalarField::<64>::from(r));
-        let (ax, ay) = eddsa_to_pub(secret);
-        let mut h2 = PoseidonHasher::default();
-        h2.write(r8.x);
-        h2.write(r8.y);
-        h2.write(ax);
-        h2.write(ay);
-        h2.write(message);
-        let h = h2.finish();
-        let s = (r + h * secret) % SUBORDER;
+        let r8 = base8.mul(ScalarField::<63>::from(r));
+        let (ax, ay) = eddsa_to_pub(123);
         (ax, ay, s, r8.x, r8.y)
     }
 
@@ -393,29 +383,24 @@ mod tests {
 
     #[test]
     fn agent_sig_accepts_valid_and_rejects_tampered() {
-        let secret = 1234;
-        let intent = compute_intent_hash(
-            fixture_agent_commit(),
-            fixture_delegation_hash(),
-            fixture_recipient(),
-            1234,
-            fixture_category(),
-            7,
-            1_700_000_000,
-        );
-        let message = encode_field(intent);
-        let (ax, ay, s, r8x, r8y) = test_sign(secret, message);
+        // 构造 intent 使 encode_field(intent) == 789（fork 常量签名对象 msg）：
+        // encode_field = Σ intent[i]·256^i, i∈0..31；21 + 3·256 = 789。
+        let mut intent = [0u8; 32];
+        intent[0] = 0x15; // 21
+        intent[1] = 0x03; // 3
+        assert(encode_field(intent) == 789);
+        let (ax, ay, s, r8x, r8y) = fork_signature();
 
-        // 正例：有效签名通过
+        // 正例：有效签名通过（签名对象 = encode_field(intent) == 789 == fork 常量 msg）
         assert(agent_sig_ok(ax, ay, s, r8x, r8y, intent));
-        // 负例 1：intent_hash 被改（签名对象变）→ false
+        // 负例 1：intent 被改（第 0 字节翻转 → encode_field ≠ 789，签名对象变）→ false
         let mut forged = intent;
         forged[0] ^= 0x01;
         assert(!agent_sig_ok(ax, ay, s, r8x, r8y, forged));
         // 负例 2：换另一把仍在曲线上的公钥 → false
-        let (bx, by, _, _, _) = test_sign(4567, message);
+        let (bx, by) = eddsa_to_pub(4567);
         assert(!agent_sig_ok(bx, by, s, r8x, r8y, intent));
-        // 负例 3：s 被篡改（仍 < suborder，不触发 assert）→ false
+        // 负例 3：s 被篡改（s+1 仍远小于 suborder，不触发 assert）→ false
         assert(!agent_sig_ok(ax, ay, s + 1, r8x, r8y, intent));
     }
 

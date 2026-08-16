@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # S-09 正式电路 spend_authorization 端到端管线（CI）。链路：
-#   gen-witness（Noir 内确定性 eddsa_sign + 撤销稀疏树）→ circuits/Prover.toml →
+#   gen-witness（Noir 内确定性 EdDSA 挑战 eddsa_challenge + 撤销稀疏树）→
+#   build 脚本（Python 大整数算签名标量 s）→ circuits/Prover.toml →
 #   nargo execute → bb write_vk/prove/verify → 公共输入回读(121) → 负向篡改 →
 #   B2/B3/B4 计时基线 + 约束门禁 → bb contract（EVM 验证器，Phase 4 复用）。
 # 非 TEMPORARY：正式电路的回归 + 基准管线（区别于 smoke 的 S-05 冒烟脚手架）。
