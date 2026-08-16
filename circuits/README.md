@@ -94,7 +94,11 @@ BN254 域，单射；断言 9 在电路内钉死完整 intent_hash → 无 mod-p
 - **硬门禁**：formal_bench.py 断言 `bb gates` 的 circuit_size < 2^18，超了 CI 红。
 - **bb 子命令名（CI run 31933654531 实测）**：bb 6.0.0-nightly.20260724 无 `info` / `contract`
   子命令，门数用 `bb gates -b <acir>`（输出 `{"functions":[{"circuit_size":G}]}`），
-  EVM 验证器用 `bb write_solidity_verifier -k vk -o out.sol`。升级 bb 需复查子命令名。
+  EVM 验证器用 `bb write_solidity_verifier -t evm-no-zk -k vk -o out.sol`。升级 bb 需复查子命令名。
+- **Flavor 一致性（CI run 31933941769 实测）**：`write_solidity_verifier` 硬编码
+  `UltraKeccakFlavor::VerificationKey`（oracle_hash=keccak + disable_zk）。因此
+  `write_vk` / `prove` / `verify` 必须统一加 `-t evm-no-zk`，否则默认 poseidon2 的
+  UltraFlavor VK（3680B）与 keccak VK（1888B）尺寸不匹配（`expected 1888, got 3680`）。
 - 每次电路改动：约束数变化需在 PR 描述里说明，避免无解释的膨胀。
 
 ## `gen-witness/` — 正式电路 witness 生成器（S-09c）

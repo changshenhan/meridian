@@ -4,6 +4,10 @@
 - 约束数：`bb gates -b target/spend_authorization.json` 抽取 circuit_size，硬门禁 < 2^18
   （MASTER_PLAN S-09 约束预算）。bb 6.0.0-nightly.20260724 无 `info` 子命令，门数命令为
   `gates`（CI run 31933654531 实测：`info` rc=109 不可用）。
+- Flavor：B2/B3 计时用 `-t evm-no-zk`（oracle_hash=keccak + disable_zk=true →
+  UltraKeccakFlavor），与 formal_zk.sh 4/8 和 8/8 一致。bb 6.0.0-nightly 的
+  `write_solidity_verifier` 硬编码 `UltraKeccakFlavor::VerificationKey`，prove/verify
+  若用默认 poseidon2（UltraFlavor）则 VK 尺寸不匹配（CI run 31933941769）。
 - B2 证明 p50 < 1s：3 次 `bb prove`（含 witness 加载）取中位数。进程开销相对证明时间可忽略。
 - B3 单验证 p99 < 10ms：10 次 `bb verify` 取 p99。**注意**：bb 是 CLI 进程，启动+加载
   约数十 ms，CLI 测量值是纯验证数学的上界（真值需 Phase 4 Rust in-process wrapper）。
@@ -100,10 +104,13 @@ def main() -> int:
         print(f"constraints: {gates} (budget < {GATE_BUDGET}) OK")
 
     # 2) B2 prove p50（3 次取中位数）
+    # -t evm-no-zk 与 formal_zk.sh 4/8 一致（oracle_hash=keccak + disable_zk=true →
+    # UltraKeccakFlavor）；prove/verify 必须和 write_solidity_verifier 用同一 flavor，
+    # 否则 VK 尺寸/证明类型对不上（CI run 31933941769 实测 VK 尺寸错误）。
     prove_times = []
     for _ in range(N_PROVE):
         t0 = time.perf_counter()
-        subprocess.run([BB, "prove", "-b", str(acir), "-w", str(wit), "-o", str(circ / "target")],
+        subprocess.run([BB, "prove", "-t", "evm-no-zk", "-b", str(acir), "-w", str(wit), "-o", str(circ / "target")],
                        cwd=str(circ), capture_output=True, check=True)
         prove_times.append(time.perf_counter() - t0)
     p50_prove = statistics.median(prove_times)
@@ -112,7 +119,7 @@ def main() -> int:
     verify_times = []
     for _ in range(N_VERIFY):
         t0 = time.perf_counter()
-        subprocess.run([BB, "verify", "-p", str(proof), "-k", str(vk)],
+        subprocess.run([BB, "verify", "-t", "evm-no-zk", "-p", str(proof), "-k", str(vk)],
                        cwd=str(circ), capture_output=True, check=True)
         verify_times.append(time.perf_counter() - t0)
     p99_verify = sorted(verify_times)[max(int(len(verify_times) * 0.99) - 1, 0)]

@@ -28,9 +28,14 @@ echo "[formal] 3/8 spend_authorization — nargo execute (witness)"
 ( cd "$ROOT/circuits" && nargo execute )
 
 echo "[formal] 4/8 bb write_vk + prove + verify"
-( cd "$ROOT/circuits" && bb write_vk -b target/spend_authorization.json -o target )
-( cd "$ROOT/circuits" && bb prove -b target/spend_authorization.json -w target/spend_authorization.gz -o target )
-( cd "$ROOT/circuits" && bb verify -p target/proof -k target/vk )
+# --verifier_target evm-no-zk：CLI 翻译成 oracle_hash=keccak + disable_zk=true，选中
+# UltraKeccakFlavor。必须与 8/8 write_solidity_verifier 一致——bb 6.0.0-nightly 的
+# CircuitWriteSolidityVerifier 硬编码 UltraKeccakFlavor::VerificationKey（1888B），
+# 默认 poseidon2 的 UltraFlavor VK（3680B）对不上（CI run 31933941769 实测
+# "expected 1888, got 3680"）。
+( cd "$ROOT/circuits" && bb write_vk -t evm-no-zk -b target/spend_authorization.json -o target )
+( cd "$ROOT/circuits" && bb prove -t evm-no-zk -b target/spend_authorization.json -w target/spend_authorization.gz -o target )
+( cd "$ROOT/circuits" && bb verify -t evm-no-zk -p target/proof -k target/vk )
 
 echo "[formal] 5/8 public-input readback (121 fields)"
 python3 "$ROOT/scripts/formal_readback.py" "$ROOT/circuits"
@@ -52,6 +57,6 @@ python3 "$ROOT/scripts/formal_bench.py" "$ROOT/circuits"
 
 echo "[formal] 8/8 EVM verifier (bb write_solidity_verifier, Phase 4 reuse)"
 mkdir -p "$ROOT/circuits/artifacts"
-( cd "$ROOT/circuits" && bb write_solidity_verifier -k target/vk -o artifacts/UltraVerifier.sol )
+( cd "$ROOT/circuits" && bb write_solidity_verifier -t evm-no-zk -k target/vk -o artifacts/UltraVerifier.sol )
 ls -la "$ROOT/circuits/artifacts"
 echo "[formal] pipeline OK"
