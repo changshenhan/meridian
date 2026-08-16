@@ -1,0 +1,29 @@
+[package]
+name = "meridian-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Meridian S-07 MCP 探针：authorize/pay，让 agent 今天就能调\"花钱\"（stdin/stdout MCP server）"
+
+[dependencies]
+meridian-core = { workspace = true }
+# rmcp = 官方 Rust MCP SDK（modelcontextprotocol/rust-sdk）。3.x API：
+#   `#[tool_router]` + `#[tool(description=...)]` + `Parameters(Request)` + `ServerHandler`。
+# server 特性含 stdio / async-rw transport + schemars（工具 JSON Schema 自动生成）。
+rmcp = { version = "3.1", features = ["server", "macros", "transport-io"] }
+# 工具入参的 JSON Schema 自动生成（#[tool] 宏对 Parameters<T> 要求 T: JsonSchema）。
+# rmcp 自带 schemars，但 derive 需要在我们的 crate 里直接用。
+schemars = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "sync", "time"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+k256 = { workspace = true }
+anyhow = "1"
+
+[dev-dependencies]
+# CI 集成测试用 rmcp client（与 server 同版本，特性统一）。生产构建不含 client。
+rmcp = { version = "3.1", features = ["client"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
