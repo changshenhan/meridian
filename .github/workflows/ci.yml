@@ -30,14 +30,16 @@ jobs:
         run: cargo bench -p meridian-bench --no-run
 
       # 性能门禁（TECH_SPEC §8.3）：同一 runner 上先记录再比对，机器无关。
-      # GitHub Actions runner 共享 CPU，噪声可到 ±10%，此处用 10% 抓灾难性回归；
-      # 精确的 1% 回归基线（§6.5）在受控参考平台上手动执行：
+      # GitHub Actions runner 共享 CPU，实测噪声可到 ±10% 以上（intent_verify_ops
+      # 是 ~35µs 的 Ed25519 验签，对 turbo/争用最敏感，曾测出 -10.28% 假阳性）。
+      # 阈值必须高于噪声地板：CI 用 15% 抓灾难性回归，1% 精准基线（§6.5）留在
+      # 受控参考平台上手动执行：
       #   cargo run --release -p meridian-bench --bin gate -- --record
-      #   cargo run --release -p meridian-bench --bin gate            # 默认 --fail-over 1
+      #   cargo run --release -p meridian-bench --bin gate -- --fail-over 1
       - name: perf gate (release)
         run: |
           cargo run --release -p meridian-bench --bin gate -- --record
-          cargo run --release -p meridian-bench --bin gate -- --fail-over 10
+          cargo run --release -p meridian-bench --bin gate -- --fail-over 15
 
   # Noir（S-05）—— Windows 无法构建 nargo_cli v1.0.0-beta.26（termion 仅 unix），
   # 且该版本无 Windows 预编译二进制、无 prove/verify 子命令（proving 已外移到 bb）。
@@ -89,10 +91,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
 
+      # runner 是 bash --noprofile --norc：安装器写入的 .bashrc 不会生效，
+      # 必须显式 export PATH（install 之后再 export，且用全路径调用）。
       - name: Install foundry (pinned to local 1.7.1)
         run: |
-          export PATH="$HOME/.foundry/bin:$PATH"
           curl -sSfL https://foundry.paradigm.xyz | bash
+          export PATH="$HOME/.foundry/bin:$PATH"
           foundryup --version v1.7.1
           forge --version
 

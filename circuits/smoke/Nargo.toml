@@ -7,7 +7,9 @@ authors = ["Meridian Labs"]
 # 独立 workspace（CI 实测必需）：否则 nargo 1.0 把父级 circuits/Nargo.toml
 # 当作隐式 workspace 根，cd 进本目录跑 `nargo compile` 会去选根包
 # spend_authorization 而报 "Selected package spend_authorization was not found"。
+# nargo 1.0 要求 [workspace] 必须显式给 members（空表报 "missing field members"）。
 [workspace]
+members = ["./"]
 
 # TEMPORARY —— S-05 管线冒烟脚手架（secp256k1 blackbox）。
 # 目标：在 CI 上跑通 nargo prove → bb verify → 公共输入回读 全链路，为正式电路铺路。
