@@ -6,8 +6,10 @@
 
 公开输入编码（v1.0.0-beta.26，noirc_evaluator::ssa::split_public_and_private_inputs）：
 `pub [u8; 32]` → 每个字节一个公共 witness（field），`pub Field` → 一个 witness，
-故本电路共 32+32+32+1 = 97 个公共输入。首次 CI 会确认 field 的大小端序与
-public_inputs 文件名，如有出入据此脚本调整一次。
+故本电路共 32+32+32+1 = 97 个公共输入。
+大小端（CI run 31926533047 实测确认）：bb 的 public_inputs 里每个 field 是 **32 字节
+大端**——值 0x3a 存成 00…003a。小端解码会错读成 0x3a<<248（即当时的 got/want
+失配：`got 570000…00 want 00000057`，同一字节两种字节序）。
 
 验证完成后删除；不进 SPEC / 文档。
 """
@@ -18,8 +20,8 @@ from pathlib import Path
 FIELD = 32  # barretenberg field = 32 bytes
 
 
-def le(b: bytes) -> int:
-    return int.from_bytes(b, "little")
+def be(b: bytes) -> int:
+    return int.from_bytes(b, "big")
 
 
 def main() -> int:
@@ -39,7 +41,7 @@ def main() -> int:
     if len(raw) % FIELD != 0:
         print(f"ERROR: {pi_path} size {len(raw)} not a multiple of {FIELD}", file=sys.stderr)
         return 1
-    actual = [le(raw[i : i + FIELD]) for i in range(0, len(raw), FIELD)]
+    actual = [be(raw[i : i + FIELD]) for i in range(0, len(raw), FIELD)]
 
     expected = (
         list(prover["message_hash"])
