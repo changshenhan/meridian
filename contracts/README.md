@@ -64,8 +64,9 @@ cd rust-smoke && cargo run   # anvil 部署 + 全链路（需先 forge build 产
 
 ## CI（.github/workflows/ci.yml `solidity` job）
 
-foundryup 钉 `v1.7.1`（与本机对齐）→ `forge install`（按 foundry.lock）
-→ `forge build` + `forge test` → alloy 冒烟（`cargo run`，自动 spawn anvil）。
+CI 直接下载钉死版本 `v1.7.1` 的官方 release 产物（绕开 foundryup：其落点依赖
+`${XDG_CONFIG_HOME:-$HOME}`，与 `$HOME/.foundry` 不一致）→ `forge install`（按
+foundry.lock）→ `forge build` + `forge test` → alloy 冒烟（`cargo run`，自动 spawn anvil）。
 
 ## 决策记录
 

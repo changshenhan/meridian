@@ -7,7 +7,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-SMOKE="$ROOT/circuits/smoke"
+# smoke 电路在仓库根（不在 circuits/ 下）：nargo 1.0 以「顶层 Nargo.toml」为
+# workspace 根，smoke 若在 circuits/ 内会撞上 spend_authorization 的隐式根包，见
+# smoke/Nargo.toml 注释。
+SMOKE="$ROOT/smoke"
 
 echo "[smoke] 1/5 generate deterministic signature -> Prover.toml"
 cargo run --release --manifest-path "$ROOT/circuits/smoke-gen/Cargo.toml" -- "$SMOKE/Prover.toml"

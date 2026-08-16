@@ -81,11 +81,13 @@ S-02 的 Ed25519（NodeId）**保持传输层身份，不改已验收代码**。
 
 ## `smoke/` — TEMPORARY 管线脚手架（不进文档/SPEC）
 
-`circuits/smoke`（secp256k1 blackbox）+ `circuits/smoke-gen`（Rust，k256 确定性签名）+ 
+仓库根的 `smoke`（secp256k1 blackbox）+ `circuits/smoke-gen`（Rust，k256 确定性签名）+ 
 `scripts/smoke_zk.sh` / `scripts/smoke_readback.py`：在 CI 上把
 `nargo compile → execute → bb write_vk → prove → verify → 公共输入回读 → 负向篡改` 全链路
 先跑通，为正式电路铺路。代码内已标注 TEMPORARY；验证完成后删除。**不允许**把该脚手架
 写进 TECH_SPEC / 文档（secp256k1 blackbox 仅作 smoke-test 脚手架，不是 DSA 设计）。
+`smoke` 放在仓库根而非 `circuits/` 下，是 nargo 1.0 workspace 解析所致（顶层
+Nargo.toml 即 workspace 根，且禁止 [package]+[workspace] 同文件），见 `smoke/Nargo.toml` 注释。
 
 ## 目录
 
@@ -93,6 +95,7 @@ S-02 的 Ed25519（NodeId）**保持传输层身份，不改已验收代码**。
 circuits/
   Nargo.toml        spend_authorization 包（外部库 git-tag 锁定）
   src/main.nr       电路 + 正/负向黑箱测试（Noir 1.0：mod tests + #[test]，无 cfg）
-  smoke/            TEMPORARY 冒烟电路（仅 stdlib）
   smoke-gen/        独立 Rust workspace；生成 smoke 的 Prover.toml（k256，确定性）
+smoke/
+  Nargo.toml        TEMPORARY 冒烟电路（仅 stdlib；顶层包，避开支 workspace 嵌套）
 ```

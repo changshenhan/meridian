@@ -13,8 +13,8 @@ Thumbs.db
 
 # Noir 构建产物（CI 生成，不提交）
 circuits/target/
-circuits/smoke/target/
-circuits/smoke/Prover.toml
+smoke/target/
+smoke/Prover.toml
 
 # Foundry 依赖与构建产物（CI 各自安装/构建；foundry.lock 保留锁定依赖）
 contracts/lib/
