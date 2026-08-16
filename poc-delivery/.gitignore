@@ -1,0 +1,2 @@
+# 独立 workspace 的 Rust 构建产物（主仓库 /target 不匹配子目录）
+/target
