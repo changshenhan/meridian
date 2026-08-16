@@ -97,15 +97,21 @@ BN254 域，单射；断言 9 在电路内钉死完整 intent_hash → 无 mod-p
 ## `gen-witness/` — 正式电路 witness 生成器（S-09c）
 
 仓库根的 `gen-witness`（Noir 包）：确定性生成正式电路的 witness——Noir 内做
-`eddsa_sign`（镜像电路的 `eddsa_verify` 的 Poseidon 域）+ 撤销稀疏树建树/寻路
-（`unconstrained` brillig 递归 `subtree_root`；S-05 教训：不做跨语言曲线数学）。Rust core
-侧只做纯字节逻辑（`zk_intent_hash` / `revocation_index`，共享 hex 向量锁定）。
+`eddsa_challenge`（镜像电路的 `eddsa_verify` 的 Poseidon 域，输出 `(r, h, r8.x, r8.y)`）
++ 撤销稀疏树建树/寻路（`unconstrained` brillig 递归 `subtree_root`；S-05 教训：不做跨语言
+曲线数学）。**签名标量 `s = (r + h·secret) % SUBORDER` 由 build 脚本用 Python 大整数计算**：
+Noir 1.0 移除了 Field 模运算（`%` 编译报错，eddsa fork 自身测试亦注明 "fields can't use
+modulo"），且 `ScalarField` 无算符、`base4_slices` 为 `pub(crate)`——mod-n 归约在 Noir 内
+无法做。该归约是纯整数逻辑（非曲线数学；R8/h/公钥仍在 Noir），与 Rust core 的纯字节逻辑
+同级，端到端由正式电路 `eddsa_verify`（CI prove）把关：s 错则证明失败。Rust core 侧只做
+纯字节逻辑（`zk_intent_hash` / `revocation_index`，共享 hex 向量锁定）。
 
-`nargo execute --overwrite-return` 把返回值（签名/pubkey/撤销 root+path/intent_hash）写入
-`gen-witness/Prover.toml` 的 `return` 键 → `scripts/formal_gen_to_prover.py`（**第三实现**
-交叉校验：Python hashlib 独立复算 `agent_commit` 与 `intent_hash`，防三侧漂移）→
-`circuits/Prover.toml`。固定场景常量在 `gen-witness/Prover.toml` 与 build 脚本两处定义，
-build 脚本读回输入键即交叉校验（防漂移）。`circuits/Prover.toml` 为生成物，gitignore。
+`nargo execute --overwrite-return` 把返回值（EdDSA 挑战/pubkey/撤销 root+path/intent_hash）
+写入 `gen-witness/Prover.toml` 的 `return` 键 → `scripts/formal_gen_to_prover.py`
+（**第三实现**交叉校验：Python hashlib 独立复算 `agent_commit` 与 `intent_hash`，防三侧
+漂移；另算 `sig_s` 并校验 `0 ≤ s < SUBORDER`）→ `circuits/Prover.toml`。固定场景常量在
+`gen-witness/Prover.toml` 与 build 脚本两处定义，build 脚本读回输入键即交叉校验（防漂移）。
+`circuits/Prover.toml` 为生成物，gitignore。
 
 ## `scripts/formal_zk.sh` — S-09 正式管线（非 TEMPORARY）
 
@@ -135,7 +141,7 @@ circuits/
   smoke-gen/        独立 Rust workspace；生成 smoke 的 Prover.toml（k256，确定性，TEMPORARY）
 gen-witness/
   Nargo.toml        S-09 正式电路 witness 生成器（顶层包，避开支 workspace 嵌套）
-  src/main.nr       eddsa_sign + 撤销稀疏树建树/寻路 + 自检 #[test]
+  src/main.nr       eddsa_challenge（s 归约在 build 脚本）+ 撤销稀疏树建树/寻路 + 自检 #[test]
   Prover.toml       固定场景输入（nargo execute --overwrite-return 追加 return 键）
 smoke/
   Nargo.toml        TEMPORARY 冒烟电路（仅 stdlib；顶层包，避开支 workspace 嵌套）

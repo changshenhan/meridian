@@ -343,12 +343,19 @@ mod tests {
     #[test]
     fn challenge_deterministic() {
         // eddsa_challenge 在同一输入下必须确定（r、h、r8 固定）——witness 生成确定性。
+        // 逐项 assert：Noir beta.26 的 `&&` 布尔链在 Field 比较语境报 "Bitwise operations
+        // are invalid on Field"（Field `==` 返回 Field-truth 而非 bool，`&&` 需 bool；
+        // eddsa fork 测试亦规避 `&&`/`||`，CI run 31931723020 实测），故拆成单比较。
         let (r1, h1, x1, y1) = eddsa_challenge(4242, 987654321);
         let (r2, h2, x2, y2) = eddsa_challenge(4242, 987654321);
-        assert(r1 == r2 && h1 == h2 && x1 == x2 && y1 == y2);
-        // 换 message → 挑战全变
+        assert(r1 == r2);
+        assert(h1 == h2);
+        assert(x1 == x2);
+        assert(y1 == y2);
+        // 换 message → 挑战全变（r、h 均变；r 变则 R8 变）
         let (r3, h3, _, _) = eddsa_challenge(4242, 987654322);
-        assert(r1 != r3 || h1 != h3);
+        assert(r1 != r3);
+        assert(h1 != h3);
     }
 
     #[test]
