@@ -1,0 +1,15 @@
+[package]
+name = "gen_witness"
+version = "0.1.0"
+type = "bin"
+authors = ["Meridian Labs"]
+
+# S-09 正式电路 witness 生成器（确定性，CI prove/verify 管线用）。
+# 与 circuits/ 同工具链锁定与 git 依赖（见 circuits/Nargo.toml 注释）。
+# 位于仓库根（非 circuits/ 下）：nargo 1.0 以「顶层 Nargo.toml」为 workspace 根，
+# 放 circuits/ 内会撞上 spend_authorization 的隐式根包（见 smoke/Nargo.toml 注释）。
+[dependencies]
+eddsa = { tag = "v1.0-7e206c9", git = "https://github.com/changshenhan/eddsa" }
+edwards = { tag = "v0.2.5", git = "https://github.com/noir-lang/noir-edwards" }
+poseidon = { tag = "v0.3.0", git = "https://github.com/noir-lang/poseidon" }
+sha256 = { tag = "v0.3.0", git = "https://github.com/noir-lang/sha256" }

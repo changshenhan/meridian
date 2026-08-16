@@ -1,5 +1,6 @@
 # Rust 构建产物
 /target
+scripts/__pycache__/
 
 # 编辑器 / 系统
 .idea/
@@ -15,6 +16,12 @@ Thumbs.db
 circuits/target/
 smoke/target/
 smoke/Prover.toml
+gen-witness/target/
+# 正式管线生成：Prover.toml 由 formal_gen_to_prover.py 从 gen-witness return 派生；
+# bench 基线 / EVM 验证器为 CI 产物（upload-artifact 交付，Phase 4 复用）
+circuits/Prover.toml
+circuits/bench/
+circuits/artifacts/
 
 # Foundry 依赖与构建产物（CI 各自安装/构建；foundry.lock 保留锁定依赖）
 contracts/lib/

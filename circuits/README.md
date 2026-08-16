@@ -1,7 +1,8 @@
 # `circuits/` — ZK 授权电路（Noir）
 
-`spend_authorization`：DSA 授权电路（TECH_SPEC §5，S-05 去 ECDSA 最小版）。
-本文档是 S-05 的**决策记录**与工具链锁定真相源；MASTER_PLAN 与 TECH_SPEC 引用这里。
+`spend_authorization`：DSA 授权电路完整版（TECH_SPEC §5，S-05 去 ECDSA 最小版 +
+S-09 intent_hash 字段级绑定 + 撤销 Merkle 非成员）。本文档是 S-05/S-09 的**决策记录**
+与工具链锁定真相源；MASTER_PLAN 与 TECH_SPEC 引用这里。
 
 ## 工具链锁定
 
@@ -51,7 +52,7 @@ S-02 的 Ed25519（NodeId）**保持传输层身份，不改已验收代码**。
 | 钥 | 曲线 | 用途 | 验证位置 |
 |---|---|---|---|
 | NodeId | Ed25519 | 传输身份、注册时**绑定签名**的签发钥 | 电路外快路径（S-02，Rust） |
-| attestation key | BabyJubJub | 对 `message`（签名对象）签 EdDSA | **电路内** `eddsa_verify` |
+| attestation key | BabyJubJub | 对 `encode_field(intent_hash)` 签 EdDSA（S-09：签名对象 = intent_hash 31B LE 编码，不再是裸 message） | **电路内** `eddsa_verify` |
 
 绑定协议：注册时 `sign_binding(Ed25519_sk, jubjub_pk)`，签名对象 =
 `b"MERIDIAN-BINDING-v1\0" || pub_x_le || pub_y_le`；`agent_commit = sha256(pub_x_le || pub_y_le)`。
@@ -61,23 +62,59 @@ S-02 的 Ed25519（NodeId）**保持传输层身份，不改已验收代码**。
 **链下一电路承诺一致性约束**：`agent_commit` 的规范 = `sha256(x_le32 || y_le32)`，两侧实现
 （Rust `sha2` 与 Noir `sha256::digest`）必须一致。任何一侧改动需双端测试同步改。
 
-## 电路断言（S-05 范围）
+## 电路断言（S-09 范围，对齐 TECH_SPEC §5.2）
 
 1. `sha256(pub_x_le || pub_y_le) == agent_commit`（承诺解承诺）
-2. `eddsa_verify(pub, sig, message) == true`（agent 对签名对象的 EdDSA）
+2. `eddsa_verify(pub, sig, encode_field(intent_hash)) == true`（agent 对签名对象的 EdDSA）
 3. `amount <= max_per_spend`
 4. `categories_len == 0`，或 `category ∈ categories`（空白名单不要求）
 5. `not_before <= now <= expires_at`
 6. `delegation_hash[0] > 0`（公共锚点非零，证明绑定真实委托上下文）
+7. `spend_nonce > 0`（防零 nonce 误用）
+8. `compute_merkle_root(EMPTY, index, path) == revocation_root`（撤销非成员，叶子=EMPTY）
+9. `intent_hash == sha256(agent_commit ‖ delegation_hash ‖ recipient ‖ amount_le ‖
+   category ‖ spend_nonce_le ‖ expires_at_le)`（字段级绑定，140B 规范字节）
 
-完整版（owner secp256k1 ECDSA + 撤销 Merkle 非成员 + `intent_hash` 字段级绑定）→ S-09。
+owner 的 secp256k1 ECDSA **电路外验证**（S-09 决策）：链上 `DSA.sol::registerDelegation`
+强制 + S-02 `verify_delegation` 已验收 + `attestation.rs` 双钥绑定；电路只锚定
+`delegation_hash`。
 
-## 约束数记录（S-05 验收）
+**签名对象编码**：`encode_field(intent_hash)` = 低 31 字节 LE 截断 → Field（248-bit <
+BN254 域，单射；断言 9 在电路内钉死完整 intent_hash → 无 mod-p 碰撞可乘）。
 
-- **位置**：CI `noir` job 的 `nargo info` 输出（当前 ACIR + bytecode witness 计数）。
-- 记录方式：首次 CI 绿后，把 `nargo info` 的约束数回填到 TECH_SPEC §5.5 预算表
-  （约束目标 < 2^18 含 S-09 的 ECDSA+Ed25519+merkle，S-05 最小版应显著低于该上限）。
+**撤销树**：深度 32 稀疏 Merkle，叶子=EMPTY(0)，`index = delegation_hash[0..4] LE`。
+`std::merkle` 已移出 Noir 1.0 stdlib → 内联 `compute_merkle_root`（merkle_insert 模式，
+`std::hash::pedersen_hash`）。原型级碰撞属性（两 delegation 同 32-bit 前缀共享叶子→撤销
+共享）标注在 SPEC，真实树 S-11 对接 RevocationRegistry 时再设计。
+
+## 约束数记录（S-05 验收 + S-09 正式门禁）
+
+- **位置**：CI `noir` job 的 `nargo info` 输出 + 正式管线 `bb info`（formal_bench.py）。
+- 记录方式：首次 CI 绿后，把约束数回填到 TECH_SPEC §5.5 预算表（约束目标 < 2^18）。
+- **硬门禁**：formal_bench.py 断言 `bb info` gate count < 2^18，超了 CI 红。
 - 每次电路改动：约束数变化需在 PR 描述里说明，避免无解释的膨胀。
+
+## `gen-witness/` — 正式电路 witness 生成器（S-09c）
+
+仓库根的 `gen-witness`（Noir 包）：确定性生成正式电路的 witness——Noir 内做
+`eddsa_sign`（镜像电路的 `eddsa_verify` 的 Poseidon 域）+ 撤销稀疏树建树/寻路
+（`unconstrained` brillig 递归 `subtree_root`；S-05 教训：不做跨语言曲线数学）。Rust core
+侧只做纯字节逻辑（`zk_intent_hash` / `revocation_index`，共享 hex 向量锁定）。
+
+`nargo execute --overwrite-return` 把返回值（签名/pubkey/撤销 root+path/intent_hash）写入
+`gen-witness/Prover.toml` 的 `return` 键 → `scripts/formal_gen_to_prover.py`（**第三实现**
+交叉校验：Python hashlib 独立复算 `agent_commit` 与 `intent_hash`，防三侧漂移）→
+`circuits/Prover.toml`。固定场景常量在 `gen-witness/Prover.toml` 与 build 脚本两处定义，
+build 脚本读回输入键即交叉校验（防漂移）。`circuits/Prover.toml` 为生成物，gitignore。
+
+## `scripts/formal_zk.sh` — S-09 正式管线（非 TEMPORARY）
+
+`gen-witness → Prover.toml → nargo execute → bb write_vk/prove/verify → 公共输入回读
+（121 fields，formal_readback.py）→ 负向篡改（spend_nonce → 求解必失败）→ B2/B3/B4 计时
+基线 + 约束门禁（formal_bench.py）→ `bb contract` EVM 验证器（`circuits/artifacts/`，
+Phase 4 复用）。B2 证明 p50<1s / B3 单验证 p99<10ms（bb CLI 进程含开销上界）/ B4 批验证
+摊薄待 Phase 4 in-process wrapper。基线报告 `circuits/bench/baseline_s09.json` 由 CI
+upload-artifact 交付。smoke 保持 TEMPORARY 原状，不作为正式基线。
 
 ## `smoke/` — TEMPORARY 管线脚手架（不进文档/SPEC）
 
@@ -95,7 +132,14 @@ Nargo.toml 即 workspace 根，且禁止 [package]+[workspace] 同文件），�
 circuits/
   Nargo.toml        spend_authorization 包（外部库 git-tag 锁定）
   src/main.nr       电路 + 正/负向黑箱测试（Noir 1.0：mod tests + #[test]，无 cfg）
-  smoke-gen/        独立 Rust workspace；生成 smoke 的 Prover.toml（k256，确定性）
+  smoke-gen/        独立 Rust workspace；生成 smoke 的 Prover.toml（k256，确定性，TEMPORARY）
+gen-witness/
+  Nargo.toml        S-09 正式电路 witness 生成器（顶层包，避开支 workspace 嵌套）
+  src/main.nr       eddsa_sign + 撤销稀疏树建树/寻路 + 自检 #[test]
+  Prover.toml       固定场景输入（nargo execute --overwrite-return 追加 return 键）
 smoke/
   Nargo.toml        TEMPORARY 冒烟电路（仅 stdlib；顶层包，避开支 workspace 嵌套）
+scripts/
+  formal_zk.sh      S-09 正式管线编排（8 步）
+  formal_gen_to_prover.py / formal_readback.py / formal_bench.py
 ```

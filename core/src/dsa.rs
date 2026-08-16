@@ -173,6 +173,48 @@ pub fn intent_hash(i: &SpendIntent) -> [u8; 32] {
     sha256(&canonical_intent(i))
 }
 
+/// ZK 授权绑定哈希（S-09，电路内断言 9 的意图字段级绑定对象）。
+///
+/// **注意与 `intent_hash(&SpendIntent)` 区分**：后者是 S-02 传输层 Ed25519 签名对象
+/// （含 `INTv1\0` 前缀 + agent Did + memo）。ZK 上下文中 agent 身份是 attestation 公钥
+/// 承诺 `agent_commit`（而非 Did），且 memo 不参与授权绑定，故这里只绑定电路公共输入
+/// 7 元组（无前缀、无 agent、无 memo）：
+/// `agent_commit(32) ‖ delegation_hash(32) ‖ recipient(20) ‖ amount_le(8) ‖
+/// category(32) ‖ spend_nonce_le(8) ‖ expires_at_le(8)` = 140 字节。
+///
+/// 与 `circuits/src/main.nr::compute_intent_hash` 用同一规范字节；双侧由 golden vector
+/// （`zk_intent_hash_golden` 测试）锁同一常量保证一致性。
+pub fn zk_intent_hash(
+    agent_commit: [u8; 32],
+    delegation_hash: [u8; 32],
+    recipient: Did,
+    amount: Amount,
+    category: Category,
+    spend_nonce: u64,
+    expires_at: u64,
+) -> [u8; 32] {
+    let mut preimage = Vec::with_capacity(140);
+    preimage.extend_from_slice(&agent_commit);
+    preimage.extend_from_slice(&delegation_hash);
+    preimage.extend_from_slice(&recipient);
+    preimage.extend_from_slice(&amount.to_le_bytes());
+    preimage.extend_from_slice(&category);
+    preimage.extend_from_slice(&spend_nonce.to_le_bytes());
+    preimage.extend_from_slice(&expires_at.to_le_bytes());
+    sha256(&preimage)
+}
+
+/// 撤销稀疏 Merkle 树索引：`delegation_hash[0..4]` LE 转 u32。
+/// 与电路 `revocation_index` / gen-witness 建树用同一派生（S-09）。
+pub fn revocation_index(delegation_hash: [u8; 32]) -> u32 {
+    u32::from_le_bytes([
+        delegation_hash[0],
+        delegation_hash[1],
+        delegation_hash[2],
+        delegation_hash[3],
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // 签名
 // ---------------------------------------------------------------------------
@@ -363,5 +405,171 @@ mod tests {
         let bytes = canonical_delegation(&d);
         // 6 + agent20 + owner20 + 8*5 + 4 + categories0 + 8*2 + 1 = 6+40+40+4+16+1
         assert_eq!(bytes.len(), 107);
+    }
+
+    /// 与 circuits/src/main.nr 测试 fixture 同输入的 golden vector。
+    /// golden hex 由此测试计算并锁定，Noir 侧（`intent_hash_matches_golden`）锁同一
+    /// 常量 → 跨语言规范字节一致性（sha2 ↔ Noir sha256）由该常量传递保证。
+    #[test]
+    fn zk_intent_hash_golden() {
+        let agent_commit: [u8; 32] = std::array::from_fn(|i| 0x11 + i as u8);
+        let delegation_hash: [u8; 32] = std::array::from_fn(|i| 0x21 + i as u8);
+        let recipient: Did = std::array::from_fn(|i| 0x31 + i as u8);
+        let category: Category = std::array::from_fn(|i| 0x51 + i as u8);
+        let h = zk_intent_hash(
+            agent_commit,
+            delegation_hash,
+            recipient,
+            1234,
+            category,
+            7,
+            1_700_000_000,
+        );
+        let want = "2352acec5b8e431c2e9167f9a07c7b237285d836599b860dba4841663ededf57";
+        assert_eq!(
+            hex::encode(h),
+            want,
+            "golden zk_intent_hash（与 Noir compute_intent_hash 共享）"
+        );
+    }
+
+    #[test]
+    fn zk_intent_hash_sensitive_to_every_field() {
+        let agent_commit: [u8; 32] = std::array::from_fn(|i| 0x11 + i as u8);
+        let delegation_hash: [u8; 32] = std::array::from_fn(|i| 0x21 + i as u8);
+        let recipient: Did = std::array::from_fn(|i| 0x31 + i as u8);
+        let category: Category = std::array::from_fn(|i| 0x51 + i as u8);
+        let base = zk_intent_hash(
+            agent_commit,
+            delegation_hash,
+            recipient,
+            1234,
+            category,
+            7,
+            1_700_000_000,
+        );
+
+        let mut ac = agent_commit;
+        ac[0] ^= 1;
+        assert_ne!(
+            zk_intent_hash(
+                ac,
+                delegation_hash,
+                recipient,
+                1234,
+                category,
+                7,
+                1_700_000_000
+            ),
+            base
+        );
+
+        let mut dh = delegation_hash;
+        dh[0] ^= 1;
+        assert_ne!(
+            zk_intent_hash(
+                agent_commit,
+                dh,
+                recipient,
+                1234,
+                category,
+                7,
+                1_700_000_000
+            ),
+            base
+        );
+
+        let mut rc = recipient;
+        rc[0] ^= 1;
+        assert_ne!(
+            zk_intent_hash(
+                agent_commit,
+                delegation_hash,
+                rc,
+                1234,
+                category,
+                7,
+                1_700_000_000
+            ),
+            base
+        );
+
+        assert_ne!(
+            zk_intent_hash(
+                agent_commit,
+                delegation_hash,
+                recipient,
+                1235,
+                category,
+                7,
+                1_700_000_000
+            ),
+            base
+        );
+
+        let mut cat = category;
+        cat[0] ^= 1;
+        assert_ne!(
+            zk_intent_hash(
+                agent_commit,
+                delegation_hash,
+                recipient,
+                1234,
+                cat,
+                7,
+                1_700_000_000
+            ),
+            base
+        );
+
+        assert_ne!(
+            zk_intent_hash(
+                agent_commit,
+                delegation_hash,
+                recipient,
+                1234,
+                category,
+                8,
+                1_700_000_000
+            ),
+            base
+        );
+
+        assert_ne!(
+            zk_intent_hash(
+                agent_commit,
+                delegation_hash,
+                recipient,
+                1234,
+                category,
+                7,
+                1_700_000_001
+            ),
+            base
+        );
+    }
+
+    #[test]
+    fn revocation_index_is_le_first_four_bytes() {
+        // 与电路派生一致：dh[0] 是最低位（LE）。
+        let dh = [0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB, 0xCC, 0xDD];
+        let full: [u8; 32] = {
+            let mut a = [0u8; 32];
+            a[..8].copy_from_slice(&dh);
+            a
+        };
+        assert_eq!(
+            revocation_index(full),
+            u32::from_le_bytes([0x01, 0x02, 0x03, 0x04])
+        );
+        // 后 28 字节不影响索引（原型级 32-bit 索引，碰撞属性见 SPEC）。
+        assert_eq!(
+            revocation_index(full),
+            revocation_index({
+                let mut a = full;
+                a[8] ^= 1;
+                a
+            })
+        );
     }
 }
