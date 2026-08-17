@@ -890,6 +890,24 @@ impl Aggregator {
         self.state.nonce_count(dh)
     }
 
+    /// S-13a MCP 只读探针：`(dh, spend_nonce, intent_hash)` 是否已被接受？返回其 seq
+    /// （= `submit` 最前幂等闸口的公共包装，与 re-ack 同源）。
+    /// 拒绝（预算拒）、跨意图 nonce 复用、以及从未见过 → `None`。
+    pub fn accepted_seq(
+        &self,
+        dh: &[u8; 32],
+        spend_nonce: u64,
+        intent_hash: [u8; 32],
+    ) -> Option<u64> {
+        self.state.lookup_accept(dh, spend_nonce, intent_hash)
+    }
+
+    /// 注册表只读（S-13a：authorize 的 EAttestBind 跨重启兜底——重启后也能查到
+    /// 已注册委托绑定的 agent 公钥）。
+    pub fn registered(&self, dh: &[u8; 32]) -> Option<RegisteredDelegation> {
+        self.registry.lookup(dh)
+    }
+
     /// 已接受总数（== 下一个待分配的 seq；测试 / 观测）。
     pub fn accepted_count(&self) -> u64 {
         self.seq.load(Ordering::Relaxed)
@@ -1037,6 +1055,47 @@ mod tests {
             )
         );
         let _ = agent_pub;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accepted_seq_reports_accepted_rejected_and_cross_intent() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("accepted_seq");
+        let agg = test_aggregator(&clock, &path);
+        let (dh, _agent_pub) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+
+        // 已接受 → Some(seq)。
+        let env1 = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+        let r1 = agg.submit(&env1);
+        assert!(r1.accepted);
+        let ih1 = meridian_core::dsa::intent_hash(&env1.intent);
+        assert_eq!(agg.accepted_seq(&dh, 1, ih1), Some(0));
+
+        // 预算拒（max_per_spend=1_000，付 2_000）→ nonce 已消耗但未接受 → None。
+        let env2 = make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 2_000, 2, now);
+        let r2 = agg.submit(&env2);
+        assert!(!r2.accepted);
+        assert_eq!(r2.reject_reason, Some(Error::EBudgetPerSpend));
+        let ih2 = meridian_core::dsa::intent_hash(&env2.intent);
+        assert_eq!(agg.accepted_seq(&dh, 2, ih2), None);
+
+        // 跨意图同 nonce 复用 → E_NONCE，lookup_accept 也不认 → None。
+        let env3 = make_env(dh, [1u8; 20], &agent_key, [0xCC; 20], 1, 1, now);
+        let r3 = agg.submit(&env3);
+        assert_eq!(r3.reject_reason, Some(Error::ENonce));
+        let ih3 = meridian_core::dsa::intent_hash(&env3.intent);
+        assert_eq!(agg.accepted_seq(&dh, 1, ih3), None);
+
+        // 从未见过的 nonce → None。
+        assert_eq!(agg.accepted_seq(&dh, 99, [0xFF; 32]), None);
+
+        // 注册表只读：registered() 能看到注册的委托与 agent 绑定。
+        let reg = agg.registered(&dh).expect("registered delegation present");
+        assert_eq!(reg.delegation.agent, [1u8; 20]);
+        assert_eq!(reg.agent_pub, agent_key.verifying_key());
         let _ = std::fs::remove_file(&path);
     }
 

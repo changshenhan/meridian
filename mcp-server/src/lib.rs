@@ -1,43 +1,44 @@
-//! S-07 MCP 探针：`meridian.authorize` / `meridian.pay`。
+//! S-13 MCP 服务器正式版：`meridian.authorize` / `meridian.pay` / `meridian.balance` /
+//! `meridian.attest` / `meridian.verify_receipt`。
 //!
-//! 形态：**单进程聚合器** + **stdin/stdout MCP server**。任何主流 agent 框架
-//! （Claude Desktop / Code / 自定义 MCP client）都能把本 server 配成 MCP 工具，
-//! 让 agent 今天就"花钱"——经过授权的预算内模拟支付。
+//! 形态：**stdio MCP server + 内嵌真实聚合器内核**（`meridian-aggregator`：WAL 持久化、
+//! 幂等 re-ack、单调 seq、真错误码、预算强制）。任何主流 agent 框架（LangChain / AutoGen /
+//! ElizaOS / Claude Desktop / 自定义 MCP client）都能把本 server 配成 MCP 工具，让 agent
+//! 用 DSA 授权自动购买数据 / API 额度。
 //!
-//! TEMPORARY 边界（S-07 验收口径，README 决策记录里有完整版）：
-//! `pay()` 的授权 = agent Ed25519 验签 + 预算检查，**无 ZK 证明**。
-//! S-09 把真实 circuit 证明插进同一路径（state.rs::pay 内留了挂载点）。
+//! 安全模型（Shape 1，延续 S-07）：**服务器不持有任何私钥**。owner secp256k1 与 agent
+//! Ed25519 密钥都在框架侧、签名外部完成；服务器只验签 + 执行。authorize 校验 owner 对
+//! delegation_hash 的 secp256k1 签名后调 `Aggregator::register`；pay 由服务器用占位证明
+//! 构造信封（诚实边界，见 README）后 `Aggregator::submit`——幂等重发（S-12）免费获得。
 //!
-//! 依赖的 core 语义：owner ECDSA-secp256k1 签 `Delegation`，agent Ed25519 签
-//! `SpendIntent`；账本执行预算（规则 1-6）。全部复用 S-02/S-05/S-06 已验收代码。
+//! TEMPORARY 边界（诚实口径，README 决策记录有完整版）：`pay()` 的 ZK 证明目前是服务器
+//! 侧占位（proof 非空 + 公共输入与 intent 一致），`FormatVerifier` 只做格式门禁。真实
+//! S-09 电路 prover 实现 `SpendVerifier` 插同一路径即可，`pay` 不改。
 //!
 //! 模块划分（宏作用域约束：`#[tool_router]` 生成的 `tool_router()` 关联函数与
 //! `#[tool_handler]` 必须同模块，见 tools.rs）。
 
 use std::sync::Arc;
 
+use meridian_aggregator::ingest::Aggregator;
+
 pub mod state;
 pub mod tools;
 
 use state::AppState;
 
-/// Meridian MCP 探针服务端（S-07）。
+/// Meridian MCP 服务器正式版（S-13）。
 #[derive(Clone)]
 pub struct MeridianServer {
     pub(crate) state: Arc<AppState>,
 }
 
 impl MeridianServer {
-    pub fn new() -> Self {
+    /// 注入聚合器内核（main.rs / 测试各自构造，WAL 路径由调用方决定）。
+    pub fn new(agg: Arc<Aggregator>) -> Self {
         Self {
-            state: Arc::new(AppState::new()),
+            state: Arc::new(AppState::new(agg)),
         }
-    }
-}
-
-impl Default for MeridianServer {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

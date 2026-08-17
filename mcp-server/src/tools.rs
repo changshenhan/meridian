@@ -1,4 +1,4 @@
-//! S-07 MCP 工具定义：`authorize` / `pay`。
+//! S-13 MCP 工具定义：`authorize` / `pay` / `balance` / `attest` / `verify_receipt`。
 //!
 //! 入参用**扁平 hex 字符串**而非嵌套 core 类型：`#[tool]` 宏需要入参类型实现
 //! `JsonSchema`（rmcp 用 schemars 生成工具 JSON Schema），而 core 的 `Delegation`
@@ -9,6 +9,7 @@
 //! rmcp 会把 Err 分支标成 `is_error=true`（MCP 客户端/agent 可见真失败）。
 
 use ed25519_dalek::Signature as AgentSignature;
+use meridian_core::attestation::AttestationPubKey;
 use meridian_core::dsa::{
     AgentPubKey, Delegation, OwnerPubKey, RateLimit, Signature64, SpendIntent,
 };
@@ -152,6 +153,65 @@ impl PayRequest {
     }
 }
 
+/// `meridian.balance` 入参。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct BalanceRequest {
+    /// 目标委托的 delegation_hash（32 字节 hex）。
+    pub delegation_hash: String,
+}
+
+impl BalanceRequest {
+    fn into_dh(self) -> Result<[u8; 32], String> {
+        decode::<32>(&self.delegation_hash, "delegation_hash")
+    }
+}
+
+/// `meridian.attest` 入参。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct AttestRequest {
+    /// 目标委托的 delegation_hash（32 字节 hex）。
+    pub delegation_hash: String,
+    /// attestation 公钥 x 坐标（BabyJubJub，32 字节小端 hex）。
+    pub pk_x: String,
+    /// attestation 公钥 y 坐标（BabyJubJub，32 字节小端 hex）。
+    pub pk_y: String,
+    /// agent Ed25519 对 `MERIDIAN-BINDING-v1\0 || x_le || y_le` 的绑定签名（64 字节 hex）。
+    pub binding: String,
+}
+
+impl AttestRequest {
+    fn into_parts(self) -> Result<([u8; 32], AttestationPubKey, AgentSignature), String> {
+        let dh = decode::<32>(&self.delegation_hash, "delegation_hash")?;
+        let pk = AttestationPubKey {
+            x: decode::<32>(&self.pk_x, "pk_x")?,
+            y: decode::<32>(&self.pk_y, "pk_y")?,
+        };
+        let binding = AgentSignature::from_bytes(&decode::<64>(&self.binding, "binding")?);
+        Ok((dh, pk, binding))
+    }
+}
+
+/// `meridian.verify_receipt` 入参。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct VerifyReceiptRequest {
+    /// 目标委托的 delegation_hash（32 字节 hex）。
+    pub delegation_hash: String,
+    /// 花费序号。
+    pub spend_nonce: u64,
+    /// 意图哈希（32 字节 hex）。
+    pub intent_hash: String,
+}
+
+impl VerifyReceiptRequest {
+    fn into_parts(self) -> Result<([u8; 32], u64, [u8; 32]), String> {
+        Ok((
+            decode::<32>(&self.delegation_hash, "delegation_hash")?,
+            self.spend_nonce,
+            decode::<32>(&self.intent_hash, "intent_hash")?,
+        ))
+    }
+}
+
 /// `#[tool_router]` 生成模块私有的 `tool_router()` 关联函数：每次调用重建一个
 /// 装满路由的 `ToolRouter`（路由表由宏内联在构造器里，无跨请求状态）。
 /// `#[tool_handler]` 生成的 `call_tool/list_tools/get_tool` 每请求调一次它，
@@ -163,7 +223,7 @@ impl MeridianServer {
     /// 并把该委托绑定到 agent 传输身份公钥（Ed25519）。返回回执。
     #[tool(
         name = "authorize",
-        description = "注册一张 DSA 委托（Delegated Spend Authority）：校验 owner 签名并绑定 agent 身份。返回 delegation_hash 与预算上限。"
+        description = "注册一张 DSA 委托（Delegated Spend Authority）：校验 owner 签名并绑定 agent 身份到真实聚合器。返回 delegation_hash 与预算上限。幂等：同委托同 agent 重发返回既有回执。"
     )]
     fn authorize(&self, req: Parameters<AuthorizeRequest>) -> Result<String, String> {
         let (delegation, signature, owner_pub, agent_pub) = req.0.into_parts()?;
@@ -176,11 +236,11 @@ impl MeridianServer {
         }
     }
 
-    /// 执行一笔模拟支付：校验 agent 对 intent 的 Ed25519 签名、防重放、
-    /// 预算检查与记账。返回回执（含累计支出与剩余额度）。
+    /// 执行一笔支付：真实聚合器内核执行全部闸口（幂等 re-ack → 验签 → 预算 → WAL）。
+    /// 返回回执（含 seq）。TEMPORARY：证明是服务器侧占位，S-09 接入真电路。
     #[tool(
         name = "pay",
-        description = "执行一笔模拟支付（SpendIntent）：agent 签名 + 预算检查 + 记账。返回回执。TEMPORARY：无 ZK 证明，S-09 接入。"
+        description = "执行一笔支付（SpendIntent）：真实聚合器验签 + 预算强制 + WAL，幂等重发返回先前 seq。返回 {intent_hash, seq, spend_nonce}。"
     )]
     fn pay(&self, req: Parameters<PayRequest>) -> Result<String, String> {
         let (intent, sig) = req.0.into_parts()?;
@@ -189,14 +249,50 @@ impl MeridianServer {
             Err(e) => Err(err_body(e.as_code())),
         }
     }
+
+    /// 查询委托剩余额度。
+    #[tool(
+        name = "balance",
+        description = "查询委托剩余额度：聚合器累计已花 vs 授权 total_cap。返回 {total_spent, total_cap, remaining}。"
+    )]
+    fn balance(&self, req: Parameters<BalanceRequest>) -> Result<String, String> {
+        let dh = req.0.into_dh()?;
+        match self.state.balance(&dh) {
+            Ok(receipt) => Ok(ok_body(&receipt)),
+            Err(e) => Err(err_body(e.as_code())),
+        }
+    }
+
+    /// 双钥绑定凭据。
+    #[tool(
+        name = "attest",
+        description = "双钥绑定凭据（S-05）：authorize 时绑定的 agent Ed25519 对 BabyJubJub attestation 公钥签名。返回 agent_commit 与凭据。"
+    )]
+    fn attest(&self, req: Parameters<AttestRequest>) -> Result<String, String> {
+        let (dh, pk, binding) = req.0.into_parts()?;
+        match self.state.attest(&dh, &pk, &binding) {
+            Ok(receipt) => Ok(ok_body(&receipt)),
+            Err(e) => Err(err_body(e.as_code())),
+        }
+    }
+
+    /// 只读确认一笔支付是否被接受。
+    #[tool(
+        name = "verify_receipt",
+        description = "只读确认某 (delegation_hash, spend_nonce, intent_hash) 是否已被聚合器接受及 seq（幂等 re-ack 的确认侧）。拒绝与未知同报 accepted=false。"
+    )]
+    fn verify_receipt(&self, req: Parameters<VerifyReceiptRequest>) -> Result<String, String> {
+        let (dh, nonce, ih) = req.0.into_parts()?;
+        Ok(ok_body(&self.state.verify_receipt(&dh, nonce, &ih)))
+    }
 }
 
 /// ServerHandler 实现由宏生成（get_info / list_tools / call_tool / get_tool）。
 /// 必须与 `#[tool_router]` 同模块：它生成的代码要访问模块私有的 `tool_router()` 构造器。
 #[tool_handler(
     name = "meridian",
-    version = "0.1.0",
-    instructions = "Meridian DSA 探针：authorize 注册委托、pay 模拟支付（预算内）。"
+    version = "0.2.0",
+    instructions = "Meridian DSA 正式版：authorize 注册委托、pay 预算内支付、balance 查额度、attest 双钥绑定、verify_receipt 确认回执。"
 )]
 impl ServerHandler for MeridianServer {}
 
@@ -227,6 +323,35 @@ mod tests {
         let back: AuthorizeRequest = serde_json::from_value(json).unwrap();
         assert_eq!(back.nonce, 1);
         assert_eq!(back.agent, hex::encode([1u8; 20]));
+    }
+
+    #[test]
+    fn new_request_types_roundtrip_json() {
+        let bal = BalanceRequest {
+            delegation_hash: hex::encode([0xAA; 32]),
+        };
+        let back: BalanceRequest =
+            serde_json::from_value(serde_json::to_value(&bal).unwrap()).unwrap();
+        assert_eq!(back.delegation_hash, hex::encode([0xAA; 32]));
+
+        let att = AttestRequest {
+            delegation_hash: hex::encode([0xAA; 32]),
+            pk_x: hex::encode([0x11; 32]),
+            pk_y: hex::encode([0x22; 32]),
+            binding: hex::encode([0x33; 64]),
+        };
+        let back: AttestRequest =
+            serde_json::from_value(serde_json::to_value(&att).unwrap()).unwrap();
+        assert_eq!(back.pk_x, hex::encode([0x11; 32]));
+
+        let vr = VerifyReceiptRequest {
+            delegation_hash: hex::encode([0xAA; 32]),
+            spend_nonce: 3,
+            intent_hash: hex::encode([0xBB; 32]),
+        };
+        let back: VerifyReceiptRequest =
+            serde_json::from_value(serde_json::to_value(&vr).unwrap()).unwrap();
+        assert_eq!(back.spend_nonce, 3);
     }
 
     #[test]

@@ -846,6 +846,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "k256",
+ "meridian-aggregator",
  "meridian-core",
  "rmcp",
  "schemars",

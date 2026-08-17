@@ -4,10 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Meridian S-07 MCP 探针：authorize/pay，让 agent 今天就能调\"花钱\"（stdin/stdout MCP server）"
+description = "Meridian S-13 MCP 正式版：authorize/pay/balance/attest/verify_receipt，薄 keyless 层包真实聚合器内核（stdin/stdout MCP server）"
 
 [dependencies]
 meridian-core = { workspace = true }
+meridian-aggregator = { workspace = true }
 # rmcp = 官方 Rust MCP SDK（modelcontextprotocol/rust-sdk）。3.x API：
 #   `#[tool_router]` + `#[tool(description=...)]` + `Parameters(Request)` + `ServerHandler`。
 # server 特性含 stdio / async-rw transport + schemars（工具 JSON Schema 自动生成）。

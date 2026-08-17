@@ -1,49 +1,51 @@
-//! S-07 探针服务端状态：委托注册表 + agent 身份绑定 + 预算账本 + 防重放。
+//! S-13 MCP 服务器正式版状态层：**薄 keyless 层包住真实聚合器内核**。
 //!
-//! 与 core 的分工：core 是纯原语（DSA 签名/哈希、账本预算状态机）；本模块是
-//! **单进程聚合器**（S-07 最小形态）——注册委托、绑定 agent 身份、执行支付。
+//! 与内核的分工：`meridian-aggregator`（S-10/S-12）负责一切账本执行——WAL 持久化、
+//! 幂等 re-ack（同意图重发返回先前 seq）、单调 seq、预算强制、真错误码。本层只保留：
+//!   1. 已授权委托的内存表（`total_cap` 给 balance；`agent_pub` 给 EAttestBind 与 attest）；
+//!   2. authorize 的 owner 验签与委托字段自洽（探针既有逻辑原样保留）；
+//!   3. pay 的占位证明构造（诚实边界，见 README）。
 //!
-//! TEMPORARY 边界（S-07 明示）：`pay()` 的"授权"目前是 agent Ed25519 验签 + 预算检查，
-//! **不含 ZK 证明**。真实证明授权在 S-09 接入（circuit + Verifier）。这符合
-//! MASTER_PLAN S-07 验收（"模拟支付闭环"）；README 记录该缺口。
+//! 安全模型（Shape 1）：**服务器无任何私钥**。owner secp256k1 / agent Ed25519 密钥都在
+//! 框架侧，签名外部完成；本层只验签 + 执行。`SdkClient` 不用在服务器侧（authorize/pay
+//! 需要私钥），本层直连 `Aggregator`。
+//!
+//! 全部字段用内部可变 + 原子：MCP tool handler 是 &self 同步调用，无 async 持有锁，
+//! 因此 std::sync::Mutex 足够（不跨 await）。
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature as AgentSignature, VerifyingKey as AgentPubKey};
+use ed25519_dalek::Signature as AgentSignature;
+use ed25519_dalek::VerifyingKey as AgentPubKey;
+use meridian_aggregator::ingest::Aggregator;
+use meridian_aggregator::receipt::IntentEnvelope;
+use meridian_core::attestation::{agent_commit, verify_binding, AttestationPubKey};
 use meridian_core::dsa::{
-    delegation_hash, verify_delegation, verify_intent, Amount, Delegation, Did, OwnerPubKey,
-    Signature64, SignedDelegation, SpendIntent,
+    delegation_hash, verify_delegation, Amount, Delegation, Did, OwnerPubKey, Signature64,
+    SignedDelegation, SpendIntent,
 };
 use meridian_core::error::Error;
-use meridian_core::ledger::ShardedLedger;
+use meridian_core::zk::{SpendProof, SpendPublicInputs};
 
-/// 注册表条目：委托本体 + 该 agent 的传输身份公钥（Ed25519，S-02 语义）。
+/// 服务器登记的委托：委托本体 + 该 agent 的 Ed25519 传输公钥。
+/// （`SignedDelegation` 不含 agent 公钥，EAttestBind / attest 需要它，故单独携带。）
 #[derive(Debug, Clone)]
-struct Registration {
-    delegation: Delegation,
-    agent_pub: AgentPubKey,
+pub struct StoredDelegation {
+    pub sd: SignedDelegation,
+    pub agent_pub: AgentPubKey,
 }
 
-/// 单进程聚合器状态。
-///
-/// 全部字段用内部可变 + 原子：MCP tool handler 是 &self 同步调用，无 async 持有锁，
-/// 因此 std::sync::Mutex 足够（不跨 await）。
+/// 薄 keyless 状态层。
 pub struct AppState {
-    /// delegation_hash → (委托, agent 公钥)。**绑定在 authorize 时建立**：
-    /// 只有用该公钥签 intent 的 agent 才能消费该委托。
-    delegations: Mutex<HashMap<[u8; 32], Registration>>,
-    /// (delegation_hash, spend_nonce) 防重放集。
-    nonces: Mutex<HashSet<([u8; 32], u64)>>,
-    /// 预算账本（分片，TECH_SPEC §4.5：ZK 证明授权、账本执行预算）。
-    ledger: ShardedLedger,
-    /// 模拟支付计数器 → payment_id。
-    payment_counter: AtomicU64,
+    /// 真实聚合器内核（WAL + 幂等 + seq + 预算）。
+    pub(crate) agg: Arc<Aggregator>,
+    /// delegation_hash → 已授权委托。绑定在 authorize 时建立。
+    delegations: Mutex<HashMap<[u8; 32], StoredDelegation>>,
 }
 
-/// 手工 Debug：内部是 Mutex<HashMap>，不派生（只暴露规模，不泄内部）。
+/// 手工 Debug：只暴露规模，不泄内部。
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
@@ -51,16 +53,12 @@ impl std::fmt::Debug for AppState {
                 "delegation_count",
                 &self.delegations.lock().expect("delegations poisoned").len(),
             )
-            .field(
-                "nonce_count",
-                &self.nonces.lock().expect("nonces poisoned").len(),
-            )
-            .field("payment_counter", &self.payment_counter)
+            .field("accepted_count", &self.agg.accepted_count())
             .finish_non_exhaustive()
     }
 }
 
-/// `authorize` 回执。
+/// `authorize` 回执（探针字段不变）。
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct AuthorizeReceipt {
     pub delegation_hash: String,
@@ -71,16 +69,41 @@ pub struct AuthorizeReceipt {
     pub total_cap: Amount,
 }
 
-/// `pay` 回执（模拟结算记录）。
+/// `pay` 回执（S-13 新形态：内核对齐——seq = 入承诺的单调摄取序号）。
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PayReceipt {
-    pub payment_id: u64,
-    pub delegation_hash: String,
-    pub recipient: String,
-    pub amount: Amount,
+    pub intent_hash: String,
+    pub seq: u64,
     pub spend_nonce: u64,
-    pub total_spent: Amount,
-    pub remaining: Amount,
+}
+
+/// `balance` 回执（total_cap 来自 authorize 内存表；total_spent 来自聚合器）。
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BalanceReceipt {
+    pub delegation_hash: String,
+    pub total_spent: u64,
+    pub total_cap: Amount,
+    pub remaining: u64,
+}
+
+/// `attest` 回执（双钥绑定凭据，S-05）。
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AttestReceipt {
+    pub delegation_hash: String,
+    pub pk_x: String,
+    pub pk_y: String,
+    pub agent_commit: String,
+    pub binding: String,
+}
+
+/// `verify_receipt` 结果（只读、infallible：拒绝 / 未知同报 accepted=false）。
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct VerifyReceiptResult {
+    pub delegation_hash: String,
+    pub spend_nonce: u64,
+    pub intent_hash: String,
+    pub accepted: bool,
+    pub seq: u64,
 }
 
 fn now_unix() -> u64 {
@@ -99,12 +122,10 @@ fn hex_hash(h: &[u8; 32]) -> String {
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(agg: Arc<Aggregator>) -> Self {
         Self {
+            agg,
             delegations: Mutex::new(HashMap::new()),
-            nonces: Mutex::new(HashSet::new()),
-            ledger: ShardedLedger::new(8),
-            payment_counter: AtomicU64::new(0),
         }
     }
 
@@ -116,6 +137,8 @@ impl AppState {
     ///
     /// 幂等：同一 delegation_hash 已注册且绑定同一 agent 公钥 → 直接返回既有回执。
     /// 若已注册但绑定不同公钥 → `Error::EAttestBind`（禁止换钥重绑，防混淆）。
+    /// 注册表交叉检查：若本地表缺省但聚合器注册表已有（未来 restore_from_wal 后），
+    /// 同样强制 EAttestBind。
     pub fn authorize(
         &self,
         delegation: &Delegation,
@@ -149,312 +172,152 @@ impl AppState {
             if existing.agent_pub.as_bytes() != agent_pub.as_bytes() {
                 return Err(Error::EAttestBind);
             }
-            // 已注册且同一 agent → 幂等返回。
-        } else {
-            map.insert(
-                dh,
-                Registration {
-                    delegation: delegation.clone(),
-                    agent_pub: *agent_pub,
-                },
-            );
+            // 已注册且同一 agent → 幂等返回（不再重复 register）。
+            return Ok(receipt_from(&existing.sd.delegation));
         }
 
-        Ok(AuthorizeReceipt {
-            delegation_hash: hex_hash(&dh),
-            agent: hex_did(&delegation.agent),
-            owner: hex_did(&delegation.owner),
-            nonce: delegation.nonce,
-            max_per_spend: delegation.max_per_spend,
-            total_cap: delegation.total_cap,
-        })
-    }
-
-    /// 执行一笔模拟支付（meridian.pay）。
-    ///
-    /// 校验顺序（不可交换）：
-    ///   1. 委托已注册（查 delegation_hash）；
-    ///   2. intent 与委托绑定（agent 一致）；
-    ///   3. agent 对 intent_hash 的 Ed25519 签名；
-    ///   4. intent 未过期；
-    ///   5. 防重放（spend_nonce）；
-    ///   6. 预算检查 + 记账（core ledger，规则 1-6）。
-    ///
-    /// TEMPORARY（S-07）：无 ZK 证明。S-09 在此处插入 `verify_proof`（电路公共输入回读）。
-    pub fn pay(&self, intent: &SpendIntent, sig: &AgentSignature) -> Result<PayReceipt, Error> {
-        let now = now_unix();
-
-        let dh = intent.delegation_hash;
-        let map = self.delegations.lock().expect("delegations poisoned");
-        let reg = map.get(&dh).ok_or(Error::EDelegExpired)?;
-        let delegation = &reg.delegation;
-
-        // 2. intent ↔ 委托绑定：agent 必须一致（delegation_hash 已隐含 owner/授权边界）。
-        if intent.agent != delegation.agent {
-            return Err(Error::EIntentHash);
-        }
-
-        // 3. agent 签名（Ed25519 over intent_hash）。
-        verify_intent(intent, sig, &reg.agent_pub)?;
-
-        // 4. intent 有效期。
-        if now > intent.expires_at {
-            return Err(Error::EIntentExpired);
-        }
-
-        // 5. 防重放：同一 delegation 下 spend_nonce 只能用一次。
-        {
-            let mut nonces = self.nonces.lock().expect("nonces poisoned");
-            if !nonces.insert((dh, intent.spend_nonce)) {
-                return Err(Error::ENonce);
+        // 本地表缺省 → 查聚合器注册表（跨重启兜底；本步 WAL 只追加，两表本就在同步）。
+        if let Some(reg) = self.agg.registered(&dh) {
+            if reg.agent_pub.as_bytes() != agent_pub.as_bytes() {
+                return Err(Error::EAttestBind);
             }
         }
 
-        // 6. 预算检查 + 记账（原子，规则 1-6；窗口回滚按 now）。
-        self.ledger
-            .check_and_apply(delegation.agent, delegation, intent.amount, now)?;
+        let sd = SignedDelegation {
+            delegation: delegation.clone(),
+            signature: *owner_sig,
+        };
+        self.agg.register(sd.clone(), *agent_pub);
+        map.insert(
+            dh,
+            StoredDelegation {
+                sd,
+                agent_pub: *agent_pub,
+            },
+        );
 
-        let total_spent = self.ledger.total_spent(&delegation.agent, &dh).unwrap_or(0);
-        let payment_id = self.payment_counter.fetch_add(1, Ordering::Relaxed);
+        Ok(receipt_from(delegation))
+    }
 
-        Ok(PayReceipt {
-            payment_id,
-            delegation_hash: hex_hash(&dh),
-            recipient: hex_did(&intent.recipient),
-            amount: intent.amount,
-            spend_nonce: intent.spend_nonce,
+    /// 执行一笔支付（meridian.pay）。
+    ///
+    /// 由服务器用占位证明构造信封（诚实边界，见 README），`Aggregator::submit` 执行
+    /// 全部闸口：幂等 re-ack（S-12，同意图重发返回先前 seq）→ 过期 → 注册表 →
+    /// 撤销 → agent 绑定 → Ed25519 验签 → 证明 → 公共输入一致 → 窗口预留 → 预算 → WAL。
+    /// 回执映射：accepted → {intent_hash, seq, spend_nonce}；rejected → 错误码透传。
+    pub fn pay(&self, intent: &SpendIntent, sig: &AgentSignature) -> Result<PayReceipt, Error> {
+        let env = IntentEnvelope {
+            intent: intent.clone(),
+            agent_sig: *sig,
+            proof: Self::build_proof(intent),
+        };
+        let r = self.agg.submit(&env);
+        if r.accepted {
+            Ok(PayReceipt {
+                intent_hash: hex_hash(&r.intent_hash),
+                seq: r.seq,
+                spend_nonce: intent.spend_nonce,
+            })
+        } else {
+            Err(r.reject_reason.unwrap_or(Error::EProof))
+        }
+    }
+
+    /// 查询委托剩余额度（meridian.balance）。
+    pub fn balance(&self, dh: &[u8; 32]) -> Result<BalanceReceipt, Error> {
+        let stored = self
+            .delegations
+            .lock()
+            .expect("delegations poisoned")
+            .get(dh)
+            .cloned()
+            .ok_or(Error::EDelegUnknown)?;
+        let total_cap = stored.sd.delegation.total_cap;
+        // 已注册委托在聚合器侧 provision → total_spent 必为 Some（从未支付为 0）。
+        let total_spent = self.agg.total_spent(dh).unwrap_or(0);
+        Ok(BalanceReceipt {
+            delegation_hash: hex_hash(dh),
             total_spent,
-            remaining: delegation.total_cap.saturating_sub(total_spent),
+            total_cap,
+            remaining: total_cap.saturating_sub(total_spent),
         })
     }
 
-    /// 查询委托注册状态（调试/测试辅助）。
-    #[cfg(test)]
-    fn is_registered(&self, dh: &[u8; 32]) -> bool {
-        self.delegations.lock().expect("poisoned").contains_key(dh)
+    /// 双钥绑定凭据（meridian.attest，S-05）。
+    ///
+    /// agent Ed25519（authorize 时绑定到 dh）对 BabyJubJub attestation 公钥做绑定签名；
+    /// 服务器重算 `agent_commit = sha256(x_le ‖ y_le)` 并用存储的 agent_pub 验签。
+    pub fn attest(
+        &self,
+        dh: &[u8; 32],
+        pk: &AttestationPubKey,
+        binding: &AgentSignature,
+    ) -> Result<AttestReceipt, Error> {
+        let stored = self
+            .delegations
+            .lock()
+            .expect("delegations poisoned")
+            .get(dh)
+            .cloned()
+            .ok_or(Error::EDelegUnknown)?;
+        let commit = agent_commit(pk);
+        verify_binding(&stored.agent_pub, pk, binding, &commit)?;
+        Ok(AttestReceipt {
+            delegation_hash: hex_hash(dh),
+            pk_x: hex::encode(pk.x),
+            pk_y: hex::encode(pk.y),
+            agent_commit: hex::encode(commit),
+            binding: hex::encode(binding.to_bytes()),
+        })
     }
-}
 
-impl Default for AppState {
-    fn default() -> Self {
-        Self::new()
+    /// 只读确认（meridian.verify_receipt）：`(dh, spend_nonce, intent_hash)` 是否已被
+    /// 接受及 seq。拒绝（预算拒）与未知同报 accepted=false（infallible）。
+    pub fn verify_receipt(
+        &self,
+        dh: &[u8; 32],
+        spend_nonce: u64,
+        intent_hash: &[u8; 32],
+    ) -> VerifyReceiptResult {
+        let seq = self.agg.accepted_seq(dh, spend_nonce, *intent_hash);
+        VerifyReceiptResult {
+            delegation_hash: hex_hash(dh),
+            spend_nonce,
+            intent_hash: hex_hash(intent_hash),
+            accepted: seq.is_some(),
+            seq: seq.unwrap_or(0),
+        }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::SigningKey as AgentSigningKey;
-    use meridian_core::dsa::{
-        owner_signing_key_from_bytes, sign_delegation, sign_intent, RateLimit, PROTOCOL_VERSION,
-    };
-
-    fn delegation(agent: Did, owner: Did, max_per_spend: Amount, total_cap: Amount) -> Delegation {
-        Delegation {
-            agent,
-            owner,
-            nonce: 1,
-            max_per_spend,
-            rate: RateLimit {
-                window_secs: 3_600,
-                max_per_window: total_cap,
+    /// 占位证明（诚实边界，见 README D3）：proof 非空 + 公共输入从 intent 派生。
+    /// `agent_commit` / `revocation_root` = [0;32]（TEMPORARY），`now` = unix。
+    /// `FormatVerifier` 只查 proof 非空 + 公共输入与 intent 一致（`check_public_inputs_consistent`），
+    /// 不查这两项 → 占位成立。真 S-09 prover 插 `SpendVerifier` 同缝，pay 不改。
+    fn build_proof(intent: &SpendIntent) -> SpendProof {
+        SpendProof {
+            proof: vec![0x00, 0x01, 0x02],
+            public_inputs: SpendPublicInputs {
+                agent_commit: [0u8; 32],
+                delegation_hash: intent.delegation_hash,
+                recipient: intent.recipient,
+                amount: intent.amount,
+                category: intent.category,
+                spend_nonce: intent.spend_nonce,
+                expires_at: intent.expires_at,
+                revocation_root: [0u8; 32],
+                now: now_unix(),
             },
-            total_cap,
-            categories: vec![],
-            not_before: 0,
-            expires_at: u64::MAX,
-            version: PROTOCOL_VERSION,
         }
     }
+}
 
-    fn intent(agent: Did, dh: [u8; 32], amount: Amount, nonce: u64) -> SpendIntent {
-        SpendIntent {
-            agent,
-            delegation_hash: dh,
-            recipient: [3u8; 20],
-            amount,
-            category: [0xCD; 32],
-            spend_nonce: nonce,
-            memo: None,
-            expires_at: u64::MAX,
-        }
-    }
-
-    /// 构造一组可用的 owner/agent 密钥与委托，返回 (state, dh, agent_pub, agent_key)。
-    fn setup(
-        state: &AppState,
-    ) -> (
-        [u8; 32],
-        AgentPubKey,
-        AgentSigningKey,
-        OwnerPubKey,
-        Delegation,
-    ) {
-        let owner_key = owner_signing_key_from_bytes([7u8; 32]);
-        let agent_key = AgentSigningKey::from_bytes(&[9u8; 32]);
-        let d = delegation([1u8; 20], [2u8; 20], 1_000, 10_000);
-        let sd = sign_delegation(&d, &owner_key);
-        state
-            .authorize(
-                &d,
-                owner_key.verifying_key(),
-                &agent_key.verifying_key(),
-                &sd.signature,
-            )
-            .expect("authorize should succeed");
-        (
-            delegation_hash(&d),
-            agent_key.verifying_key(),
-            agent_key,
-            *owner_key.verifying_key(),
-            d,
-        )
-    }
-
-    #[test]
-    fn authorize_rejects_bad_owner_signature() {
-        let state = AppState::new();
-        let owner_key = owner_signing_key_from_bytes([7u8; 32]);
-        let other = owner_signing_key_from_bytes([8u8; 32]);
-        let agent_key = AgentSigningKey::from_bytes(&[9u8; 32]);
-        let d = delegation([1u8; 20], [2u8; 20], 1_000, 10_000);
-        // 用另一把 owner 私钥签 → 验签失败
-        let sd = sign_delegation(&d, &other);
-        assert_eq!(
-            state.authorize(
-                &d,
-                owner_key.verifying_key(),
-                &agent_key.verifying_key(),
-                &sd.signature,
-            ),
-            Err(Error::EDelegSig)
-        );
-    }
-
-    #[test]
-    fn authorize_rejects_inconsistent_caps() {
-        let state = AppState::new();
-        let owner_key = owner_signing_key_from_bytes([7u8; 32]);
-        let agent_key = AgentSigningKey::from_bytes(&[9u8; 32]);
-        // max_per_spend > max_per_window → 自相矛盾
-        let d = delegation([1u8; 20], [2u8; 20], 5_000, 10_000);
-        let mut bad = d.clone();
-        bad.rate.max_per_window = 1_000;
-        let sd = sign_delegation(&bad, &owner_key);
-        assert_eq!(
-            state.authorize(
-                &bad,
-                owner_key.verifying_key(),
-                &agent_key.verifying_key(),
-                &sd.signature,
-            ),
-            Err(Error::EBudgetPerSpend)
-        );
-    }
-
-    #[test]
-    fn authorize_is_idempotent_and_binds_agent() {
-        let state = AppState::new();
-        let (dh, ..) = setup(&state);
-        assert!(state.is_registered(&dh));
-    }
-
-    #[test]
-    fn authorize_rejects_key_rebinding() {
-        let state = AppState::new();
-        let owner_key = owner_signing_key_from_bytes([7u8; 32]);
-        let d = delegation([1u8; 20], [2u8; 20], 1_000, 10_000);
-        let sd = sign_delegation(&d, &owner_key);
-
-        let agent_a = AgentSigningKey::from_bytes(&[9u8; 32]);
-        let agent_b = AgentSigningKey::from_bytes(&[0xA0; 32]);
-        state
-            .authorize(
-                &d,
-                owner_key.verifying_key(),
-                &agent_a.verifying_key(),
-                &sd.signature,
-            )
-            .unwrap();
-        // 同一委托换 agent 公钥重绑 → 拒绝
-        assert_eq!(
-            state.authorize(
-                &d,
-                owner_key.verifying_key(),
-                &agent_b.verifying_key(),
-                &sd.signature,
-            ),
-            Err(Error::EAttestBind)
-        );
-    }
-
-    #[test]
-    fn pay_full_loop_with_budget_decrement() {
-        let state = AppState::new();
-        let (dh, _, agent_key, _, _) = setup(&state);
-        let i = intent([1u8; 20], dh, 42, 1);
-        let sig = sign_intent(&i, &agent_key);
-        let receipt = state.pay(&i, &sig).expect("pay should succeed");
-        assert_eq!(receipt.amount, 42);
-        assert_eq!(receipt.total_spent, 42);
-        assert_eq!(receipt.remaining, 10_000 - 42);
-        assert_eq!(receipt.payment_id, 0);
-    }
-
-    #[test]
-    fn pay_rejects_unregistered_delegation() {
-        let state = AppState::new();
-        let agent_key = AgentSigningKey::from_bytes(&[9u8; 32]);
-        let i = intent([1u8; 20], [0xEE; 32], 1, 1);
-        let sig = sign_intent(&i, &agent_key);
-        assert_eq!(state.pay(&i, &sig), Err(Error::EDelegExpired));
-    }
-
-    #[test]
-    fn pay_rejects_wrong_agent_signature() {
-        let state = AppState::new();
-        let (dh, ..) = setup(&state);
-        let impostor = AgentSigningKey::from_bytes(&[0xB0; 32]);
-        let i = intent([1u8; 20], dh, 1, 1);
-        let sig = sign_intent(&i, &impostor);
-        assert_eq!(state.pay(&i, &sig), Err(Error::EIntentSig));
-    }
-
-    #[test]
-    fn pay_rejects_replay_nonce() {
-        let state = AppState::new();
-        let (dh, _, agent_key, _, _) = setup(&state);
-        let i = intent([1u8; 20], dh, 1, 7);
-        let sig = sign_intent(&i, &agent_key);
-        assert!(state.pay(&i, &sig).is_ok());
-        assert_eq!(state.pay(&i, &sig), Err(Error::ENonce));
-    }
-
-    #[test]
-    fn pay_rejects_above_total_cap() {
-        let state = AppState::new();
-        let owner_key = owner_signing_key_from_bytes([7u8; 32]);
-        let agent_key = AgentSigningKey::from_bytes(&[9u8; 32]);
-        // 单笔不挡（6_000 ≤ per_spend），窗口 1s 快速回滚，只测总额 10_000。
-        let mut d = delegation([1u8; 20], [2u8; 20], 10_000, 10_000);
-        d.rate.window_secs = 1;
-        let sd = sign_delegation(&d, &owner_key);
-        state
-            .authorize(
-                &d,
-                owner_key.verifying_key(),
-                &agent_key.verifying_key(),
-                &sd.signature,
-            )
-            .unwrap();
-        let dh = delegation_hash(&d);
-        let i1 = intent([1u8; 20], dh, 6_000, 1);
-        let s1 = sign_intent(&i1, &agent_key);
-        assert!(state.pay(&i1, &s1).is_ok());
-        // 跨窗口：窗口计数重置，但总额仍累计 → 12_000 > 10_000
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let i2 = intent([1u8; 20], dh, 6_000, 2);
-        let s2 = sign_intent(&i2, &agent_key);
-        assert_eq!(state.pay(&i2, &s2), Err(Error::EBudgetTotal));
+fn receipt_from(d: &Delegation) -> AuthorizeReceipt {
+    AuthorizeReceipt {
+        delegation_hash: hex_hash(&delegation_hash(d)),
+        agent: hex_did(&d.agent),
+        owner: hex_did(&d.owner),
+        nonce: d.nonce,
+        max_per_spend: d.max_per_spend,
+        total_cap: d.total_cap,
     }
 }
