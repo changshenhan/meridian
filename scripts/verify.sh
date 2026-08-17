@@ -91,20 +91,22 @@ else
     skip "agg_sim"
 fi
 
-# 可选外围（Linux 工具链）——缺失不阻塞 Rust 主门禁。
-if command -v forge >/dev/null 2>&1; then
+# 可选外围——缺失不阻塞 Rust 主门禁。工具不在 PATH 时兜底查标准安装位置
+# （foundryup → ~/.foundry/bin；noirup → ~/.nargo/bin；bbup → ~/.bb）。
+if command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; then
     step "7/8 solidity (forge build + test)"
-    run "forge" bash -c 'cd contracts && forge build && forge test'
+    run "forge build+test" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts && forge build && forge test'
 else
-    skip "forge 未安装 → solidity 门禁跳过（装 foundry 或借 Linux 服务器开启）"
+    skip "forge 未找到 → solidity 门禁跳过"
 fi
 
-if command -v nargo >/dev/null 2>&1 && command -v bb >/dev/null 2>&1; then
+if { command -v nargo >/dev/null 2>&1 || [ -x "$HOME/.nargo/bin/nargo" ]; } \
+   && { command -v bb >/dev/null 2>&1 || [ -x "$HOME/.bb/bb" ]; }; then
     step "8/8 ZK (smoke_zk + formal_zk)"
-    run "zk smoke" bash scripts/smoke_zk.sh
-    run "zk formal" bash scripts/formal_zk.sh
+    run "zk smoke" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/smoke_zk.sh'
+    run "zk formal" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/formal_zk.sh'
 else
-    skip "nargo/bb 未安装 → ZK 门禁跳过（需 Linux；可借 neuralzoo Linux 服务器或 WSL）"
+    skip "nargo/bb 未找到 → ZK 门禁跳过（需 Linux；可借 neuralzoo Linux 服务器或 WSL）"
 fi
 
 printf '\n'
