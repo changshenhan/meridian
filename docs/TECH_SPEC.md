@@ -502,11 +502,22 @@ contract BatchSettler {
 > 口径：全管线含 `SpendVerifier`（本阶段 `FormatVerifier`，TEMPORARY，与 PoC ② 同口径）。
 > CI 只跑回归门禁（B8/B11 硬断言 + gate 吞吐基线），全量验收在参考机 `agg_sim`。
 
-### 8.3 可复现与 CI 门禁
+### 8.3 可复现与验证门禁
 
-- `cargo bench --ci --baseline baseline.json --fail-over 1.0`（B8/B11 特殊规则）。
-- baseline.json 入库；PR 必须通过全量套件。
+- **主门禁 = 本地流水线**：`scripts/verify.sh`（fmt → clippy `-D warnings` → `cargo test
+  --workspace` → bench 编译 → perf gate（`cargo run --release -p meridian-bench --bin
+  gate -- --fail-over 15`，抓灾难性回归）→ `agg_sim --check-alloc`（B8 零分配）/
+  `--check-determinism`（B11））。挂 `.githooks/pre-push` 钩子（注册：
+  `git config core.hooksPath .githooks`），**推送前必须全绿**；紧急放行
+  `git push --no-verify`。跑在记录 baseline.json 的参考机上，比共享 runner（±10% 噪声）
+  更稳。
+- **1% 精准基线**（人工，受控参考机）：`gate -- --record` 更新 baseline 后
+  `gate -- --fail-over 1`。同机多次 run 噪声 ±6%（§8.2），低于 15% 门禁，不误拒。
+- baseline.json 入库；`scripts/verify.sh` 必须通过全量套件。
 - 热路径零分配用分配器钩子断言（`dhat` 或自写 alloc hook），不靠估计。
+- **GitHub CI**（`.github/workflows/ci.yml`）：**可选第二道网**，2026-08-17 起被账户
+  计费阻断（私有 Actions included 额度耗尽）而挂起。solidity（forge）与 ZK（nargo/bb）
+  job 需 Linux 工具链，本机未装时 `verify.sh` 打印 `[SKIP]`；可借 Linux 服务器或 WSL 补上。
 
 ### 8.4 输出 schema（JSON）
 

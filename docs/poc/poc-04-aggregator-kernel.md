@@ -52,6 +52,8 @@ torn-write 检测，replay 重建 registry+nonce+ledger+seq。FaultInjection 测
   - `cargo run --release -p meridian-bench --bin agg_sim`（全量报告）
   - `agg_sim --check 100000`（B5）、`--check-alloc`（B8）、`--check-determinism`（B11）
   - `agg_sim --gen-fixture`（生成器改动后重新快照）
+  - **门禁**：`scripts/verify.sh`（主门禁，跑在参考机，替代被计费卡死的 GitHub CI；
+    挂 `.githooks/pre-push`，推送前全绿）
 - **机器**：32 核 Windows x86_64（基准平台，TECH_SPEC §8.1 口径），release build。
 
 ## 关键优化（B8 零分配）
@@ -94,4 +96,6 @@ torn-write 检测，replay 重建 registry+nonce+ledger+seq。FaultInjection 测
 - `bench/src/bin/agg_sim.rs` — S-10 验收 sim（B5/B6/B7/B8/B10/B11 + --gen-fixture）。
 - `bench/data/s10_fixture.bin` — 固定输入快照（入库）。
 - `bench/src/bin/gate.rs` — + `agg_kernel_ingest_ops` / `agg_kernel_b7_wall_ms`（CI 基线）。
-- `.github/workflows/ci.yml` — + `agg_sim --check-alloc` / `--check-determinism` 回归。
+- `.github/workflows/ci.yml` — + `agg_sim --check-alloc` / `--check-determinism` 回归
+  （2026-08-17 起因账户计费阻断挂起，改为本地 `scripts/verify.sh` 主门禁）。
+- `scripts/verify.sh` + `.githooks/pre-push` — 本地验证流水线（fmt/clippy/test/gate/agg_sim）。
