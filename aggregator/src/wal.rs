@@ -523,6 +523,50 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// S-11c：Revoke 记录与其它记录种类交错（注册/意图/封窗/净额）时，记录边界与 CRC 正确，
+    /// 重放逐条解码一致且不截断——撤销集重放与顺序无关（幂等并集），但解码层必须跨种类稳健。
+    #[test]
+    fn revoke_interleaved_replay_decodes_all_kinds() {
+        let path = tmp_path("revinter");
+        let w = Wal::open(&path, 1000).unwrap();
+        w.append_register(&sample_sd(), &[0x11; 32]).unwrap(); // 0 Register
+        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000, [0xEE; 20])
+            .unwrap(); // 1 Intent
+        w.append_revoke([0x01; 32]).unwrap(); // 2 Revoke
+        w.append_intent(2, [0xBB; 32], [0xCD; 32], 6, 43, 1_700_000_001, [0xFF; 20])
+            .unwrap(); // 3 Intent
+        w.append_epoch_seal(0, [0x77; 32], 2, 1_700_000_002)
+            .unwrap(); // 4 EpochSeal
+        w.append_revoke([0x02; 32]).unwrap(); // 5 Revoke
+        w.append_netting(0, [0x88; 32], 1).unwrap(); // 6 Netting
+        w.append_intent(3, [0xCC; 32], [0xDD; 32], 7, 44, 1_700_000_003, [0x12; 20])
+            .unwrap(); // 7 Intent
+        w.flush().unwrap();
+        let (records, valid, truncated) = w.replay().unwrap();
+        assert!(!truncated);
+        assert_eq!(valid, w.file_len().unwrap());
+        assert_eq!(records.len(), 8);
+        // 种类按序解码，Revoke 出现在插入位置且 dh 正确。
+        assert!(matches!(&records[0], DecodedRecord::Register(_, _)));
+        assert!(matches!(&records[1], DecodedRecord::Intent { seq, .. } if *seq == 1));
+        assert!(matches!(
+            &records[2],
+            DecodedRecord::Revoke { delegation_hash } if *delegation_hash == [0x01; 32]
+        ));
+        assert!(matches!(&records[3], DecodedRecord::Intent { seq, .. } if *seq == 2));
+        assert!(matches!(
+            &records[4],
+            DecodedRecord::EpochSeal { epoch_id, .. } if *epoch_id == 0
+        ));
+        assert!(matches!(
+            &records[5],
+            DecodedRecord::Revoke { delegation_hash } if *delegation_hash == [0x02; 32]
+        ));
+        assert!(matches!(&records[6], DecodedRecord::Netting { .. }));
+        assert!(matches!(&records[7], DecodedRecord::Intent { seq, .. } if *seq == 3));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn torn_tail_is_truncated_on_replay() {
         let path = tmp_path("torn");

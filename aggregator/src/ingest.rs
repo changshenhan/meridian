@@ -1697,6 +1697,191 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// S-11c：撤销与意图交错 + 崩溃恢复——撤销前 A 意图照常结算（非追溯）、撤销后 A 新意图
+    /// E_REVOKED（seq 不前进）、恢复后撤销集/撤销根/nonce 集/seq 全部精确续接、B 不受影响，
+    /// 全量结算保持不变量（Σnet == Σaccepted、每笔恰一次、rejected 不入承诺）。
+    #[test]
+    fn revoke_interleaved_crash_restore_ledger_consistent() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revinter");
+        let now = clock.load(Ordering::Relaxed);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let mut cfg = test_cfg();
+        cfg.epoch_capacity = 1000; // 过程中不自动封窗，最后统一结算
+        let mut expected: Vec<(bool, [u8; 32], u64)> = Vec::new();
+        let dh_a;
+        let dh_b;
+        let expect_root;
+        {
+            let c = Arc::clone(&clock);
+            let wal = Wal::open(&path, 100_000).unwrap();
+            let agg = Aggregator::with_clock(
+                cfg.clone(),
+                Box::new(FormatVerifier),
+                wal,
+                Box::new(move || c.load(Ordering::Relaxed)),
+            );
+            let (a, _) = register_default(&agg, [0x01; 20]);
+            let (b, _) = register_default(&agg, [0x02; 20]);
+            dh_a = a;
+            dh_b = b;
+            // 撤销前：A 3 笔 + B 3 笔（同 seq 序落 WAL）。
+            for i in 0..3u64 {
+                for (dh, agent) in [(dh_a, [0x01; 20]), (dh_b, [0x02; 20])] {
+                    let env = make_env(dh, agent, &agent_key, [i as u8; 20], 10, i + 1, now);
+                    let r = agg.submit(&env);
+                    assert!(r.accepted);
+                    expected.push((true, meridian_core::dsa::intent_hash(&env.intent), 10));
+                }
+            }
+            // 撤销 A。
+            assert!(agg.revoke(dh_a));
+            // 撤销后：A 新意图 E_REVOKED（不耗窗口槽）；B 继续接受。
+            let env_rev = make_env(dh_a, [0x01; 20], &agent_key, [0xAA; 20], 10, 4, now);
+            let r = agg.submit(&env_rev);
+            assert!(!r.accepted);
+            assert_eq!(r.reject_reason, Some(Error::ERevoked));
+            expected.push((false, meridian_core::dsa::intent_hash(&env_rev.intent), 10));
+            assert_eq!(agg.accepted_count(), 6, "ERevoked 不耗窗口槽");
+            for i in 4..6u64 {
+                let env = make_env(dh_b, [0x02; 20], &agent_key, [i as u8; 20], 5, i + 1, now);
+                let r = agg.submit(&env);
+                assert!(r.accepted);
+                expected.push((true, meridian_core::dsa::intent_hash(&env.intent), 5));
+            }
+            expect_root = agg.revocation_root();
+            agg.wal.flush().unwrap();
+        } // 崩溃：聚合器丢弃，只剩 WAL
+
+        // 恢复：撤销集/撤销根/nonce/seq 全部续接。
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            test_cfg(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+        assert!(agg2.is_revoked(&dh_a));
+        assert!(!agg2.is_revoked(&dh_b));
+        assert_eq!(agg2.revocation_root(), expect_root, "撤销根崩溃前后一致");
+        assert_eq!(agg2.nonce_count(&dh_a), Some(3), "A 只保留撤销前的 nonce");
+        assert_eq!(agg2.nonce_count(&dh_b), Some(5), "B 的 nonce 完整");
+        assert_eq!(
+            agg2.accepted_count(),
+            8,
+            "恢复后已接受数 = 撤销前 6 + 撤销后 B 2"
+        );
+        // 恢复后续接：B 继续接受（seq 从 8 续）、A 仍 E_REVOKED。
+        let env = make_env(dh_b, [0x02; 20], &agent_key, [0xBB; 20], 5, 7, now);
+        let r = agg2.submit(&env);
+        assert!(r.accepted);
+        assert_eq!(r.seq, 8, "恢复后 seq 从已接受数续接");
+        expected.push((true, meridian_core::dsa::intent_hash(&env.intent), 5));
+        let r = agg2.submit(&make_env(
+            dh_a, [0x01; 20], &agent_key, [0xCC; 20], 10, 5, now,
+        ));
+        assert!(!r.accepted);
+        assert_eq!(r.reject_reason, Some(Error::ERevoked));
+        // 全量结算：不变量保持（含 A 撤销前 3 笔、B 全部）。
+        settle_all_and_check(&agg2, &expected);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-11c：撤销 + 崩溃后 epoch 编号续接（不重复已密封 epoch_id），撤销根随恢复后 epoch
+    /// 锚定并已变化（1 epoch 内进入撤销根），撤销前接受的意图仍在原 epoch 净额中（非追溯）。
+    #[test]
+    fn revoke_crash_epoch_numbering_continues_and_root_anchors() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revecpoch");
+        let now = clock.load(Ordering::Relaxed);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let mut cfg = test_cfg();
+        cfg.epoch_capacity = 4;
+        let res0_root;
+        let sum0: u64;
+        let dh_a;
+        let dh_b;
+        {
+            let c = Arc::clone(&clock);
+            let wal = Wal::open(&path, 100_000).unwrap();
+            let agg = Aggregator::with_clock(
+                cfg.clone(),
+                Box::new(FormatVerifier),
+                wal,
+                Box::new(move || c.load(Ordering::Relaxed)),
+            );
+            let (a, _) = register_default(&agg, [0x01; 20]);
+            let (b, _) = register_default(&agg, [0x02; 20]);
+            dh_a = a;
+            dh_b = b;
+            // epoch 0：4 笔 A（满窗即封）。
+            for i in 0..4u64 {
+                assert!(
+                    agg.submit(&make_env(
+                        dh_a,
+                        [0x01; 20],
+                        &agent_key,
+                        [i as u8; 20],
+                        1,
+                        i + 1,
+                        now
+                    ))
+                    .accepted
+                );
+            }
+            let sealed = agg.seal_expired(now + 10_000, 1);
+            assert_eq!(sealed.len(), 1);
+            assert_eq!(sealed[0].epoch_id, 0);
+            let res0 = agg.settle_epoch(&sealed[0]).expect("settle epoch 0");
+            res0_root = res0.revocation_root;
+            sum0 = res0.net.iter().map(|l| l.amount).sum();
+            // 撤销 A 后崩溃。
+            assert!(agg.revoke(dh_a));
+            agg.wal.flush().unwrap();
+        }
+
+        // 恢复：epoch 编号接到 1，撤销集重建。
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            test_cfg(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+        assert!(agg2.is_revoked(&dh_a));
+        // epoch 1：4 笔 B（A 已撤销不能再用）。
+        for i in 0..4u64 {
+            assert!(
+                agg2.submit(&make_env(
+                    dh_b,
+                    [0x02; 20],
+                    &agent_key,
+                    [i as u8; 20],
+                    1,
+                    i + 1,
+                    now
+                ))
+                .accepted
+            );
+        }
+        let sealed = agg2.seal_expired(now + 20_000, 1);
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].epoch_id, 1, "恢复后 epoch 编号续接（不重复 0）");
+        let res1 = agg2.settle_epoch(&sealed[0]).expect("settle epoch 1");
+        assert_eq!(res1.revocation_root, agg2.revocation_root());
+        assert_ne!(
+            res1.revocation_root, res0_root,
+            "撤销根随恢复后 epoch 锚定并已变化"
+        );
+        // 非追溯：撤销前接受的 A 意图仍在 epoch 0 净额中。
+        assert_eq!(sum0, 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// S-10c 并发 fuzz（确定性）：8 线程并发提交混入重复 nonce / 超预算的批次，结算全部
     /// epoch 后不变量保持——无双重记账、每个 accepted 恰一次、Σnet == Σaccepted。
     #[test]
@@ -1810,6 +1995,166 @@ mod tests {
                 ));
             }
             settle_all_and_check(&agg, &expected);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // S-11c 随机 fuzz（proptest）：submit/revoke 交错 + 中途崩溃恢复。确定性前缀保证覆盖
+    // 撤销路径（A 接受一笔 → revoke A → A 再提交 E_REVOKED）；随后随机 op 混入（kind%3：
+    // 0=revoke A 幂等 / 1=submit B / 2=submit A→必 E_REVOKED）。阶段 1 结算后崩溃→恢复，撤销
+    // 集/根一致；阶段 2 续接。不变量：Σnet == Σaccepted、每笔恰一次、撤销后 A 新意图
+    // E_REVOKED 拒且不入承诺、B 不受影响、崩溃对账本不可见。
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+        #[test]
+        fn fuzz_revoke_interleaved_preserves_invariants(
+            ops in proptest::collection::vec(
+                (any::<u16>(), any::<u16>(), any::<u8>(), any::<u8>()),
+                0..48,
+            ),
+        ) {
+            let clock = Arc::new(AtomicU64::new(1_700_000_000));
+            let path = tmp_path("fuzzrev");
+            let now = clock.load(Ordering::Relaxed);
+            let mut cfg = test_cfg();
+            cfg.epoch_capacity = 8;
+            let mut plan: Vec<(u8, u16, u8, u8)> = vec![
+                (2, 1, 0x11, 0), // 先接受一笔 A
+                (0, 0, 0, 0),    // revoke A
+                (2, 1, 0x22, 0), // A → E_REVOKED
+            ];
+            plan.extend(
+                ops.into_iter()
+                    .map(|(k, amt, recip, off)| (k as u8, amt, recip, off)),
+            );
+            let dh_a;
+            let dh_b;
+            let expect_root;
+            // nonce 计数器在函数作用域：跨崩溃持续递增（不依赖恢复后的 nonce_count —— 预算
+            // 拒的 nonce 已消耗但不落 WAL，恢复重建的集合只含 accepted）。
+            let mut nonce_a: u64 = 1;
+            let mut nonce_b: u64 = 1;
+            {
+                let c = Arc::clone(&clock);
+                let wal = Wal::open(&path, 100_000).unwrap();
+                let agg = Aggregator::with_clock(
+                    cfg.clone(),
+                    Box::new(FormatVerifier),
+                    wal,
+                    Box::new(move || c.load(Ordering::Relaxed)),
+                );
+                let (a, _) = register_default(&agg, [0x01; 20]);
+                let (b, _) = register_default(&agg, [0x02; 20]);
+                dh_a = a;
+                dh_b = b;
+                let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+                let mut expected: Vec<(bool, [u8; 32], u64)> = Vec::new();
+                // A 撤销标记：前缀 op1（(0,0,0,0)）撤销后，后续 A 提交一律 E_REVOKED；
+                // op0（(2,1,0x11,0)）在撤销前，接受。
+                let mut a_revoked = false;
+                for (k, amt, recip, off) in &plan {
+                    let amount = (*amt % 1200) as u64; // 部分超 max_per_spend=1000 → 预算拒
+                    match k % 3 {
+                        0 => {
+                            agg.revoke(dh_a); // 撤销幂等
+                            a_revoked = true;
+                        }
+                        1 => {
+                            let env = make_env(
+                                dh_b,
+                                [0x02; 20],
+                                &agent_key,
+                                [*recip; 20],
+                                amount,
+                                nonce_b,
+                                now + *off as u64,
+                            );
+                            let r = agg.submit(&env);
+                            nonce_b += 1;
+                            expected.push((
+                                r.accepted,
+                                meridian_core::dsa::intent_hash(&env.intent),
+                                amount,
+                            ));
+                        }
+                        _ => {
+                            // A 已撤销：必 E_REVOKED，不耗 nonce/窗口槽。
+                            let env = make_env(
+                                dh_a,
+                                [0x01; 20],
+                                &agent_key,
+                                [*recip; 20],
+                                amount,
+                                nonce_a,
+                                now + *off as u64,
+                            );
+                            let r = agg.submit(&env);
+                            nonce_a += 1;
+                            assert_eq!(
+                                r.accepted, !a_revoked,
+                                "A 撤销前接受、撤销后 E_REVOKED"
+                            );
+                            if a_revoked {
+                                assert_eq!(r.reject_reason, Some(Error::ERevoked));
+                            }
+                            expected.push((
+                                r.accepted,
+                                meridian_core::dsa::intent_hash(&env.intent),
+                                amount,
+                            ));
+                        }
+                    }
+                }
+                // 阶段 1 结算（耗尽密封队列，写 EpochSeal/Netting 边界 → 崩溃点干净）。
+                settle_all_and_check(&agg, &expected);
+                expect_root = agg.revocation_root();
+                agg.wal.flush().unwrap();
+            } // 崩溃：聚合器丢弃，只剩 WAL
+
+            // 恢复：撤销集/根一致；阶段 2 续接（epoch 编号 + seq + 撤销闸口续效）。
+            let c = Arc::clone(&clock);
+            let (agg2, truncated) = Aggregator::restore_from_wal(
+                test_cfg(),
+                Box::new(FormatVerifier),
+                &path,
+                Box::new(move || c.load(Ordering::Relaxed)),
+            )
+            .unwrap();
+            assert!(!truncated);
+            assert!(agg2.is_revoked(&dh_a));
+            assert!(!agg2.is_revoked(&dh_b));
+            assert_eq!(agg2.revocation_root(), expect_root, "撤销根崩溃前后一致");
+            let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+            let mut expected2: Vec<(bool, [u8; 32], u64)> = Vec::new();
+            for i in 0..10u64 {
+                let env = make_env(
+                    dh_b,
+                    [0x02; 20],
+                    &agent_key,
+                    [i as u8; 20],
+                    1,
+                    nonce_b,
+                    now,
+                );
+                let rb = agg2.submit(&env);
+                nonce_b += 1;
+                expected2.push((rb.accepted, meridian_core::dsa::intent_hash(&env.intent), 1));
+                let env = make_env(
+                    dh_a,
+                    [0x01; 20],
+                    &agent_key,
+                    [i as u8; 20],
+                    1,
+                    nonce_a,
+                    now,
+                );
+                let ra = agg2.submit(&env);
+                nonce_a += 1;
+                assert!(!ra.accepted, "恢复后 A 仍 E_REVOKED");
+                assert_eq!(ra.reject_reason, Some(Error::ERevoked));
+                expected2.push((false, meridian_core::dsa::intent_hash(&env.intent), 1));
+            }
+            settle_all_and_check(&agg2, &expected2);
             let _ = std::fs::remove_file(&path);
         }
     }
