@@ -22,7 +22,7 @@ test/
   BatchSettler.t.sol     31 个用例（挑战正反/去重/跨收款人/窗口/罚没账/void 后 claim）
   IntentHelper.t.sol     5 个用例（golden vector 对 Rust 计算值）
   Merkle.t.sol           7 个用例（已知向量对 Rust merkle_root）
-rust-smoke/            alloy 链上集成冒烟（TEMPORARY，S-11d 并入 Anvil 端到端）
+rust-smoke/            alloy Anvil 端到端（S-11d：聚合器 + BatchSettler v2 全链路，三条场景）
 foundry.toml           solc 0.8.24 / cancun / via_ir
 foundry.lock           forge-std v1.9.6（rev 3b20d60）
 ```
@@ -59,6 +59,22 @@ forge build
 forge test          # 53 用例全绿
 cd rust-smoke && cargo run   # anvil 部署 + 全链路（需先 forge build 产出 out/）
 ```
+
+### S-11d Anvil 端到端（rust-smoke）
+
+一条 anvil 会话内跑三条场景，验证**聚合器（Rust）↔ BatchSettler v2（Solidity）**的
+完整链路与交叉实现契约：
+
+1. **快乐路径**：注册（链上 DSA + 聚合器）→ submit 满窗 → 密封结算 → `commit`（债券 +
+   撤销根）→ `settle`（资金足）→ 过 6h 挑战窗 → `claim`：收款人收**精确净额**（原生 ETH）。
+2. **撤销路径**：链上 `revoke` → 运营者把 revoke 事件镜像进聚合器 → 新意图 `E_REVOKED`
+   拒（不耗 nonce / 窗口槽）→ 下个密封 epoch **撤销根变化**（撤销 1 epoch 内锚定）。
+3. **欺诈路径**：`commit` 诚实承诺根 → `settle` 漏单 net[]（自洽 netting root）→ 挑战者出示
+   漏单意图的包含证明（kind=1，`inclusion_proof` 生成）→ `challenge` 成功 → 债券罚没给
+   挑战者 + settlementFunded 退运营者 + epoch voided → 过窗后 `claim` 被 `EpochVoided` 拒。
+
+该步是 `scripts/verify.sh` 的 **9/9** 门禁（forge + anvil 就绪时运行；forge/anvil 缺失则
+跳过，不阻塞 Rust 主门禁）。
 
 ## alloy 版本锁定
 

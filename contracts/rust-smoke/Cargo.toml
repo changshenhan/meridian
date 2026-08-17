@@ -3,13 +3,15 @@ name = "contract-smoke"
 version = "0.1.0"
 edition = "2021"
 
-# S-06c：链上集成冒烟（TEMPORARY，S-08 前并入正式部署/测试脚本）。
+# S-11d：Anvil 端到端（聚合器 + BatchSettler v2 全链路）。
 # 独立 workspace：不污染主仓 fmt/clippy/test 门禁（同 circuits/smoke-gen 惯例）。
-# 依赖 meridian-core 走 path；alloy 做链上交互（版本锁定见 contracts/README.md）。
+# 依赖 meridian-core（授权原语）+ meridian-aggregator（L3 结算内核）走 path；
+# alloy 做链上交互（版本锁定见 contracts/README.md）。
 [workspace]
 
 [dependencies]
 meridian-core = { path = "../../core" }
+meridian-aggregator = { path = "../../aggregator" }
 alloy = { version = "2.4", features = ["sol-types", "signer-local", "provider-anvil-api"] }
 url = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }

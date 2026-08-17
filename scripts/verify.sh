@@ -41,42 +41,42 @@ run() { # run <label> <cmd...>
 }
 
 if want fmt; then
-    step "1/6 cargo fmt --all --check"
+    step "1/9 cargo fmt --all --check"
     run "fmt" cargo fmt --all --check
 else
     skip "fmt"
 fi
 
 if want clippy; then
-    step "2/6 cargo clippy (-D warnings, all targets)"
+    step "2/9 cargo clippy (-D warnings, all targets)"
     run "clippy" cargo clippy --workspace --all-targets -- -D warnings
 else
     skip "clippy"
 fi
 
 if want test; then
-    step "3/6 cargo test (workspace)"
+    step "3/9 cargo test (workspace)"
     run "test" cargo test --workspace
 else
     skip "test"
 fi
 
 if want bench; then
-    step "4/6 bench 编译检查 (--no-run)"
+    step "4/9 bench 编译检查 (--no-run)"
     run "bench compile" cargo bench -p meridian-bench --no-run
 else
     skip "bench"
 fi
 
 if want perf; then
-    step "5/6 性能门禁 (release, --fail-over 15 抓灾难性回归)"
+    step "5/9 性能门禁 (release, --fail-over 15 抓灾难性回归)"
     run "perf gate" cargo run --release -p meridian-bench --bin gate -- --fail-over 15
 else
     skip "perf"
 fi
 
 if want alloc || want det; then
-    step "6/6 agg_sim 回归 (B8 热路径零分配 + B11 确定性)"
+    step "6/9 agg_sim 回归 (B8 热路径零分配 + B11 确定性)"
     if want alloc; then
         run "agg_sim B8 zero-alloc" cargo run --release -p meridian-bench --bin agg_sim -- --check-alloc
     else
@@ -94,7 +94,7 @@ fi
 # 可选外围——缺失不阻塞 Rust 主门禁。工具不在 PATH 时兜底查标准安装位置
 # （foundryup → ~/.foundry/bin；noirup → ~/.nargo/bin；bbup → ~/.bb）。
 if command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; then
-    step "7/8 solidity (forge build + test)"
+    step "7/9 solidity (forge build + test)"
     run "forge build+test" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts && forge build && forge test'
 else
     skip "forge 未找到 → solidity 门禁跳过"
@@ -102,11 +102,21 @@ fi
 
 if { command -v nargo >/dev/null 2>&1 || [ -x "$HOME/.nargo/bin/nargo" ]; } \
    && { command -v bb >/dev/null 2>&1 || [ -x "$HOME/.bb/bb" ]; }; then
-    step "8/8 ZK (smoke_zk + formal_zk)"
+    step "8/9 ZK (smoke_zk + formal_zk)"
     run "zk smoke" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/smoke_zk.sh'
     run "zk formal" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/formal_zk.sh'
 else
     skip "nargo/bb 未找到 → ZK 门禁跳过（需 Linux；可借 neuralzoo Linux 服务器或 WSL）"
+fi
+
+# S-11d：Anvil 端到端（聚合器 + BatchSettler v2 全链路，三条场景）。依赖 forge build 产物
+# （上一步 7/9 已生成）+ anvil 可执行；两者缺一即跳过（不阻塞 Rust 主门禁）。
+if { command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; } \
+   && { command -v anvil >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/anvil" ]; }; then
+    step "9/9 rust-smoke Anvil 端到端 (S-11d)"
+    run "rust-smoke" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run'
+else
+    skip "forge/anvil 未找到 → rust-smoke 门禁跳过"
 fi
 
 printf '\n'

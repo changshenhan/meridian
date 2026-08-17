@@ -580,6 +580,13 @@ contract BatchSettler {
 - **1% 精准基线**（人工，受控参考机）：`gate -- --record` 更新 baseline 后
   `gate -- --fail-over 1`。同机多次 run 噪声 ±6%（§8.2），低于 15% 门禁，不误拒。
 - baseline.json 入库；`scripts/verify.sh` 必须通过全量套件。
+- **S-11d 链上端到端（verify.sh 9/9）**：`rust-smoke`（`contracts/rust-smoke`，独立
+  workspace）在一条 anvil 会话内跑三场景——① 快乐路径：注册→submit→密封结算→
+  `commit`（债券+撤销根）→`settle`（资金足）→过窗 `claim` 收款人收精确净额；② 撤销：
+  链上 revoke→聚合器 revoke→新意图 `E_REVOKED` 拒→下个 epoch 撤销根变化；③ 欺诈：
+  `commit` 诚实根→`settle` 漏单（自洽 netting root）→kind=1 包含证明 `challenge` 成功→
+  债券罚没+`settlementFunded` 退运营者+epoch voided→claim 拒绝。依赖 forge build 产物 +
+  anvil，缺任一则 `[SKIP]`（不阻塞 Rust 主门禁）。
 - 热路径零分配用分配器钩子断言（`dhat` 或自写 alloc hook），不靠估计。
 - **GitHub CI**（`.github/workflows/ci.yml`）：**可选第二道网**，2026-08-17 起被账户
   计费阻断（私有 Actions included 额度耗尽）而挂起。solidity（forge）与 ZK（nargo/bb）
