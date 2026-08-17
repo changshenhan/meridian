@@ -9,10 +9,14 @@ Meridian 做"AI Agent 之间怎么互相花钱、互相信任"的标准 + 参考
 
 | 文件 | 层级 |
 |---|---|
+| **`docs/developers/`** | **开发者文档站（S-14c）：index / 快速上手 / 三角色集成指南** |
 | `docs/TECH_SPEC.md` | 代码契约（v1.0，Phase 0 定稿） |
 | `docs/WHITEPAPER.md` | 对外白皮书（英文，引用 PoC 实测） |
 | `docs/why-no-new-chain.md` | 立场文《为什么机器商务不需要新链》 |
 | `docs/poc/*.md` | Phase 0 三个 PoC 实测报告 |
+
+新手上路：`docs/developers/quickstart.md`（5 分钟跑通 M1 demo + 框架闭环）。
+三种角色怎么接：`docs/developers/integration.md`（agent / framework / vendor）。
 
 ## Phase 0 PoC（已全绿）
 
@@ -26,7 +30,13 @@ Meridian 做"AI Agent 之间怎么互相花钱、互相信任"的标准 + 参考
 
 ```
 core/          DSA 授权原语 + 预算账本（meridian-core）
+aggregator/    结算内核：ingest / commitment lattice / WAL / 净额（meridian-aggregator）
+sdk/           Agent 集成层：authorize / pay / attest + 幂等重试（meridian-sdk）
+mcp-server/    MCP stdio 服务器：5 工具、keyless（meridian-mcp）
 bench/         基准基座 + 零分配门禁 + CI gate（meridian-bench）
+contracts/     Solidity：DSA / RevocationRegistry / BatchSettler + rust-smoke（独立 workspace）
+circuits/      Noir ZK 电路（intent_hash 绑定 + 撤销非成员）
+demos/         三框架演示闭环（LangChain / AutoGen / Eliza）
 poc-delivery/  PoC ③ 交付证明（独立 workspace：tlsn 拉 mpz 大图，不进主 workspace）
 ```
 
@@ -36,12 +46,18 @@ poc-delivery/  PoC ③ 交付证明（独立 workspace：tlsn 拉 mpz 大图，�
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+# 全量门禁（9 步，pre-push 钩子同款）
+bash scripts/verify.sh
+# M1 端到端 demo（10 万笔 → 净额结算，Anvil 全绿；需 foundry）
+cd contracts/rust-smoke && cargo run --release --bin m1_demo
 # 性能基座
-cargo run -p meridian-bench --bin gate -- --record          # 记录 baseline
-cargo run -p meridian-bench --bin gate                       # 与 baseline 比较，回归 >1% 退出码 1
+cargo run -p meridian-bench --bin gate -- --record          # 记录 baseline（3 整轮取中位）
+cargo run -p meridian-bench --bin gate                       # 与 baseline 比较，疑似回归自动复测
 cargo bench -p meridian-bench --no-run                        # criterion 基准编译
 # 吞吐验收
 cargo run -p meridian-bench --bin poc_aggregator -- --check 100000
+# v0.1 release 工装（门禁 → 构建 → dist 装配 + sha256；暂不公开）
+bash scripts/release.sh
 # 交付证明复现（首次编译拉 tlsn/mpz 框架，较久）
 cd poc-delivery && cargo run --release
 ```
