@@ -1,0 +1,19 @@
+# S-12 SDK —— agent 侧客户端库（封装 core + 聚合器，暴露 authorize/pay/attest + 幂等重试）。
+#
+# 技术来源（MASTER_PLAN S-12）：core crate 复用；tower/retry 模式（本 crate 以轻量
+# RetryPolicy 实现同构模式，不引入 tokio——聚合器是同步内核，agent 进程无需 async 运行时）。
+[package]
+name = "meridian-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Meridian agent SDK: authorize()/pay()/attest() with idempotent retry"
+
+[dependencies]
+meridian-core = { workspace = true }
+meridian-aggregator = { workspace = true }
+k256 = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }

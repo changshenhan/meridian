@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "aggregator", "bench", "mcp-server"]
+members = ["core", "aggregator", "bench", "mcp-server", "sdk"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ authors = ["Meridian Labs"]
 [workspace.dependencies]
 meridian-core = { path = "core" }
 meridian-aggregator = { path = "aggregator" }
+meridian-sdk = { path = "sdk" }
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"

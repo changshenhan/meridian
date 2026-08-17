@@ -1,10 +1,12 @@
 //! Ingest 管线（TECH_SPEC §6.2，MASTER_PLAN S-10）。
 //!
-//! `Aggregator::submit(env) -> Receipt` 快路径，顺序（与 §6.2 一致）：
-//! 意图有效期 → 委托查表（未注册拒 `E_DELEG_UNKNOWN`）→ agent 绑定 → Ed25519 验签（证明前
-//! 的廉价 DoS 闸门）→ 验证明（`SpendVerifier`，登记以返回值为准）→ 公共输入与信封一致性 →
-//! 预留窗口槽 → nonce 去重 + 预算检查记账（分片锁内**分配 seq**）→ 定稿（accepted 才入承诺）
-//! → WAL 追加 → 满窗即封。已封 epoch 由 `process_pending` 结算（`lattice::build_epoch`：
+//! `Aggregator::submit(env) -> Receipt` 快路径，顺序（§6.2 一致，S-12 增幂等闸口）：
+//! 幂等重发（S-12：同意图同 nonce 已被接受 → 直接返回既有 seq，**最先**——重发时信封可能
+//! 已过期，过期意图仍是已接受意图，不能诱发 SDK 用新 nonce 重发 → 双花）→ 意图有效期 →
+//! 委托查表（未注册拒 `E_DELEG_UNKNOWN`）→ agent 绑定 → Ed25519 验签（证明前的廉价 DoS
+//! 闸门）→ 验证明（`SpendVerifier`，登记以返回值为准）→ 公共输入与信封一致性 → 预留窗口槽
+//! → nonce 去重 + 幂等 + 预算检查记账（分片锁内**分配 seq**）→ 定稿（accepted 才入承诺）→
+//! WAL 追加 → 满窗即封。已封 epoch 由 `process_pending` 结算（`lattice::build_epoch`：
 //! 承诺根/净额/净额根 + WAL EpochSeal/Netting 记录 + 上链 seam）。
 //!
 //! 并发一致性（关键不变量）：
@@ -16,11 +18,11 @@
 //!   `finalize(rejected)`，不需要滚任何已提交状态。
 //! - **无丢失**：满窗 / 已密封时 `reserve` 内部换新窗口整链重试（预算还没应用，无副作用）。
 //!
-//! B8 容量预置：`register` 时 provision 分片条目（预算零态 + 预置 nonce 集）；稳态
-//! `try_commit` 的 `entry` 查找与 `nonces.insert` 都在容量内 → 零分配。
+//! B8 容量预置：`register` 时 provision 分片条目（预算零态 + 预置 nonce 记录集）；稳态
+//! `try_commit` 的 `entry` 查找与 nonce 记录插入都在容量内 → 零分配。
 //! WAL 失败 panic（持久化骨干，不可降级）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -127,10 +129,26 @@ impl Default for DelegationRegistry {
 // 账本分片（nonce 去重 + 预算记账）
 // ---------------------------------------------------------------------------
 
-/// 每委托的账本状态：预算 + 已用 nonce 集。
+/// 每 nonce 的结果（S-12 幂等重发返回，不透传成成功 / 不重复记账）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonceOutcome {
+    /// 已接受：记住 seq（同意图重发返回同一 seq，不重复分配 / 不重复扣预算）。
+    Accepted { seq: u64 },
+    /// 已拒绝（nonce 已消耗，§6.2 不复用）：同意图重发原样返回原因。
+    Rejected(Error),
+}
+
+/// nonce 记录：intent_hash 区分「同意图重发」vs「跨意图复用」（§6.2 禁止）。
+#[derive(Debug, Clone, Copy)]
+struct NonceState {
+    intent_hash: [u8; 32],
+    outcome: NonceOutcome,
+}
+
+/// 每委托的账本状态：预算 + nonce 记录（去重 + 幂等）。
 struct DelegationLedgerState {
     budget: BudgetState,
-    nonces: HashSet<u64>,
+    nonces: HashMap<u64, NonceState>,
 }
 
 /// 并发分片账本：键 = delegation_hash。每分片一把锁，串行化同委托的 nonce + 预算 + seq。
@@ -169,17 +187,44 @@ impl ShardedState {
         let mut map = self.shards[idx].lock().expect("shard poisoned");
         map.entry(*dh).or_insert_with(|| DelegationLedgerState {
             budget: BudgetState::new(*dh, 0),
-            nonces: HashSet::with_capacity(nonce_capacity),
+            nonces: HashMap::with_capacity(nonce_capacity),
         });
     }
 
-    /// 原子：nonce 去重 → 预算检查记账 → 分片锁内分配 seq。`Ok(seq)` = accepted。
-    /// Err 时 nonce 已消耗（§6.2：拒绝意图的 nonce 不允许复用）。
+    /// 幂等重发探针（S-12）：nonce 已被**同一 intent_hash** 接受 → 返回其 seq。
+    /// 供 `submit` 在最前闸口调用——重发时信封可能已过期（过期意图仍是已接受意图，不能
+    /// 因 EIntentExpired 拒绝而让 SDK 误判失败去重发新 nonce，那才是双花的来源）。
+    /// 返回 None = 未接受（新提交 / 已被拒绝 / 跨意图复用，后续由 `try_commit` 裁决）。
+    pub fn lookup_accept(
+        &self,
+        dh: &[u8; 32],
+        spend_nonce: u64,
+        intent_hash: [u8; 32],
+    ) -> Option<u64> {
+        let idx = shard_of(dh, self.shards.len());
+        let map = self.shards[idx].lock().expect("shard poisoned");
+        match map.get(dh)?.nonces.get(&spend_nonce)? {
+            NonceState {
+                intent_hash: stored,
+                outcome: NonceOutcome::Accepted { seq },
+            } if *stored == intent_hash => Some(*seq),
+            _ => None,
+        }
+    }
+
+    /// 原子：nonce 去重 + 幂等 → 预算检查记账 → 分片锁内分配 seq。`Ok(seq)` = accepted。
+    ///
+    /// 幂等（S-12）：同一 `intent_hash` 的重发返回先前结果——Accepted → 原 seq（不重复
+    /// 分配、不重复扣预算），Rejected → 原原因（不透传成成功）。跨意图复用 nonce 仍
+    /// `E_Nonce`（§6.2 不允许复用）。Err 时 nonce 已消耗。
     /// 防御路径：未 provision 的委托不该走到这里（管线在注册表查表时已拒）。
+    /// 全 Copy 参数（B8 快路径，不引入结构体包装）。
+    #[allow(clippy::too_many_arguments)]
     pub fn try_commit(
         &self,
         dh: &[u8; 32],
         delegation: &Delegation,
+        intent_hash: [u8; 32],
         spend_nonce: u64,
         amount: u64,
         now: u64,
@@ -189,15 +234,42 @@ impl ShardedState {
         let mut map = self.shards[idx].lock().expect("shard poisoned");
         let st = map.entry(*dh).or_insert_with(|| DelegationLedgerState {
             budget: BudgetState::new(*dh, 0),
-            nonces: HashSet::new(),
+            nonces: HashMap::new(),
         });
-        if !st.nonces.insert(spend_nonce) {
+        if let Some(rec) = st.nonces.get(&spend_nonce) {
+            if rec.intent_hash == intent_hash {
+                return match rec.outcome {
+                    NonceOutcome::Accepted { seq } => Ok(seq),
+                    NonceOutcome::Rejected(e) => Err(e),
+                };
+            }
             return Err(Error::ENonce);
         }
-        check_budget(delegation, &mut st.budget, amount, now)?;
-        // seq 在锁内分配：同委托的提交序 == seq 序（重放精确性，见模块文档）。
-        let seq = seq_assigner.fetch_add(1, Ordering::Relaxed);
-        Ok(seq)
+        match check_budget(delegation, &mut st.budget, amount, now) {
+            Ok(()) => {
+                // seq 在锁内分配：同委托的提交序 == seq 序（重放精确性，见模块文档）。
+                let seq = seq_assigner.fetch_add(1, Ordering::Relaxed);
+                st.nonces.insert(
+                    spend_nonce,
+                    NonceState {
+                        intent_hash,
+                        outcome: NonceOutcome::Accepted { seq },
+                    },
+                );
+                Ok(seq)
+            }
+            Err(e) => {
+                // 预算拒也消耗 nonce（§6.2）；记下原因，同意图重发原样返回。
+                st.nonces.insert(
+                    spend_nonce,
+                    NonceState {
+                        intent_hash,
+                        outcome: NonceOutcome::Rejected(e),
+                    },
+                );
+                Err(e)
+            }
+        }
     }
 
     pub fn total_spent(&self, dh: &[u8; 32]) -> Option<u64> {
@@ -568,7 +640,7 @@ impl Aggregator {
             })?;
             let got = agg
                 .state
-                .try_commit(&dh, &reg.delegation, spend_nonce, amount, now, &agg.seq)
+                .try_commit(&dh, &reg.delegation, ih, spend_nonce, amount, now, &agg.seq)
                 .map_err(std::io::Error::other)?;
             debug_assert_eq!(got, seq, "replay seq must match WAL seq");
             // 意图索引只收未密封意图：已提交的（seq < 边界）由 EpochSeal/Netting 覆盖，
@@ -634,6 +706,15 @@ impl Aggregator {
         let intent = &env.intent;
         let ih = intent_hash(intent);
 
+        // 0. 幂等重发（S-12）：同意图（同 nonce + 同 intent_hash）已被接受 → 直接返回既有 seq。
+        //    必须在其它闸口之前——重发时信封可能已过期，而该意图早已接受；若让 EIntentExpired
+        //    挡掉，SDK 会把已接受的支付误判为失败 → 用新 nonce 重发同一意图 → 双花。
+        if let Some(seq) = self
+            .state
+            .lookup_accept(&intent.delegation_hash, intent.spend_nonce, ih)
+        {
+            return Receipt::accepted(ih, seq);
+        }
         // 1. 意图有效期（早退：过期意图不占窗口 / 账本）。
         if now > intent.expires_at {
             return Receipt::rejected(ih, Error::EIntentExpired);
@@ -671,6 +752,7 @@ impl Aggregator {
         let seq = match self.state.try_commit(
             &pi.delegation_hash,
             &reg.delegation,
+            ih,
             pi.spend_nonce,
             pi.amount,
             pi.now,
@@ -822,6 +904,7 @@ mod tests {
         SpendIntent,
     };
     use meridian_core::zk::SpendProof;
+    use std::collections::HashSet;
 
     use crate::proof::FormatVerifier;
     use proptest::prelude::*;
@@ -1003,6 +1086,78 @@ mod tests {
         let r2 = agg.submit(&e2);
         assert!(!r2.accepted);
         assert_eq!(r2.reject_reason, Some(Error::ENonce));
+        assert_eq!(agg.nonce_count(&dh), Some(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resubmit_same_intent_returns_original_seq() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("resubmit-ok");
+        let agg = test_aggregator(&clock, &path);
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+        let r1 = agg.submit(&env);
+        assert!((r1.accepted, r1.seq) == (true, 0));
+        // 同一 intent 重发（S-12 断线重试语义）→ 幂等返回原 seq，不重复记账 / 不重复分配。
+        let r2 = agg.submit(&env);
+        assert!(r2.accepted);
+        assert_eq!(r2.seq, r1.seq);
+        assert_eq!(r2.intent_hash, r1.intent_hash);
+        assert_eq!(agg.accepted_count(), 1);
+        assert_eq!(agg.total_spent(&dh), Some(10));
+        assert_eq!(agg.nonce_count(&dh), Some(1));
+        // 后续新意图（新 nonce）不受影响。
+        let r3 = agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 20, 2, now));
+        assert!((r3.accepted, r3.seq) == (true, 1));
+        assert_eq!(agg.total_spent(&dh), Some(30));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resubmit_accepted_after_expiry_returns_seq() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("resubmit-expired");
+        let agg = test_aggregator(&clock, &path);
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now); // expires_at = now+60
+        let r1 = agg.submit(&env);
+        assert!(r1.accepted);
+        // 时钟越过意图过期时间；重发必须走幂等闸口返回原 seq，而不是 EIntentExpired
+        //（否则 SDK 会误判失败 → 换新 nonce 重发 → 双花）。
+        clock.fetch_add(61, Ordering::Relaxed);
+        let r2 = agg.submit(&env);
+        assert!(r2.accepted);
+        assert_eq!(r2.seq, r1.seq);
+        assert_eq!(agg.accepted_count(), 1);
+        assert_eq!(agg.total_spent(&dh), Some(10));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resubmit_budget_rejected_intent_returns_reason() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("resubmit-rejected");
+        let agg = test_aggregator(&clock, &path);
+        let d = delegation([1u8; 20], 100, 1_000_000);
+        let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        agg.register(sd, agent_key.verifying_key());
+        let dh = meridian_core::dsa::delegation_hash(&d);
+        let now = clock.load(Ordering::Relaxed);
+        let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 101, 1, now);
+        let r1 = agg.submit(&env);
+        assert_eq!(r1.reject_reason, Some(Error::EBudgetPerSpend));
+        // 同一意图重发：返回原拒绝原因（nonce 已消耗），不透传成成功。
+        let r2 = agg.submit(&env);
+        assert!(!r2.accepted);
+        assert_eq!(r2.reject_reason, Some(Error::EBudgetPerSpend));
+        assert_eq!(agg.accepted_count(), 0);
+        assert_eq!(agg.total_spent(&dh), Some(0));
         assert_eq!(agg.nonce_count(&dh), Some(1));
         let _ = std::fs::remove_file(&path);
     }

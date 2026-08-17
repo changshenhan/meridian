@@ -56,7 +56,7 @@ meridian/
     DSA.sol
     RevocationRegistry.sol
     BatchSettler.sol
-  sdk/             # agent 客户端 SDK（封装 core，暴露 pay()/authorize()）
+  sdk/             # agent 客户端 SDK（S-12：authorize/pay/attest + 幂等重试，见 §6.6）
   bench/           # 基准基座 + baseline.json + compare 工具
   tests/           # 单元 / property / 集成 / fuzz
 ```
@@ -390,6 +390,12 @@ pub trait Ingest {
 
 - 摄入管线：验签（Ed25519 快路径）→ 验证明（§5）→ 预算检查（§4.5）→ 记账 → 入窗口队列。
 - 拒绝原因必须进 `Receipt`，供 agent 端幂等重试（nonce 不允许复用）。
+- **幂等重发（S-12，管线最前闸口）**：同一 `spend_nonce` + 同一 `intent_hash` 的重发
+  **在过期检查之前**直接返回既有结果——accepted → 原 `seq`（不重复分配、不重复记账）；
+  rejected → 原错误码（不透传成成功）。此闸口在过期检查之前，因此**已过期但曾被接受的
+  意图重发**仍返回原 `seq`——SDK 断线重试绝不因 `EIntentExpired` 误判失败而换新 nonce
+  重发（那才是双花的来源）。跨意图复用 nonce 仍 `E_Nonce`（§6.2 不允许复用，原语义
+  不变）。
 
 ### 6.3 排序与承诺（commitment lattice，防抢跑）
 
@@ -448,6 +454,32 @@ pub trait Ingest {
 - **出界**：超付不可证（需完备性）；按 epoch 结算资金后超付是运营者自损（自掏 Σnet 付虚高
   行），不掏空其他 claim 方。整 epoch void 会惩罚诚实收款人（该 epoch 全部 claim 拒绝）——
   v1 接受（§6.5 "net[] 回滚"口径），按收款人封禁是后续增强。
+
+### 6.6 SDK 集成层（S-12）
+
+独立 agent 进程集成层（`sdk/` crate，`meridian-sdk`）：封装 core 密码学原语 + 聚合器
+摄取管线，暴露三个高层操作——`authorize()`（注册委托）/ `pay()`（幂等支付）/
+`attest()`（双钥绑定凭据）。错误码经 `Error::as_code` 透传，供 agent 把拒绝原因原样
+转达上层策略。
+
+**幂等重试契约（"断线重试不产生双花"）**：
+1. 每笔逻辑支付取**固定 `spend_nonce`**，整个重试周期不复用、不推进；只有聚合器返回
+   定局（accepted 或永久拒绝）后，下一笔才取新 nonce（`NonceManager`，每委托单调）。
+2. **仅传输错误**（`SdkError::Transport`）触发重试；聚合器的业务拒绝（`SdkError::Meridian`，
+   错误码透传）**永不重试**。
+3. 聚合器侧幂等（§6.2 幂等重发闸口）兜底重发：断线重发返回先前结果 → 不会把同一笔意图
+   记两次（双花），也绝不会把一笔被拒绝的意图透传成成功。
+
+**传输形态**：`Transport` trait 抽象「聚合器连接」——`authorize` / `submit`。S-12 提供
+`InProcessAggregator`（进程内聚合器，测试与单进程嵌入用）；网络传输是 S-13 框架分发层
+的接缝。
+
+**诚实边界**：
+- 证明 = `PlaceholderProver`（proof 非空 + 公共输入与信封一致），与聚合器内置
+  `FormatVerifier`（TEMPORARY）配套；真实 S-09 电路 prover 实现 core `SpendProver`
+  经 `SdkClient::with_prover` 接入，`pay()` 重试逻辑不变。
+- `NonceManager` 为进程内单调计数，崩溃后不持久化；跨重启恢复依赖聚合器 WAL + 未来
+  `next_nonce` 查询 RPC（Phase 2 缝，sdk/README 记录）。
 
 ---
 
@@ -656,7 +688,7 @@ contract BatchSettler {
 | `E_BUDGET_PER_SPEND` | 超过单笔上限 |
 | `E_BUDGET_RATE` | 超过窗口速率 |
 | `E_BUDGET_TOTAL` | 超过累计总上限 |
-| `E_NONCE` | spend_nonce 重复或回退 |
+| `E_NONCE` | 同 nonce **换意图**重放（§6.2 幂等重发：同意图重发返回先前结果，不是本码） |
 | `E_REVOKED` | 委托已撤销 |
 | `E_INTENT_EXPIRED` | 意图过期 |
 | `E_INTENT_HASH` | intent_hash 与字段不一致 |
@@ -676,6 +708,7 @@ contract BatchSettler {
 | `agg` | 10 万笔确定性排序；承诺根可复现；WAL 崩溃恢复；B5/B6/B7/B8 达标 |
 | `contracts` | Anvil 集成测试全绿；commit/settle/challenge 全路径可挑战 |
 | `bench` | §8 全套件可在参考机复现；baseline.json 入库；CI 门禁生效 |
+| `sdk` | authorize/pay/attest 全可用；断线重试不双花（e2e：re-ack 原 seq、accept 一次） |
 | **里程碑 M1** | 端到端 demo：agent 持 DSA → ZK 授权 → 聚合器 100k 笔 → BatchSettler 净额结算，Anvil 上全绿 |
 
 ---
