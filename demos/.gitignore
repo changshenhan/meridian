@@ -3,4 +3,5 @@
 .wal/
 __pycache__/
 eliza/node_modules/
-eliza/character.json   # 每次运行按本机绝对路径重新生成
+# 每次运行按本机绝对路径重新生成，不入库
+eliza/character.json
