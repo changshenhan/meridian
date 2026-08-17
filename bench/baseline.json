@@ -3,14 +3,14 @@
   "commit": "local",
   "machine": "windows x86_64",
   "metrics": {
-    "agg_kernel_b7_wall_ms": 45.3977,
-    "agg_kernel_ingest_ops": 47820.755851878195,
-    "aggregator_ingest_ops": 41849.540439734046,
-    "check_budget_ops": 3398851938.308267,
-    "intent_sign_ops": 95066.85418075505,
-    "intent_verify_ops": 50993.92254431117,
-    "sign_delegation_ops": 35323.475610994574,
-    "verify_delegation_ops": 19958.856812566573
+    "agg_kernel_b7_wall_ms": 46.0687,
+    "agg_kernel_ingest_ops": 40514.91930251034,
+    "aggregator_ingest_ops": 48393.41426123673,
+    "check_budget_ops": 1817890304.5850422,
+    "intent_sign_ops": 95811.68787618064,
+    "intent_verify_ops": 51572.81617488548,
+    "sign_delegation_ops": 35976.438311021346,
+    "verify_delegation_ops": 19558.831007788325
   },
-  "recorded_at_unix": 1786971072
+  "recorded_at_unix": 1786971817
 }

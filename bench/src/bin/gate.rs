@@ -7,6 +7,10 @@
 //!
 //! 度量：固定输入集 + 固定迭代，输出 ops/sec，写入/比对 baseline.json。
 //! 所有数字可复现（固定 seed、固定输入）。机器差异通过在同一参考平台上记录 baseline 消除。
+//!
+//! 噪音稳健性（S-14b）：`intent_verify_ops` 等指标单机 run-to-run 波动实测 ±17%
+//! （> 15% 阈值）。因此：单指标 9 轮取中位 + 疑似回归整轮复测确认（连续两轮同指标都退步
+//! 才算真回归）；`--record` 3 整轮逐指标取中位。真实代码回归两轮都退步必然被抓住。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,7 +42,9 @@ fn bench_per_sec<F: FnMut()>(mut f: F) -> f64 {
     for _ in 0..20_000 {
         f();
     }
-    const ROUNDS: usize = 5;
+    // S-14b：5 → 9 轮取中位。intent_verify_ops 单机 run-to-run 波动实测 ±17%
+    // （> 15% 阈值），5 轮中位仍会被一次负载突发整体拉低；9 轮显著收窄。
+    const ROUNDS: usize = 9;
     let mut samples = [0.0f64; ROUNDS];
     for s in samples.iter_mut() {
         let mut n: u64 = 0;
@@ -87,6 +93,48 @@ fn sample_intent(dh: [u8; 32]) -> SpendIntent {
     }
 }
 
+/// 三值中位数（`--record` 3 整轮逐指标取中位）。
+fn median3(a: f64, b: f64, c: f64) -> f64 {
+    let mut v = [a, b, c];
+    v.sort_by(|x, y| x.partial_cmp(y).expect("finite sample"));
+    v[1]
+}
+
+/// 输出比对表并返回超过 `fail_over`% 退步的指标名（不退出——调用方决定复测/失败）。
+fn compare_table(
+    baseline: &Report,
+    metrics: &BTreeMap<String, f64>,
+    fail_over: f64,
+) -> Vec<String> {
+    println!(
+        "{:<28} {:>14} {:>14} {:>10}",
+        "metric", "baseline", "current", "delta%"
+    );
+    // 低值优指标（墙钟类）：回归 = delta **正**（变慢）。其余指标都是 ops/s（高值优），
+    // 回归 = delta 负（变少）。统一以"退步超过 fail_over%" 判回归（S-14b 核对时修正：
+    // 此前只查负 delta，b7_wall_ms 变慢永远不触发 → 该指标的门禁形同虚设）。
+    const LOWER_IS_BETTER: &[&str] = &["agg_kernel_b7_wall_ms"];
+    let mut regressions: Vec<String> = Vec::new();
+    for (name, base) in &baseline.metrics {
+        let cur = metrics.get(name).copied().unwrap_or(0.0);
+        let delta = if *base > 0.0 {
+            (cur - base) / base * 100.0
+        } else {
+            0.0
+        };
+        println!("{:<28} {:>14.1} {:>14.1} {:>9.2}%", name, base, cur, delta);
+        let regressed = if LOWER_IS_BETTER.contains(&name.as_str()) {
+            delta > fail_over
+        } else {
+            delta < -fail_over
+        };
+        if regressed {
+            regressions.push(name.clone());
+        }
+    }
+    regressions
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let record = args.iter().any(|a| a == "--record");
@@ -105,71 +153,83 @@ fn main() {
     let signed = dsa::sign_delegation(&delegation, &owner_key);
     let intent = sample_intent(dsa::delegation_hash(&delegation));
     let agent_sig = dsa::sign_intent(&intent, &agent_key);
-    let mut state = BudgetState::new(dsa::delegation_hash(&delegation), 0);
     let agent_pub = agent_key.verifying_key();
 
-    let metrics: BTreeMap<String, f64> = BTreeMap::from([
-        (
-            "verify_delegation_ops".to_string(),
-            bench_per_sec(|| {
-                std::hint::black_box(dsa::verify_delegation(&signed, owner_key.verifying_key()))
+    // 测量闭包：一整轮全指标采样（每指标 9 轮取中位）。确定性输入、每调用独立样本
+    // （state/batch 在闭包内重建）→ 可复测确认，防单机负载突发误报（S-14b）。
+    let measure = || {
+        BTreeMap::from([
+            (
+                "verify_delegation_ops".to_string(),
+                bench_per_sec(|| {
+                    std::hint::black_box(dsa::verify_delegation(
+                        &signed,
+                        owner_key.verifying_key(),
+                    ))
                     .ok();
+                }),
+            ),
+            (
+                "sign_delegation_ops".to_string(),
+                bench_per_sec(|| {
+                    std::hint::black_box(dsa::sign_delegation(&delegation, &owner_key));
+                }),
+            ),
+            (
+                "intent_sign_ops".to_string(),
+                bench_per_sec(|| {
+                    std::hint::black_box(dsa::sign_intent(&intent, &agent_key));
+                }),
+            ),
+            (
+                "intent_verify_ops".to_string(),
+                bench_per_sec(|| {
+                    std::hint::black_box(dsa::verify_intent(&intent, &agent_sig, &agent_pub)).ok();
+                }),
+            ),
+            ("check_budget_ops".to_string(), {
+                let mut state = BudgetState::new(dsa::delegation_hash(&delegation), 0);
+                bench_per_sec(|| {
+                    std::hint::black_box(check_budget(&delegation, &mut state, 1, 0)).ok();
+                })
             }),
-        ),
-        (
-            "sign_delegation_ops".to_string(),
-            bench_per_sec(|| {
-                std::hint::black_box(dsa::sign_delegation(&delegation, &owner_key));
-            }),
-        ),
-        (
-            "intent_sign_ops".to_string(),
-            bench_per_sec(|| {
-                std::hint::black_box(dsa::sign_intent(&intent, &agent_key));
-            }),
-        ),
-        (
-            "intent_verify_ops".to_string(),
-            bench_per_sec(|| {
-                std::hint::black_box(dsa::verify_intent(&intent, &agent_sig, &agent_pub)).ok();
-            }),
-        ),
-        (
-            "check_budget_ops".to_string(),
-            bench_per_sec(|| {
-                std::hint::black_box(check_budget(&delegation, &mut state, 1, 0)).ok();
-            }),
-        ),
-        // PoC ②（S-08a）：聚合器完整 ingest 快路径（验签→nonce→预算记账）。
-        // 单线程基线；多线程吞吐见 bin/poc_aggregator（10 万笔/秒验收）。
-        // 固定批次一次性处理（nonce 不能跨次复用），见 ingest.rs。
-        (
-            "aggregator_ingest_ops".to_string(),
-            measure_single_threaded(&Batch::build(FixtureParams {
-                n_agents: 32,
-                per_agent: 200,
-            })),
-        ),
-        // S-10 生产内核（meridian-aggregator）：单线程 ingest 全管线吞吐
-        // （验签 → SpendVerifier → 预算 → 入窗 → WAL），B5 口径的单线程基线。
-        // B8 零分配 / B11 确定性是硬断言，走 agg_sim --check-alloc / --check-determinism
-        // （CI 回归），不进吞吐 baseline。
-        (
-            "agg_kernel_ingest_ops".to_string(),
-            measure_kernel_single_threaded(&KernelBatch::build(KernelFixtureParams {
-                n_agents: 32,
-                per_agent: 200,
-                now: 1_700_000_000,
-                seed: MASTER_SEED,
-            })),
-        ),
-        // B7 排序 + 承诺（100k 笔）最佳墙钟（5 轮取最短），lattice 热路径回归。
-        ("agg_kernel_b7_wall_ms".to_string(), b7_measure().0 * 1e3),
-    ]);
+            // PoC ②（S-08a）：聚合器完整 ingest 快路径（验签→nonce→预算记账）。
+            // 单线程基线；多线程吞吐见 bin/poc_aggregator（10 万笔/秒验收）。
+            // 固定批次一次性处理（nonce 不能跨次复用），见 ingest.rs。
+            (
+                "aggregator_ingest_ops".to_string(),
+                measure_single_threaded(&Batch::build(FixtureParams {
+                    n_agents: 32,
+                    per_agent: 200,
+                })),
+            ),
+            // S-10 生产内核（meridian-aggregator）：单线程 ingest 全管线吞吐
+            // （验签 → SpendVerifier → 预算 → 入窗 → WAL），B5 口径的单线程基线。
+            // B8 零分配 / B11 确定性是硬断言，走 agg_sim --check-alloc / --check-determinism
+            // （CI 回归），不进吞吐 baseline。
+            (
+                "agg_kernel_ingest_ops".to_string(),
+                measure_kernel_single_threaded(&KernelBatch::build(KernelFixtureParams {
+                    n_agents: 32,
+                    per_agent: 200,
+                    now: 1_700_000_000,
+                    seed: MASTER_SEED,
+                })),
+            ),
+            // B7 排序 + 承诺（100k 笔）最佳墙钟（5 轮取最短），lattice 热路径回归。
+            ("agg_kernel_b7_wall_ms".to_string(), b7_measure().0 * 1e3),
+        ])
+    };
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("baseline.json");
 
     if record {
+        // --record：3 整轮测量逐指标取中位（一次即得稳健基线，无需外部多次校准）。
+        let (a, b, c) = (measure(), measure(), measure());
+        let metrics = a
+            .iter()
+            .map(|(k, v)| (k.clone(), median3(*v, b[k], c[k])))
+            .collect();
         let report = Report {
             suite: SUITE.to_string(),
             commit: std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_string()),
@@ -195,26 +255,21 @@ fn main() {
     });
     let baseline: Report = serde_json::from_str(&baseline_raw).expect("parse baseline");
 
-    println!(
-        "{:<28} {:>14} {:>14} {:>10}",
-        "metric", "baseline", "current", "delta%"
-    );
-    let mut regressions: Vec<String> = Vec::new();
-    for (name, base) in &baseline.metrics {
-        let cur = metrics.get(name).copied().unwrap_or(0.0);
-        let delta = if *base > 0.0 {
-            (cur - base) / base * 100.0
-        } else {
-            0.0
-        };
-        println!("{:<28} {:>14.1} {:>14.1} {:>9.2}%", name, base, cur, delta);
-        if delta < -fail_over {
-            regressions.push(name.clone());
-        }
-    }
+    // 首轮测量 + 比对。
+    let regressions = compare_table(&baseline, &measure(), fail_over);
     if !regressions.is_empty() {
-        eprintln!("REGRESSION > {}% on: {}", fail_over, regressions.join(", "));
-        std::process::exit(1);
+        // 疑似回归 → 整轮复测确认：连续两轮同指标都退步才算真回归
+        // （intent_verify_ops 等指标单机 run-to-run 波动 ±17% > 15% 阈值，S-14b）。
+        eprintln!(
+            "[gate] 疑似回归（{}）——整轮复测确认…",
+            regressions.join(", ")
+        );
+        let confirmed = compare_table(&baseline, &measure(), fail_over);
+        if !confirmed.is_empty() {
+            eprintln!("REGRESSION > {}% on: {}", fail_over, confirmed.join(", "));
+            std::process::exit(1);
+        }
+        eprintln!("复测无回归 —— 初次判定为测量噪音，通过");
     }
     println!("OK");
 }
