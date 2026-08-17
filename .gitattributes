@@ -1,0 +1,5 @@
+# Git for Windows 默认系统级 core.autocrlf=true → 会把这些文件在 checkout 时转成 CRLF。
+# bash/sh 脚本遇 CRLF 会在 shebang 与 $(...) 命令替换里引入 \r，导致钩子静默失效。
+# 强制 LF，覆盖 autocrlf。
+*.sh text eol=lf
+.githooks/* text eol=lf
