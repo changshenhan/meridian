@@ -50,6 +50,7 @@ Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互
 | `mcp-server/README.md` | MCP 服务器：5 工具 + 错误码 + 框架接入坑 + 决策记录 D1-D5 | 框架接入 |
 | `sdk/README.md` | SDK 幂等重试契约 + 传输形态 + 诚实边界 | agent 集成 |
 | `docs/ops.md` | 生产拓扑 + 健康判定 + 指标口径 + 告警阈值（S-15） | 部署/运维 |
+| `docs/zk-batch-verify-eval.md` | ZK 批验证评估（S-18）：批验证摊薄边界 + 递归聚合路径 + 预算线诚实修订 | 技术评审 |
 
 ## 规范与性能信条
 

@@ -341,8 +341,11 @@ expires_at / revocation_root / now）为准（接口已设计成"返回即登记
 | Phase 2 | 电路内"递归聚合"：N 笔 → 1 个聚合证明 | 摊销到近乎固定成本 |
 
 > 诚实预算：100μs/笔是**目标线**。owner ECDSA 电路外（§5.2），电路内是 BabyJubJub EdDSA +
-> pedersen Merkle + sha256——单验证 ~ms 级（§5.5 实测），v1.1 批验证先达摊薄线，递归聚合
-> （Phase 2）才真正击穿。基准（§8）会产生真实数字回填预算表。
+> pedersen Merkle + sha256——单验证 ~ms 级（§5.5 实测）。**S-18 评估（`docs/zk-batch-verify-eval.md`）**：
+> 批验证（v1.1）只摊薄固定成本（配对合成、setup 共享），每证明的 MSM 主成本不跨证明共享——
+> 分析上 256 笔/批现实的摊薄约 0.5-2ms/笔（in-process wrapper 去掉 CLI 启动后），**100μs/笔
+> 单靠批验证不可达，需递归聚合（Phase 2/4）才击穿**；若批验证实测不到线，按诚实修订调整预算。
+> 基准（§8）会产生真实数字回填预算表。
 
 ### 5.5 约束预算（目标 + S-09 实测）
 
@@ -351,7 +354,7 @@ expires_at / revocation_root / now）为准（接口已设计成"返回即登记
 | 电路约束数 | < 2^18 | **66736**（`bb gates` circuit_size；含 sha256 intent_hash + pedersen Merkle + Jubjub EdDSA） |
 | 证明生成（agent 侧，桌面级） | p50 < 1s | 1.8457s（CI 2 核共享 runner，`bb prove` 进程含 witness 加载；桌面级/优化留待 Phase 4） |
 | 单证明验证（聚合器） | < 10ms | **7.62ms p99 PASS**（`bb verify` CLI 进程含启动开销，纯验证数学更小） |
-| 批验证摊薄（≥256 笔/批） | ≤ 100μs / 笔 | 7.62ms/笔 CLI 上界；真批验证摊薄待 Phase 4 in-process wrapper |
+| 批验证摊薄（≥256 笔/批） | ≤ 100μs / 笔 | 7.62ms/笔 CLI 上界；S-18 分析（`docs/zk-batch-verify-eval.md`）估计 in-process + 批验证 ~0.5-2ms/笔，**100μs 需递归聚合**（Phase 2/4）；真实测待 nargo/bb 环境 |
 
 **S-05 基线**（run 31926682045）：最小版 = 6880 ACIR opcodes + 1289 Brillig opcodes。
 **S-09 完整版**（run 31934410549）：circuit_size = **66736**，ACIR opcodes = 9044（`bb gates`
@@ -576,7 +579,7 @@ contract BatchSettler {
 | B1 | delegation 签名/验签 | ops/s, p99 | 验签 > 50k ops/s | 回归 >1% 红 |
 | B2 | ZK 证明生成（agent 侧） | p50/p99, 约束数 | p50 < 1s | 回归 >5% 红 |
 | B3 | ZK 单验证 | p99 | < 10ms | 回归 >5% 红 |
-| B4 | ZK 批验证（≥256 笔） | 摊薄 μs/笔 | ≤ 100μs | 回归 >5% 红 |
+| B4 | ZK 批验证（≥256 笔） | 摊薄 μs/笔 | ≤ 100μs（**S-18 评估**：单靠批验证不可达，需递归聚合；见 `docs/zk-batch-verify-eval.md`） | 回归 >5% 红 |
 | B5 | 聚合器摄入吞吐 | 笔/s（1/8/64 线程） | 单实例 ≥ 100k 笔/s | 回归 >1% 红 |
 | B6 | 摄入端到端延迟 | p99 | ≤ 50ms | 回归 >1% 红 |
 | B7 | 排序+承诺（100k 笔） | 耗时, 内存峰值 | < 1s, < 1GB | 回归 >1% 红 |
@@ -599,6 +602,15 @@ contract BatchSettler {
 > **180.9 ms / 0 分配**（基线记录）；B11 同 seed 两跑 lattice 输出一致（**PASS**）。
 > 口径：全管线含 `SpendVerifier`（本阶段 `FormatVerifier`，TEMPORARY，与 PoC ② 同口径）。
 > CI 只跑回归门禁（B8/B11 硬断言 + gate 吞吐基线），全量验收在参考机 `agg_sim`。
+
+> **S-14b/S-18 实测回填（`bench/baseline.json`，Windows x86_64 release 实测机，单线程
+> `gate` 全指标）**：B1 `verify_delegation_ops` **19,558/s**、`sign_delegation_ops`
+> **35,976/s**；B9 `check_budget_ops` **1.82×10⁹/s**（>1M → **PASS**，余量 ~1800×）；
+> `intent_verify_ops` 51,573/s、`intent_sign_ops` 95,812/s。**B1 目标修订（诚实口径）**：
+> 原「验签 > 50k ops/s」未标注线程基数；实测为 k256 单线程 secp256k1 验签上界
+> （~20k/s，纯数学，无 SIMD 加速），且 delegation 验签是**冷路径**（register 时每委托
+> 一次，不进 ingest 热路径）。修订为：单线程验签 ≥ 15k/s（实测余量 ~1.3×），多线程按核
+> 线性放大（B5 实测证）。B12 稳态 RSS 未测，标记**待测**（S-18 后续项，需稳态 RSS 探针）。
 
 ### 8.3 可复现与验证门禁
 
