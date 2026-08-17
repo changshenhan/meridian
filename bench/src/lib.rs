@@ -11,6 +11,7 @@ use std::cell::Cell;
 
 pub mod agg_fixture;
 pub mod ingest;
+pub mod rss;
 
 thread_local! {
     static GUARD_DEPTH: Cell<usize> = const { Cell::new(0) };

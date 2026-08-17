@@ -20,6 +20,11 @@ serde_json.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# B12 稳态 RSS 探针（gate 指标 agg_kernel_rss_mib）：Windows 用 psapi GetProcessMemoryInfo。
+# 版本对齐 Cargo.lock 已有传递 windows-sys（0.61），不引入新解析。
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
 [[bench]]
 name = "dsa_bench"
 path = "benches/dsa_bench.rs"

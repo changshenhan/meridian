@@ -587,7 +587,7 @@ contract BatchSettler {
 | B9 | 预算检查 | ops/s | > 1M ops/s | 回归 >1% 红 |
 | B10 | 端到端 100k 笔→批次→净额 | 墙钟, allocs, 峰值 | 记录基线 | 首次=基线 |
 | B11 | 确定性 | 同 seed 输出 | 输出哈希一致 | 不一致即红 |
-| B12 | 内存 | 稳态 RSS | 记录基线 | 回归 >3% 红 |
+| B12 | 内存 | 稳态 RSS（gate `agg_kernel_rss_mib`，MiB） | 记录基线 63.8 MiB（S-18 实测回填） | 回归 >3% 红（gate 强制） |
 
 > **S-08a 实测（PoC ②，`docs/poc/poc-02-aggregator-throughput.md`）**：B5 聚合器摄入
 > 吞吐，32 线程满核 **488,738 笔/s**（目标 ≥100k → **PASS**，余量 ~4.9×）；单线程基线
@@ -610,7 +610,10 @@ contract BatchSettler {
 > 原「验签 > 50k ops/s」未标注线程基数；实测为 k256 单线程 secp256k1 验签上界
 > （~20k/s，纯数学，无 SIMD 加速），且 delegation 验签是**冷路径**（register 时每委托
 > 一次，不进 ingest 热路径）。修订为：单线程验签 ≥ 15k/s（实测余量 ~1.3×），多线程按核
-> 线性放大（B5 实测证）。B12 稳态 RSS 未测，标记**待测**（S-18 后续项，需稳态 RSS 探针）。
+> 线性放大（B5 实测证）。B12 稳态 RSS **63.8 MiB**（gate 指标 `agg_kernel_rss_mib`：
+> 64 代理 × 1000 笔 = 64k 全量提交填满状态后驻留采样峰值；跨平台探针 `/proc`（Linux）/
+> `GetProcessMemoryInfo`（Windows），run-to-run 方差 ~0.2%，3% 阈值永不误报；**gate 强制、
+> 不受 `--fail-over` 放宽**）。
 
 ### 8.3 可复现与验证门禁
 

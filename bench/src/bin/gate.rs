@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use meridian_bench::agg_fixture::{
-    measure_kernel_single_threaded, KernelBatch, KernelFixtureParams, MASTER_SEED,
+    measure_kernel_rss_mib, measure_kernel_single_threaded, KernelBatch, KernelFixtureParams,
+    MASTER_SEED,
 };
 use meridian_bench::b7_measure;
 use meridian_bench::ingest::{measure_single_threaded, Batch, FixtureParams};
@@ -26,6 +27,12 @@ use meridian_core::ledger::{check_budget, BudgetState};
 
 const SUITE: &str = "meridian-bench";
 const DEFAULT_FAIL_OVER_PCT: f64 = 1.0;
+
+/// 每指标阈值，**始终生效**（不随显式 `--fail-over` 放宽）。
+/// B12 稳态 RSS 回归 >3% 红（TECH_SPEC §8.2）。RSS 是内存计数器、非 timing：实测
+/// run-to-run 方差 ~0.2%，3% 阈值永不误报；`--fail-over 15` 灾难模式是给 ±17% 噪音的
+/// timing 指标设计的，RSS 不需要放宽。其余指标沿用全局 `fail_over`。
+const METRIC_THRESHOLDS: &[(&str, f64)] = &[("agg_kernel_rss_mib", 3.0)];
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Report {
@@ -100,20 +107,23 @@ fn median3(a: f64, b: f64, c: f64) -> f64 {
     v[1]
 }
 
-/// 输出比对表并返回超过 `fail_over`% 退步的指标名（不退出——调用方决定复测/失败）。
+/// 输出比对表并返回超过阈值% 退步的指标名（不退出——调用方决定复测/失败）。
+/// `metric_thresholds` 是每指标覆盖（如 B12 RSS 3%）；未命中则用全局 `fail_over`。
 fn compare_table(
     baseline: &Report,
     metrics: &BTreeMap<String, f64>,
     fail_over: f64,
+    metric_thresholds: &[(&str, f64)],
 ) -> Vec<String> {
     println!(
         "{:<28} {:>14} {:>14} {:>10}",
         "metric", "baseline", "current", "delta%"
     );
-    // 低值优指标（墙钟类）：回归 = delta **正**（变慢）。其余指标都是 ops/s（高值优），
-    // 回归 = delta 负（变少）。统一以"退步超过 fail_over%" 判回归（S-14b 核对时修正：
-    // 此前只查负 delta，b7_wall_ms 变慢永远不触发 → 该指标的门禁形同虚设）。
-    const LOWER_IS_BETTER: &[&str] = &["agg_kernel_b7_wall_ms"];
+    // 低值优指标（墙钟 / 内存）：回归 = delta **正**（变慢 / 驻留涨）。其余指标都是
+    // ops/s（高值优），回归 = delta 负（变少）。统一以"退步超过阈值%" 判回归
+    // （S-14b 核对时修正：此前只查负 delta，b7_wall_ms 变慢永远不触发 → 该指标的门禁
+    // 形同虚设。B12 同向：RSS 涨 >3% 即红，TECH_SPEC §8.2）。
+    const LOWER_IS_BETTER: &[&str] = &["agg_kernel_b7_wall_ms", "agg_kernel_rss_mib"];
     let mut regressions: Vec<String> = Vec::new();
     for (name, base) in &baseline.metrics {
         let cur = metrics.get(name).copied().unwrap_or(0.0);
@@ -123,10 +133,15 @@ fn compare_table(
             0.0
         };
         println!("{:<28} {:>14.1} {:>14.1} {:>9.2}%", name, base, cur, delta);
+        let threshold = metric_thresholds
+            .iter()
+            .find(|(n, _)| *n == name.as_str())
+            .map(|(_, t)| *t)
+            .unwrap_or(fail_over);
         let regressed = if LOWER_IS_BETTER.contains(&name.as_str()) {
-            delta > fail_over
+            delta > threshold
         } else {
-            delta < -fail_over
+            delta < -threshold
         };
         if regressed {
             regressions.push(name.clone());
@@ -138,6 +153,8 @@ fn compare_table(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let record = args.iter().any(|a| a == "--record");
+    // 每指标阈值始终生效（RSS 3%）；显式 --fail-over 只作用于无覆盖的指标（timing 类）。
+    let metric_thresholds: &[(&str, f64)] = METRIC_THRESHOLDS;
     let fail_over = match args.iter().position(|a| a == "--fail-over") {
         Some(pos) => args
             .get(pos + 1)
@@ -218,6 +235,9 @@ fn main() {
             ),
             // B7 排序 + 承诺（100k 笔）最佳墙钟（5 轮取最短），lattice 热路径回归。
             ("agg_kernel_b7_wall_ms".to_string(), b7_measure().0 * 1e3),
+            // B12 稳态 RSS（MiB，TECH_SPEC §8.2）：生产内核全量填满后的进程驻留足迹。
+            // 低值优指标，METRIC_THRESHOLDS 3%；记录基线后回归 >3% 红。
+            ("agg_kernel_rss_mib".to_string(), measure_kernel_rss_mib()),
         ])
     };
 
@@ -256,7 +276,7 @@ fn main() {
     let baseline: Report = serde_json::from_str(&baseline_raw).expect("parse baseline");
 
     // 首轮测量 + 比对。
-    let regressions = compare_table(&baseline, &measure(), fail_over);
+    let regressions = compare_table(&baseline, &measure(), fail_over, metric_thresholds);
     if !regressions.is_empty() {
         // 疑似回归 → 整轮复测确认：连续两轮同指标都退步才算真回归
         // （intent_verify_ops 等指标单机 run-to-run 波动 ±17% > 15% 阈值，S-14b）。
@@ -264,7 +284,7 @@ fn main() {
             "[gate] 疑似回归（{}）——整轮复测确认…",
             regressions.join(", ")
         );
-        let confirmed = compare_table(&baseline, &measure(), fail_over);
+        let confirmed = compare_table(&baseline, &measure(), fail_over, metric_thresholds);
         if !confirmed.is_empty() {
             eprintln!("REGRESSION > {}% on: {}", fail_over, confirmed.join(", "));
             std::process::exit(1);

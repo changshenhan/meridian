@@ -276,3 +276,64 @@ pub fn measure_kernel_single_threaded(batch: &KernelBatch) -> f64 {
     let elapsed = start.elapsed().as_secs_f64();
     batch.envs.len() as f64 / elapsed
 }
+
+/// B12 稳态 RSS（MiB）——生产内核真实驻留足迹基线（TECH_SPEC §8.2）。
+///
+/// 口径与 `measure_kernel_single_threaded` 一致：真实 `Aggregator`（WAL、`FormatVerifier`、
+/// 容量预置、可控时钟）与同构 `IngestConfig`。规模取主 fixture 量级（64 代理 × 1000 笔，
+/// 共 64k，B6 同量级）使聚合器状态成为进程驻留主体。
+///
+/// 流程：全量 submit 填满状态（验签→预算→入窗→WAL，此后无增长即"稳态"）→ 驻留采样
+/// 5 次取峰值（工作集不瞬时回落，峰值抗瞬时抖动）。返回 MiB，供 gate 指标
+/// `agg_kernel_rss_mib` 使用（METRIC_THRESHOLDS 3%，回归 >3% 红）。
+pub fn measure_kernel_rss_mib() -> f64 {
+    use meridian_aggregator::ingest::{Aggregator, IngestConfig};
+    use meridian_aggregator::proof::FormatVerifier;
+    use meridian_aggregator::wal::Wal;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let batch = KernelBatch::build(KernelFixtureParams {
+        n_agents: 64,
+        per_agent: 1_000,
+        now: 1_700_000_000,
+        seed: MASTER_SEED,
+    });
+    let cfg = IngestConfig {
+        ledger_shards: 64,
+        epoch_capacity: batch.envs.len() + 1024,
+        epoch_secs: 60,
+        wal_sync_every: 10_000_000, // 与吞吐测量同口径：不 fsync（缓冲兜底）
+        nonce_capacity_per_delegation: batch.per_agent + 64,
+    };
+    let mut wal_path = std::env::temp_dir();
+    wal_path.push(format!("meridian-gate-rss-{}.wal", std::process::id()));
+    let _ = std::fs::remove_file(&wal_path);
+    let wal = Wal::open(&wal_path, cfg.wal_sync_every).expect("gate rss wal open");
+    let clock = Arc::new(AtomicU64::new(batch.now));
+    let agg = Aggregator::with_capacity_and_clock(
+        cfg,
+        Box::new(FormatVerifier),
+        wal,
+        Box::new({
+            let clock = Arc::clone(&clock);
+            move || clock.load(Ordering::Relaxed)
+        }),
+        batch.agents.len(),
+        batch.envs.len(),
+    );
+    for a in &batch.agents {
+        agg.register(a.sd.clone(), a.agent_pub);
+    }
+    // 预热 + 填满状态：全部意图提交。此后分配器稳定、状态无增长 → "稳态"。
+    for env in &batch.envs {
+        assert!(agg.submit(env).accepted, "rss fixture intent rejected");
+    }
+    // 驻留采样：aggregator 保持存活，进程 RSS 5 次取峰值（MiB）。
+    let mut peak: u64 = 0;
+    for _ in 0..5 {
+        peak = peak.max(crate::rss::current_rss_bytes());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    peak as f64 / (1024.0 * 1024.0)
+}
