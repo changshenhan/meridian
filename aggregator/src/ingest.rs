@@ -675,6 +675,12 @@ impl Aggregator {
             .provision(&dh, self.cfg.nonce_capacity_per_delegation);
     }
 
+    /// 手动批量 fsync WAL 到盘（结算边界 / 优雅停机时调用，确保持久点后的状态可完整恢复）。
+    /// 未 flush 的尾巴在崩溃中丢失属标准 WAL 语义（S-10c）；本方法让调用方选择持久化时机。
+    pub fn flush_wal(&self) -> std::io::Result<()> {
+        self.wal.flush()
+    }
+
     /// 撤销委托（链上 revoke 事件 → 运营者调用）：WAL 追加后入撤销集（持久化骨干，WAL 失败
     /// panic）。返回是否新撤销（重复撤销幂等）。从本调用起，该委托的新意图 `submit` 一律
     /// `E_REVOKED` 拒；撤销根随下个密封 epoch 上链（S-11 验收：1 epoch 内进入撤销根）。

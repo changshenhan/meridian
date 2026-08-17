@@ -112,6 +112,10 @@ impl WalInner {
         if self.buf_len > 0 {
             self.file.write_all(&self.buf[..self.buf_len])?;
             self.file.sync_data()?;
+            // 必须 clear：不清则 `buf` 仍含已刷前缀，而 `buf_len` 从 0 重新计，
+            // 下一次 flush 写 `buf[..buf_len]` 会**重写旧前缀**（重复注册/意图）→ 重放
+            // CRC 错截断（S-14 M1 回归）。clear 只清长度、保留 8MB 容量 → 仍零 realloc。
+            self.buf.clear();
             self.buf_len = 0;
             self.records_buffered = 0;
         }
@@ -496,6 +500,47 @@ mod tests {
         let (records, _, truncated) = w.replay().unwrap();
         assert!(!truncated);
         assert_eq!(records.len(), 100);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-14 M1 回归：跨多次 fsync 的重放不得重复前缀。
+    ///
+    /// 曾有的缺陷：`flush_locked` 写 `buf[..buf_len]` 后只清 `buf_len` 不清 `buf`——第二次
+    /// flush 时 `buf` 里还躺着第一批记录的字节，而 `buf_len` 从 0 重新计 → `buf[..buf_len]`
+    /// 是**旧前缀**被原样重写（重复 Register + 重复意图）→ 重放遇 CRC 错截断。
+    /// 仅当记录数跨过 `sync_every` 触达第二次 flush 才会暴露，故此前 2~10 条的单测全绿。
+    #[test]
+    fn multi_flush_replay_no_duplicate_prefix() {
+        let path = tmp_path("multiflush");
+        let w = Wal::open(&path, 100).unwrap(); // 每 100 条自动 fsync；末 50 条显式 flush
+        for seq in 1..=250u64 {
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20])
+                .unwrap();
+        }
+        w.flush().unwrap(); // 持久化缓冲中未达阈值的尾巴（200 之后的 50 条）
+        let (records, valid, truncated) = w.replay().unwrap();
+        assert!(!truncated, "多次 flush 后重放不得截断");
+        assert_eq!(valid, w.file_len().unwrap());
+        assert_eq!(
+            records.len(),
+            250,
+            "不得出现重复前缀（250 条必须恰好重放 250 条）"
+        );
+        let mut expect = 1u64;
+        for r in &records {
+            match r {
+                DecodedRecord::Intent { seq, .. } => {
+                    assert_eq!(*seq, expect, "seq 必须严格递增 1..=250");
+                    expect += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // 精确字节校验：250 条 Intent × 128B，绝无旧前缀残留。
+        assert_eq!(
+            w.file_len().unwrap(),
+            250 * (HEADER_LEN + INTENT_PAYLOAD_LEN) as u64
+        );
         let _ = std::fs::remove_file(&path);
     }
 
