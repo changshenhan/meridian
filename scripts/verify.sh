@@ -109,12 +109,14 @@ else
     skip "nargo/bb 未找到 → ZK 门禁跳过（需 Linux；可借 neuralzoo Linux 服务器或 WSL）"
 fi
 
-# S-11d：Anvil 端到端（聚合器 + BatchSettler v2 全链路，三条场景）。依赖 forge build 产物
-# （上一步 7/9 已生成）+ anvil 可执行；两者缺一即跳过（不阻塞 Rust 主门禁）。
+# S-11d + S-14：Anvil 端到端（聚合器 + BatchSettler v2 全链路 + M1 里程碑 demo）。依赖 forge
+# build 产物（上一步 7/9 已生成）+ anvil 可执行；两者缺一即跳过（不阻塞 Rust 主门禁）。
+# m1_demo 用 release（100k 笔 debug 下 ~9min，release ~4s）；rust-smoke 场景小，debug 够。
 if { command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; } \
    && { command -v anvil >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/anvil" ]; }; then
-    step "9/9 rust-smoke Anvil 端到端 (S-11d)"
+    step "9/9 rust-smoke Anvil 端到端 (S-11d) + M1 里程碑 demo (S-14a)"
     run "rust-smoke" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run'
+    run "m1_demo" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run --release --bin m1_demo'
 else
     skip "forge/anvil 未找到 → rust-smoke 门禁跳过"
 fi
