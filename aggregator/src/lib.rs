@@ -18,5 +18,6 @@ pub mod lattice;
 pub mod merkle;
 pub mod proof;
 pub mod receipt;
+pub mod revocation;
 pub mod wal;
 pub mod window;

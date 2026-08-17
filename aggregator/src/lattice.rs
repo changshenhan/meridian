@@ -30,20 +30,28 @@ pub struct NetLine {
     pub amount: u64,
 }
 
-/// 一个 epoch 的 lattice 产物（承诺根 + 净额 + 净额根）。
+/// 一个 epoch 的 lattice 产物（承诺根 + 撤销根 + 净额 + 净额根）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochResult {
     pub epoch_id: u64,
     pub sealed_at: u64,
     pub commitment_root: [u8; 32],
+    /// 本 epoch 承诺时的撤销根（`RevocationSet::sparse_root` 快照；单独锚定，不并入承诺树，
+    /// 避免破坏承诺根的叶索引——S-11 决策）。
+    pub revocation_root: [u8; 32],
     pub net: Vec<NetLine>,
     pub netting_root: [u8; 32],
 }
 
 /// 链上发布 seam（S-11 实现为 BatchSettler 交易；失败由运营者重试，内核不内化重试）。
 pub trait ChainPublisher {
-    fn commit(&self, epoch_id: u64, commitment_root: [u8; 32], sealed_at: u64)
-        -> Result<(), Error>;
+    fn commit(
+        &self,
+        epoch_id: u64,
+        commitment_root: [u8; 32],
+        revocation_root: [u8; 32],
+        sealed_at: u64,
+    ) -> Result<(), Error>;
     fn settle(&self, epoch_id: u64, netting_root: [u8; 32], net_count: u64) -> Result<(), Error>;
 }
 
@@ -56,6 +64,7 @@ impl ChainPublisher for NoopPublisher {
         &self,
         _epoch_id: u64,
         _commitment_root: [u8; 32],
+        _revocation_root: [u8; 32],
         _sealed_at: u64,
     ) -> Result<(), Error> {
         Ok(())
@@ -125,12 +134,14 @@ pub fn netting_root(net: &[NetLine]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// 全管线：承诺根 → 重排 → 净额 → 净额根。
+/// 全管线：承诺根 → 重排 → 净额 → 净额根。`revocation_root` 由调用方（`settle_epoch` 里的
+/// `RevocationSet::sparse_root` 快照）传入，随承诺根一起上链（S-11 撤销根 1 epoch 内锚定）。
 pub fn build_epoch(
     epoch_id: u64,
     sealed_at: u64,
     entries: &[WindowEntry],
     resolve: &mut Resolver<'_>,
+    revocation_root: [u8; 32],
 ) -> Option<EpochResult> {
     let commitment_root = commitment_root(entries);
     let ordered = reorder(entries);
@@ -140,6 +151,7 @@ pub fn build_epoch(
         epoch_id,
         sealed_at,
         commitment_root,
+        revocation_root,
         net,
         netting_root,
     })
@@ -287,9 +299,10 @@ mod tests {
         let entries: Vec<WindowEntry> = (0..10).map(|i| entry(i, [(i as u8) ^ 0x5A; 32])).collect();
         let mut r1 = |ih: &[u8; 32]| Some(([ih[0]; 20], ih[1] as u64));
         let mut r2 = |ih: &[u8; 32]| Some(([ih[0]; 20], ih[1] as u64));
-        let a = build_epoch(7, 1_700_000_000, &entries, &mut r1).unwrap();
-        let b = build_epoch(7, 1_700_000_000, &entries, &mut r2).unwrap();
+        let a = build_epoch(7, 1_700_000_000, &entries, &mut r1, [0xAB; 32]).unwrap();
+        let b = build_epoch(7, 1_700_000_000, &entries, &mut r2, [0xAB; 32]).unwrap();
         assert_eq!(a.commitment_root, b.commitment_root);
+        assert_eq!(a.revocation_root, [0xAB; 32]);
         assert_eq!(a.netting_root, b.netting_root);
         assert_eq!(a.net, b.net);
     }

@@ -48,6 +48,8 @@ pub enum RecordKind {
     Intent = 2,
     EpochSeal = 3,
     Netting = 4,
+    /// 撤销委托（S-11）：崩溃后重放重建撤销集 → 下个 epoch 的撤销根精确一致。
+    Revoke = 5,
 }
 
 impl RecordKind {
@@ -57,6 +59,7 @@ impl RecordKind {
             2 => RecordKind::Intent,
             3 => RecordKind::EpochSeal,
             4 => RecordKind::Netting,
+            5 => RecordKind::Revoke,
             _ => return None,
         })
     }
@@ -92,6 +95,8 @@ pub enum DecodedRecord {
         netting_root: [u8; 32],
         net_count: u64,
     },
+    /// 撤销委托（重放重建撤销集）。
+    Revoke { delegation_hash: [u8; 32] },
 }
 
 struct WalInner {
@@ -251,6 +256,14 @@ impl Wal {
             .append_raw(RecordKind::Netting, &payload)
     }
 
+    /// 冷路径：撤销委托记录（payload 固定 32B = delegation_hash）。
+    pub fn append_revoke(&self, delegation_hash: [u8; 32]) -> std::io::Result<()> {
+        self.inner
+            .lock()
+            .expect("wal poisoned")
+            .append_raw(RecordKind::Revoke, &delegation_hash)
+    }
+
     /// 批量 fsync 到盘。
     pub fn flush(&self) -> std::io::Result<()> {
         self.inner.lock().expect("wal poisoned").flush_locked()
@@ -353,6 +366,15 @@ impl Wal {
                         epoch_id,
                         netting_root,
                         net_count,
+                    });
+                }
+                RecordKind::Revoke => {
+                    if len != 32 {
+                        truncated = true;
+                        break;
+                    }
+                    records.push(DecodedRecord::Revoke {
+                        delegation_hash: payload.try_into().unwrap(),
                     });
                 }
             }
@@ -474,6 +496,30 @@ mod tests {
         let (records, _, truncated) = w.replay().unwrap();
         assert!(!truncated);
         assert_eq!(records.len(), 100);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-11：Revoke 记录 roundtrip（撤销集崩溃恢复的前提）。
+    #[test]
+    fn revoke_record_roundtrip() {
+        let path = tmp_path("revoke");
+        let w = Wal::open(&path, 1000).unwrap();
+        w.append_revoke([0xAB; 32]).unwrap();
+        w.append_revoke([0xCD; 32]).unwrap();
+        w.flush().unwrap();
+        let (records, valid, truncated) = w.replay().unwrap();
+        assert!(!truncated);
+        assert_eq!(valid, w.file_len().unwrap());
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            &records[0],
+            DecodedRecord::Revoke { delegation_hash } if *delegation_hash == [0xAB; 32]
+        ));
+        assert!(matches!(
+            &records[1],
+            DecodedRecord::Revoke { delegation_hash } if *delegation_hash == [0xCD; 32]
+        ));
+        // 旧 WAL（无 Revoke 字节）兼容：kind=5 不存在的场景被 from_u8 判为撕裂 → 截断。
         let _ = std::fs::remove_file(&path);
     }
 

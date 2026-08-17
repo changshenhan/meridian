@@ -49,6 +49,65 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     layer[0]
 }
 
+/// 包含证明生成器：(accepted_count, siblings[自底层向上])。`index` 指向 `leaves` 内的位置，
+/// 与 Solidity `ChallengeTestHelper::proofFor`（contracts/test/）逐字节对齐——欺诈证明的
+/// 链下生成侧（S-11）。
+///
+/// 叶索引 = seq − epoch 起始 seq；`accepted_count` 由链上验证器自校验（错值 → 根不匹配）。
+/// 返回 `None` 当 `index` 越界。
+pub fn inclusion_proof(leaves: &[[u8; 32]], index: usize) -> Option<(usize, Vec<[u8; 32]>)> {
+    if index >= leaves.len() {
+        return None;
+    }
+    let n = leaves.len().next_power_of_two();
+    let mut layer: Vec<[u8; 32]> = Vec::with_capacity(n);
+    layer.extend_from_slice(leaves);
+    layer.resize(n, EMPTY_LEAF);
+    let mut siblings = Vec::with_capacity(n.trailing_zeros() as usize);
+    let mut idx = index;
+    while layer.len() > 1 {
+        siblings.push(layer[idx ^ 1]);
+        let mut next = Vec::with_capacity(layer.len() / 2);
+        for pair in layer.chunks_exact(2) {
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&pair[0]);
+            buf[32..].copy_from_slice(&pair[1]);
+            next.push(h(&buf));
+        }
+        layer = next;
+        idx >>= 1;
+    }
+    Some((leaves.len(), siblings))
+}
+
+/// 验证包含证明：沿路径重推根并与 `root` 比较。siblings 自底层向上；长度须 ==
+/// `tree_depth(accepted_count)`（与 Solidity `Merkle.computeRoot` 的边界检查对齐）。
+pub fn verify_inclusion(
+    leaf_hash: [u8; 32],
+    index: usize,
+    accepted_count: usize,
+    siblings: &[[u8; 32]],
+    root: [u8; 32],
+) -> bool {
+    let depth = accepted_count.next_power_of_two().trailing_zeros() as usize;
+    if index >= accepted_count || siblings.len() != depth {
+        return false;
+    }
+    let mut cur = leaf_hash;
+    for (i, s) in siblings.iter().enumerate() {
+        let mut buf = [0u8; 64];
+        if (index >> i) & 1 == 0 {
+            buf[..32].copy_from_slice(&cur);
+            buf[32..].copy_from_slice(s);
+        } else {
+            buf[..32].copy_from_slice(s);
+            buf[32..].copy_from_slice(&cur);
+        }
+        cur = h(&buf);
+    }
+    cur == root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +139,63 @@ mod tests {
         let b = leaf(2, [0x02; 32]);
         assert_eq!(merkle_root(&[a, b]), merkle_root(&[a, b]));
         assert_ne!(merkle_root(&[a, b]), merkle_root(&[b, a]));
+    }
+
+    /// 任意叶数任意索引：proof → verify 恒真。小树枚举全部索引；100k 容量级采样（每个 proof
+    /// 本身 O(n log n)，全枚举 100k 索引是 O(n² log n)——用采样控测试时长）。
+    #[test]
+    fn inclusion_proof_roundtrip_all_indexes() {
+        for count in [1usize, 2, 3, 4] {
+            let leaves: Vec<[u8; 32]> = (0..count as u64)
+                .map(|seq| leaf(seq + 1, [seq as u8; 32]))
+                .collect();
+            let root = merkle_root(&leaves);
+            for index in 0..count {
+                check_proof(&leaves, root, index);
+            }
+        }
+        // 100k 容量级：采样首尾 + 确定性中间点。
+        let count = 100_000usize;
+        let leaves: Vec<[u8; 32]> = (0..count as u64)
+            .map(|seq| leaf(seq + 1, [seq as u8; 32]))
+            .collect();
+        let root = merkle_root(&leaves);
+        for index in [0usize, 1, 2, 37, 65_535, 65_536, 99_998, 99_999] {
+            check_proof(&leaves, root, index);
+        }
+    }
+
+    fn check_proof(leaves: &[[u8; 32]], root: [u8; 32], index: usize) {
+        let (accepted, siblings) = inclusion_proof(leaves, index).unwrap();
+        assert_eq!(accepted, leaves.len());
+        assert_eq!(
+            siblings.len(),
+            leaves.len().next_power_of_two().trailing_zeros() as usize
+        );
+        assert!(
+            verify_inclusion(leaves[index], index, accepted, &siblings, root),
+            "verify failed: count={} index={index}",
+            leaves.len()
+        );
+    }
+
+    /// 边界防御：越界索引 → None；篡改兄弟路径 / 错 accepted_count → verify 为假。
+    #[test]
+    fn inclusion_proof_rejects_tampering() {
+        let leaves: Vec<[u8; 32]> = (0..4u64)
+            .map(|seq| leaf(seq + 1, [seq as u8; 32]))
+            .collect();
+        let root = merkle_root(&leaves);
+        assert!(inclusion_proof(&leaves, 4).is_none());
+        let (accepted, siblings) = inclusion_proof(&leaves, 1).unwrap();
+        assert!(verify_inclusion(leaves[1], 1, accepted, &siblings, root));
+        // 篡改一个兄弟 → 根不匹配。
+        let mut tampered = siblings.clone();
+        tampered[0] = leaf(99, [0xEE; 32]);
+        assert!(!verify_inclusion(leaves[1], 1, accepted, &tampered, root));
+        // 错误 accepted_count（改变深度）→ 假。
+        assert!(!verify_inclusion(leaves[1], 1, 5, &siblings, root));
+        // 越界 index → 假。
+        assert!(!verify_inclusion(leaves[1], 7, accepted, &siblings, root));
     }
 }

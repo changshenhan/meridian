@@ -61,7 +61,10 @@ fn run_pipeline(entries: &[WindowEntry]) -> EpochResult {
         let amount = u64::from_le_bytes(ih[20..28].try_into().unwrap()) % 1000;
         Some((r, amount))
     };
-    lattice::build_epoch(0, 1_700_000_000, entries, &mut resolve).expect("resolver total")
+    // 撤销根参数（S-11）：空撤销集根（bench 不测撤销稀疏根）。
+    let empty_rev_root = meridian_aggregator::revocation::RevocationSet::new().sparse_root();
+    lattice::build_epoch(0, 1_700_000_000, entries, &mut resolve, empty_rev_root)
+        .expect("resolver total")
 }
 
 fn main() {

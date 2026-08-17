@@ -35,6 +35,7 @@ use meridian_core::zk::SpendVerifier;
 use crate::lattice::{ChainPublisher, EpochResult, NoopPublisher};
 use crate::proof::check_public_inputs_consistent;
 use crate::receipt::{IntentEnvelope, Receipt};
+use crate::revocation::RevocationSet;
 use crate::wal::{DecodedRecord, Wal};
 use crate::window::{EpochWindow, WindowEntry};
 
@@ -375,6 +376,9 @@ pub struct Aggregator {
     intents: Mutex<HashMap<[u8; 32], IntentRef>>,
     /// 链上发布 seam（S-10 用 `NoopPublisher` 只算不发布；S-11 换真实交易后端）。
     publisher: Box<dyn ChainPublisher + Send + Sync>,
+    /// 撤销集（S-11）：链上 revoke 事件 → `revoke()` 落 WAL 后入集 → `submit` 闸口 +
+    /// `settle_epoch` 的撤销根快照。崩溃后由 WAL Revoke 记录重放重建。
+    revocations: RevocationSet,
     /// 全局接受序号（accepted 计数）。在分片锁内递增。
     seq: AtomicU64,
     now_fn: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -462,6 +466,7 @@ impl Aggregator {
             wal,
             intents: Mutex::new(HashMap::with_capacity(intents_expected)),
             publisher: Box::new(NoopPublisher),
+            revocations: RevocationSet::with_capacity(intents_expected / 1000),
             seq: AtomicU64::new(0),
             now_fn,
         }
@@ -485,6 +490,12 @@ impl Aggregator {
         }
         let agg = Self::build(cfg.clone(), verifier, wal, now_fn, None, 0);
 
+        // 1a. 撤销集重放（S-11）：Revoke 记录 → 撤销集（幂等；与注册表重建顺序无关）。
+        for rec in &records {
+            if let DecodedRecord::Revoke { delegation_hash } = rec {
+                agg.revocations.insert(*delegation_hash);
+            }
+        }
         // 1. 注册表 + provision。
         for rec in &records {
             if let DecodedRecord::Register(sd, agent_pub_bytes) = rec {
@@ -592,6 +603,31 @@ impl Aggregator {
             .provision(&dh, self.cfg.nonce_capacity_per_delegation);
     }
 
+    /// 撤销委托（链上 revoke 事件 → 运营者调用）：WAL 追加后入撤销集（持久化骨干，WAL 失败
+    /// panic）。返回是否新撤销（重复撤销幂等）。从本调用起，该委托的新意图 `submit` 一律
+    /// `E_REVOKED` 拒；撤销根随下个密封 epoch 上链（S-11 验收：1 epoch 内进入撤销根）。
+    pub fn revoke(&self, delegation_hash: [u8; 32]) -> bool {
+        self.wal
+            .append_revoke(delegation_hash)
+            .expect("WAL failure (durability backbone)");
+        self.revocations.insert(delegation_hash)
+    }
+
+    /// 撤销集当前根（下个 epoch 承诺时锚定；测试 / 观测）。
+    pub fn revocation_root(&self) -> [u8; 32] {
+        self.revocations.sparse_root()
+    }
+
+    /// 某委托是否已撤销（测试 / 观测）。
+    pub fn is_revoked(&self, dh: &[u8; 32]) -> bool {
+        self.revocations.is_revoked(dh)
+    }
+
+    /// 已撤销委托数（测试 / 观测）。
+    pub fn revoked_len(&self) -> usize {
+        self.revocations.len()
+    }
+
     /// 摄取单条意图（TECH_SPEC §6.2 管线，见模块文档）。永远返回 `Receipt`（不 panic，除非 WAL 失败）。
     pub fn submit(&self, env: &IntentEnvelope) -> Receipt {
         let now = (self.now_fn)();
@@ -607,6 +643,11 @@ impl Aggregator {
             Some(r) => r,
             None => return Receipt::rejected(ih, Error::EDelegUnknown),
         };
+        // 2b. 撤销闸口（S-11）：注册表查找后立即查，最廉价——不耗 nonce / 窗口槽，撤销前已
+        //     接受的意图仍留在承诺中支付（非追溯，TECH_SPEC §6.5）。
+        if self.revocations.is_revoked(&intent.delegation_hash) {
+            return Receipt::rejected(ih, Error::ERevoked);
+        }
         // 3. agent 绑定：意图声明的 agent 必须与委托绑定的一致。
         if intent.agent != reg.delegation.agent {
             return Receipt::rejected(ih, Error::EOrdering);
@@ -694,8 +735,16 @@ impl Aggregator {
                 .get(ih)
                 .copied()
         };
-        let res =
-            crate::lattice::build_epoch(se.epoch_id, se.sealed_at, &se.entries, &mut resolve)?;
+        // 撤销根快照（S-11）：本 epoch 承诺时的撤销集稀疏根，随 commit 上链；不并入承诺树
+        // （承诺根的叶索引是欺诈证明位置，独立锚定撤销根）。
+        let rev_root = self.revocations.sparse_root();
+        let res = crate::lattice::build_epoch(
+            se.epoch_id,
+            se.sealed_at,
+            &se.entries,
+            &mut resolve,
+            rev_root,
+        )?;
         // WAL 记录（崩溃重放按 epoch_id 跳过已承诺 / 已结算的 epoch）。
         // accepted_count = **累计**接受数（截至本 epoch 末，含此前全部）：max(seq)+1。
         // 恢复时用它区分已密封 vs 未密封尾（seq >= 该值 → 未密封，需重建窗口，S-10c）。
@@ -713,7 +762,12 @@ impl Aggregator {
             .expect("WAL failure (durability backbone)");
         // 上链 seam（S-11 真实交易后端；失败由运营者重试）。
         self.publisher
-            .commit(se.epoch_id, res.commitment_root, se.sealed_at)
+            .commit(
+                se.epoch_id,
+                res.commitment_root,
+                res.revocation_root,
+                se.sealed_at,
+            )
             .expect("publisher commit failed");
         self.publisher
             .settle(se.epoch_id, res.netting_root, res.net.len() as u64)
@@ -1505,6 +1559,141 @@ mod tests {
         for e in &sealed[0].entries {
             assert!(e.seq >= 4, "no epoch-0 intent re-enters commitment");
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-11：撤销后新意图 E_REVOKED 拒，不耗 nonce/窗口槽；撤销前已接受意图不受影响（非追溯）。
+    #[test]
+    fn revoked_delegation_new_intents_rejected() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revoked");
+        let agg = test_aggregator(&clock, &path);
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        // 撤销前接受 1 笔。
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now))
+                .accepted
+        );
+        // 撤销 → 新意图 E_REVOKED 拒，seq 不前进（不耗窗口槽）。
+        assert!(agg.revoke(dh));
+        assert!(!agg.revoke(dh), "重复撤销幂等");
+        let r = agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 20, 2, now));
+        assert!(!r.accepted);
+        assert_eq!(r.reject_reason, Some(Error::ERevoked));
+        assert_eq!(r.seq, 0);
+        assert_eq!(agg.accepted_count(), 1, "撤销前意图不受影响");
+        assert_eq!(agg.nonce_count(&dh), Some(1));
+        // 撤销前已接受的意图仍可结算（非追溯）。
+        let sealed = agg.seal_expired(now + 10_000, 1);
+        assert_eq!(sealed.len(), 1);
+        let res = agg.settle_epoch(&sealed[0]).expect("settle ok");
+        let sum_net: u64 = res.net.iter().map(|l| l.amount).sum();
+        assert_eq!(sum_net, 10);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-11：撤销根随下个密封 epoch 上链——epoch 0 无撤销 → 空根；revoke 后 epoch 1 的
+    /// 撤销根 = 当前撤销集稀疏根且 ≠ epoch 0（验收：撤销事件 1 epoch 内进入撤销根）。
+    #[test]
+    fn revocation_root_anchored_in_next_epoch() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revroot");
+        let mut cfg = test_cfg();
+        cfg.epoch_capacity = 4;
+        let c = Arc::clone(&clock);
+        let wal = Wal::open(&path, 100_000).unwrap();
+        let agg = Aggregator::with_clock(
+            cfg,
+            Box::new(FormatVerifier),
+            wal,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        );
+        // 两个委托：dh_a 用于 epoch 0 并随后撤销；dh_b 用于 epoch 1（被撤销委托不能再提交）。
+        let (dh_a, _) = register_default(&agg, [0x01; 20]);
+        let (dh_b, _) = register_default(&agg, [0x02; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        let empty_root = RevocationSet::new().sparse_root();
+        // epoch 0：4 笔 dh_a，无撤销。
+        for i in 0..4u64 {
+            assert!(
+                agg.submit(&make_env(
+                    dh_a,
+                    [0x01; 20],
+                    &agent_key,
+                    [i as u8; 20],
+                    1,
+                    i + 1,
+                    now
+                ))
+                .accepted
+            );
+        }
+        let sealed = agg.seal_expired(now + 10_000, 1);
+        assert_eq!(sealed.len(), 1);
+        let res0 = agg.settle_epoch(&sealed[0]).expect("settle epoch 0");
+        assert_eq!(res0.revocation_root, empty_root, "epoch 0 撤销根 = 空根");
+        // 撤销 dh_a → epoch 1 的撤销根变化。
+        assert!(agg.revoke(dh_a));
+        for i in 0..4u64 {
+            assert!(
+                agg.submit(&make_env(
+                    dh_b,
+                    [0x02; 20],
+                    &agent_key,
+                    [i as u8; 20],
+                    1,
+                    i + 1,
+                    now
+                ))
+                .accepted
+            );
+        }
+        let sealed = agg.seal_expired(now + 20_000, 1);
+        assert_eq!(sealed.len(), 1);
+        let res1 = agg.settle_epoch(&sealed[0]).expect("settle epoch 1");
+        assert_eq!(res1.revocation_root, agg.revocation_root());
+        assert_ne!(res1.revocation_root, res0.revocation_root, "撤销根已变化");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-11c 前提：撤销集崩溃后可重放重建，撤销根精确一致，且恢复后新意图仍 E_REVOKED。
+    #[test]
+    fn revoke_survives_crash_restore() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revrestore");
+        let now = clock.load(Ordering::Relaxed);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let d = delegation([1u8; 20], 1_000, 1_000_000);
+        let dh = meridian_core::dsa::delegation_hash(&d);
+        let expect_root;
+        {
+            let agg = test_aggregator(&clock, &path);
+            let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
+            agg.register(sd, agent_key.verifying_key());
+            agg.revoke(dh);
+            expect_root = agg.revocation_root();
+            agg.wal.flush().unwrap();
+        } // 崩溃：聚合器丢弃，只剩 WAL
+
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            test_cfg(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+        assert!(agg2.is_revoked(&dh), "撤销集由 WAL 重放重建");
+        assert_eq!(agg2.revoked_len(), 1);
+        assert_eq!(agg2.revocation_root(), expect_root, "撤销根崩溃前后一致");
+        // 恢复后新意图仍拒。
+        let r = agg2.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now));
+        assert!(!r.accepted);
+        assert_eq!(r.reject_reason, Some(Error::ERevoked));
         let _ = std::fs::remove_file(&path);
     }
 
