@@ -2,6 +2,9 @@
 name = "contract-smoke"
 version = "0.1.0"
 edition = "2021"
+# S-14a：新增 bin/m1_demo.rs（M1 里程碑 demo）→ 两个 bin target，`cargo run` 默认跑
+# main.rs（S-11d 三场景）；m1_demo 显式 `--bin m1_demo`（verify.sh 9/9）。
+default-run = "contract-smoke"
 
 # S-11d：Anvil 端到端（聚合器 + BatchSettler v2 全链路）。
 # 独立 workspace：不污染主仓 fmt/clippy/test 门禁（同 circuits/smoke-gen 惯例）。
