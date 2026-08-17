@@ -112,7 +112,13 @@ An **ingest → commit → net** pipeline:
 - **Net**: deterministically reorder by intent hash (public rule → no front-running on
   position/amount), compute net positions per recipient, settle via `BatchSettler.settle`.
 - **Dispute**: a `CHALLENGE_WINDOW` (default 6 h) allows anyone to challenge a
-  `commit ≠ settle` mismatch; bonds are slashed to challengers.
+  `commit ≠ settle` mismatch; bonds are slashed to challengers. Fraud proofs are
+  missing-recipient / under-payment against the commitment lattice (sound + bounded).
+- **Settlement asset**: v1 settles **native ETH** — the operator posts a bond
+  (`commit` msg.value) and funds each epoch's net positions (`settle` msg.value ≥ Σnet);
+  recipients `claim()` after the window, and a successful challenge voids the epoch and
+  refunds the settlement funds. USDC/ERC-20 is a Phase 2 seam: `NetInstruction
+  { recipient, amount }` is asset-agnostic, so the swap does not touch the netting structure.
 
 Netting collapses ~100k transactions into a few hundred net instructions — the on-chain gas
 is trivial.

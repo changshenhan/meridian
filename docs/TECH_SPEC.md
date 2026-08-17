@@ -27,7 +27,7 @@
 
 | 术语 | 定义 |
 |---|---|
-| `Amount` | `u64`，USDC 基础单位（1e-6 USD）。`100` = $0.0001 |
+| `Amount` | `u64`，账本/电路侧金额单位；链上结算按 S-11 用户决策用**原生 ETH**（wei，Solidity `uint256` 承接）。USDC 基础单位（1e-6 USD）推迟 Phase 2（§7 缝） |
 | `Did` | 固定 20 字节（兼容 EVM 地址形态；`did:agent:<hex>` / `did:pkh:eip155:1:<hex>`） |
 | `Delegation` | 主人签发、授予 agent 的委托消费凭证 |
 | `SpendIntent` | agent 单笔消费意图 |
@@ -210,9 +210,21 @@ pub fn check_budget(
 ### 4.6 撤销（Revocation）
 
 - 链上 `RevocationRegistry`：`delegation_hash → revoked`。
-- 聚合器定期（每 epoch）从注册表事件构建**稀疏 Merkle 树**，根 = `RevocationRoot`，作为电路公共输入。
-- 电路内验证：`delegation_hash` 对应叶子 = `EMPTY`（非成员），即未撤销。
+- **电路侧**：撤销非成员证明——`delegation_hash` 对应叶子 = `EMPTY`（非成员），即未撤销。
+  树深 32，索引 = `revocation_index(dh)` = `delegation_hash[0..4]` LE，叶子 = EMPTY(0)
+  （Pedersen sparse merkle，§5.2 断言 8）。
+- **聚合器侧（S-11 新增）**：`RevocationSet`（`aggregator/src/revocation.rs`）收集被撤销委托
+  的 `delegation_hash`，`sparse_root()` 压实成 32B 根（**sha256** sparse merkle，索引 =
+  `revocation_index(dh)`，叶子 = dh，空子树根表 `empty_roots[k]=sha256(empty_roots[k-1]‖
+  empty_roots[k-1])`，O(32·|revoked|)；空根 golden `10ffc30c…304d` Python 交叉 + 朴素全树
+  交叉验证）。撤销事件流：链上 revoke → 运营者调 `Aggregator::revoke(dh)`（WAL 追加
+  `Revoke` 记录后入集，崩溃可重放重建）→ `submit()` 在注册表查找后立即查集，已撤销委托
+  新意图一律 `E_REVOKED` 拒（最廉价闸口，不耗 nonce/窗口槽）→ 撤销根随**下个密封 epoch**
+  的 `ChainPublisher::commit` 上链（S-11 验收：1 epoch 内进入撤销根）。
 - 撤销即时性：聚合器拉取注册表延迟 ≤ 1 个 epoch；对"已撤销仍消费"的窗口期，用债券惩罚运营者（§6.5）。
+- **诚实缝（非活跃错配，S-11 记录在案）**：聚合器撤销根是 **sha256** 树，电路根是
+  **Pedersen** 树——内核用 `FormatVerifier` 从不读 `pi.revocation_root`，真正的 `E_REVOKED`
+  闸口在 `submit()`；真对齐（聚合器算 Pedersen 树）推迟到真 ZK 集成（revocation.rs + 本行）。
 
 ### 4.7 两种模式映射（实现同一接口）
 
@@ -221,7 +233,9 @@ pub fn check_budget(
 | `Contract` | 模块化智能账户（ERC-4337/6900），DSA 作为 spend-policy 模块 | 链上合约 | 中额、低频、需即时链上可查 |
 | `ZkCredential` ★ | 本 spec §5 电路 + 聚合器 | 聚合器账本 | 微额、高频、海量 |
 
-两种模式最终都由 `BatchSettler` 净额结算 USDC，接口一致。
+两种模式最终都由 `BatchSettler` 净额结算。**S-11 起用原生 ETH**（bond = `msg.value`，
+claim 付原生 ETH；`BatchSettler` v2，见 §7）。USDC/ERC-20 结算推迟 Phase 2（§7 缝：
+接口已按 `recipient + amount` 指令形状设计，资产置换不动净额结构）。
 
 ---
 
@@ -382,10 +396,12 @@ pub trait Ingest {
 ```
 窗口 W 收满（10s 或 100_000 笔）→
   A. 密封：L = [(seq_i, intent_hash_i)]，按摄取顺序；root = merkle(L)
-  B. 承诺：root 上链（BatchSettler.commit(root, epoch_id, bond_ref)）
+  B. 承诺：root + revocation_root 上链，质押债券（BatchSettler.commit(epoch_id, root,
+     revocation_root) payable onlyOperator，msg.value = bond）
   C. 确定性重排：sort L by intent_hash（公开规则，任何人可重推）
   D. 处理：按重排序执行预算净额 → 生成净额指令 net[i] = (recipient, amount)
-  E. 结算：BatchSettler.settle(epoch_id, net[], netting_root)
+  E. 结算：BatchSettler.settle(epoch_id, net[], netting_root) payable onlyOperator，
+     msg.value ≥ Σnet（结算资金源，S-11 延迟 claim）
 ```
 
 - 排序规则公开且由哈希决定 → 摄取顺序不可被"位置/金额"套利（无夹子）。
@@ -397,23 +413,48 @@ pub trait Ingest {
 
 净额结算的链上成本 = 每 epoch 仅按**净头寸**转账（典型 100k 笔 → 数百条净额指令），Gas 与吞吐完全可行。
 
+**结算节奏（S-11 延迟 claim 模式，用户决策 2026-08-17）**：
+1. `commit`：运营者质押债券（`msg.value`）+ 锚定承诺根与撤销根，一次性；
+2. `settle`：运营者提交 `net[]` + `nettingRoot`（链式 keccak 校验），**同笔携带 ≥ Σnet
+   的结算资金**（`settlementFunded` 存入；挑战成功时全额退运营者，多付部分留在合同视作
+   捐赠）；
+3. 挑战窗口（6h）：任何人可提交欺诈证明（§6.5）；挑战成功 → epoch `voided`；
+4. `claim`：窗口过后收款人**逐条**领取原生 ETH。挑战与 claim 严格时间分离 → 挑战成功时
+   无任何 claim 已付，退款干净。
+
 ### 6.5 债券/惩罚（乐观安全模型）
 
 | 承诺 | 违约 | 惩罚 |
 |---|---|---|
-| 运营者质押债券（USDC） | 等价双花 / 漏单 / 提交与承诺不符的 net[] | 债券罚没，判给挑战者 |
+| 运营者质押债券（**原生 ETH**，`commit` 时 `msg.value`） | 等价双花 / 漏单 / 提交与承诺不符的 net[] | 债券罚没，判给挑战者 |
 | 预算账本诚实 | 已撤销仍放行 / 超限记账 | 债券罚没 + 声誉分（Phase 2） |
 | 撤销根最新 | 用过时撤销根放行已撤销委托 | 债券罚没 |
 
-- 挑战窗口：`settle` 后 `CHALLENGE_WINDOW`（默认 6h）内，任何人可对 `commit ≠ settle 的 net[]` 或账本违规提交欺诈证明；成功后罚金归挑战者，`net[]` 回滚。
-- 诚实路径：v1 信任运营者（我们自己是第一个运营者），债券起震慑作用；Phase 2 引入多运营者 + 共享账本（L3 前置）。
+- **欺诈证明类型（S-11，sound + 有界）**：
+  - **漏单（missing-recipient）**：出示一条明文 SpendIntent + `seq`/`leafIndex`/
+    `acceptedCount` + merkle 兄弟路径。链上重算 `intent_hash`（字节精确）→ 叶子 →
+    验证在承诺根内；若收款人 ∉ `net[]` → 欺诈。
+  - **低付（under-payment）**：出示同一收款人的已提交意图**子集**，uint256 和 >
+    `net[target].amount` → 欺诈（单调子集，不需完备性）。超付不可证（出界，见下）。
+  - **两个防假阳性硬守卫**：同笔意图重复计入 → `DuplicateIntent` 拒；跨收款人子集
+    （低付要求每条 `recipient == net[target].recipient`）→ `BadFraudKind` 拒。
+    外加边界：`leafIndex < acceptedCount`、`siblings.length == treeDepth(acceptedCount)`。
+- **挑战窗口**：`settle` 后 `CHALLENGE_WINDOW`（6h）内，任何人可对 `commit ≠ settle` 提交
+  欺诈证明。**CEI 顺序**：验证通过 → 先置 `challenged`/`voided` → 债券罚没给挑战者 +
+  `settlementFunded`（= Σnet）全额退运营者 → 后续 claim 全部拒绝。验证失败整笔回滚（挑战者
+  吃 gas——窗口内无押金，v1 反垃圾手段）。单次挑战 `MAX_INTENTS_PER_CHALLENGE = 32`
+  （epoch_capacity=100k → 树深 17，每意图 ~19 次 sha256 预编译，~500-600k gas）。
+- **诚实路径**：v1 信任运营者（我们自己是第一个运营者），债券起震慑作用；Phase 2 引入多运营者 + 共享账本（L3 前置）。
+- **出界**：超付不可证（需完备性）；按 epoch 结算资金后超付是运营者自损（自掏 Σnet 付虚高
+  行），不掏空其他 claim 方。整 epoch void 会惩罚诚实收款人（该 epoch 全部 claim 拒绝）——
+  v1 接受（§6.5 "net[] 回滚"口径），按收款人封禁是后续增强。
 
 ---
 
-## 7. 链上合约接口（Solidity，S-06 已实现，生产化在 S-11）
+## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）
 
-三个最小可跑合约在 `contracts/src/`（forge test 19 用例 + alloy 链上冒烟，见
-`contracts/README.md`）。签名与语义以代码为准，此处为契约要点。
+五个合约在 `contracts/src/`（S-11 增 `IntentHelper.sol` / `Merkle.sol` 交叉实现；
+forge test **53 用例**全绿，见 `contracts/README.md`）。签名与语义以代码为准，此处为契约要点。
 
 ```solidity
 // DSA.sol —— 委托注册（Contract 模式 + 撤销锚点来源）
@@ -433,17 +474,40 @@ contract RevocationRegistry {
     error NotOwner(); error NotRegistered();
 }
 
-// BatchSettler.sol —— 乐观批量结算
+// BatchSettler.sol —— 乐观批量结算（S-11 v2 生产化：operator 守卫 + 延迟 claim + 完整挑战流）
 contract BatchSettler {
     struct NetInstruction { address recipient; uint256 amount; }
-    event Commit(uint256 indexed epochId, bytes32 commitmentRoot, uint64 bondedAmount);
+    struct IntentProof {
+        bytes20 agent; bytes32 delegationHash; bytes20 recipient; uint64 amount;
+        bytes32 category; uint64 spendNonce; bytes memo; uint64 expiresAt;
+        uint64 seq; uint256 leafIndex; uint256 acceptedCount; bytes32[] siblings;
+    }
+    struct FraudProof { uint8 kind; uint256 targetNetIndex; IntentProof[] intents; }
+    // kind 1 = 漏单（收款人 ∉ net[]）；kind 2 = 低付（同收款人意图子集和 > net[target].amount）
+
+    event Commit(uint256 indexed epochId, bytes32 commitmentRoot, bytes32 revocationRoot,
+                 uint256 bondedAmount);
     event Settled(uint256 indexed epochId, bytes32 nettingRoot, uint64 netCount);
-    event Challenge(uint256 indexed epochId, address challenger, bytes32 fraudProofHash);
-    function commit(uint256 epochId, bytes32 commitmentRoot) external payable; // 质押债券，一次性
-    function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot) external;
-    function challenge(uint256 epochId, bytes calldata fraudProof) external;   // CHALLENGE_WINDOW = 6h
-    error EpochAlreadyCommitted(); error EpochAlreadySettled(); error EpochAlreadyChallenged();
-    error EpochUnknown(); error WrongNettingRoot(); error ChallengeWindowClosed();
+    event ChallengeSucceeded(uint256 indexed epochId, address indexed challenger, uint8 kind);
+    event Claimed(uint256 indexed epochId, address indexed recipient, uint256 amount);
+
+    address public immutable operator;                 // 唯一运营者（onlyOperator 守卫）
+    uint256 public constant CHALLENGE_WINDOW = 6 hours;
+    uint256 public constant MAX_INTENTS_PER_CHALLENGE = 32;
+
+    function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot)
+        external payable onlyOperator;                // 质押债券（msg.value）+ 锚定撤销根，一次性
+    function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot)
+        external payable onlyOperator;                // keccak(net) 校验 + 存 net[] + msg.value ≥ Σnet
+    function claim(uint256 epochId, uint256 netIndex) external;  // 窗口后逐条领原生 ETH；voided 拒
+    function challenge(uint256 epochId, FraudProof calldata fp) external; // 窗口内完整验证欺诈证明
+
+    error EpochAlreadyCommitted(uint256); error EpochAlreadySettled(uint256);
+    error EpochAlreadyChallenged(uint256); error EpochUnknown(uint256); error EpochVoided(uint256);
+    error WrongNettingRoot(); error ChallengeWindowClosed(); error ChallengeWindowOpen();
+    error AlreadyClaimed(uint256,uint256); error NetIndexOutOfBounds(uint256,uint256);
+    error TooManyIntents(); error DuplicateIntent(); error BadInclusionProof(); error NotFraud();
+    error InsufficientSettlementFunding(); error BadFraudKind(); error NotOperator();
 }
 ```
 
@@ -454,9 +518,11 @@ contract BatchSettler {
 `sha256` 预编译，双向验收）。owner 签名强制低位 s（`s > n/2` → `revert HighS`）。
 
 - 部署底座：Base（主网 Phase 2 起）；测试：Anvil 本地链 + Base Sepolia。
-- USDC 转账用标准 ERC-20；净额指令仅含收款方与金额。
-- S-10/S-11 生产化：BatchSettler 完整 fraud-proof + 债券罚没 + 回滚；撤销事件
-  1 epoch 内进入聚合器撤销根；真实 Merkle（现为 chained-keccak 占位）。
+- **S-11 结算资产 = 原生 ETH**（bond = `msg.value`；claim 付原生 ETH）；USDC/ERC-20 结算
+  推迟 Phase 2——`NetInstruction { recipient, amount }` 指令形状不变，资产置换不动净额结构。
+- S-11 生产化：BatchSettler 完整 fraud-proof（漏单/低付，sound+有界）+ 债券罚没 +
+  epoch voided 回滚 + 延迟 claim；撤销事件 1 epoch 内进入聚合器撤销根（sha256 sparse root，
+  随 commit 上链）；真实 sha256 Merkle 已替换占位（`IntentHelper.sol`/`Merkle.sol` 交叉实现）。
 
 ---
 
