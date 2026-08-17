@@ -49,6 +49,7 @@ Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互
 | `docs/poc/*.md` | Phase 0 三个 PoC 实测报告（吞吐 488k/s、交付证明、ZK 约束） | 技术评审 |
 | `mcp-server/README.md` | MCP 服务器：5 工具 + 错误码 + 框架接入坑 + 决策记录 D1-D5 | 框架接入 |
 | `sdk/README.md` | SDK 幂等重试契约 + 传输形态 + 诚实边界 | agent 集成 |
+| `docs/ops.md` | 生产拓扑 + 健康判定 + 指标口径 + 告警阈值（S-15） | 部署/运维 |
 
 ## 规范与性能信条
 
@@ -67,6 +68,7 @@ core/          DSA 授权原语 + 预算账本（meridian-core）
 aggregator/    结算内核：ingest / commitment lattice / WAL / 净额（meridian-aggregator）
 sdk/           Agent 集成层：authorize / pay / attest + 幂等重试（meridian-sdk）
 mcp-server/    MCP stdio 服务器：5 工具、keyless（meridian-mcp）
+monitor/       S-15 可观测性：/metrics Prometheus 文本 + /healthz 健康判定（std-only）
 bench/         基准基座 + 零分配/确定性门禁 + CI gate（meridian-bench）
 contracts/     Solidity：DSA / RevocationRegistry / BatchSettler + forge 测试 + rust-smoke
 circuits/      Noir ZK 电路（spend_authorization，intent_hash 绑定 + 撤销非成员）

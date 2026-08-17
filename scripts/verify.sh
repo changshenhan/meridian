@@ -41,42 +41,56 @@ run() { # run <label> <cmd...>
 }
 
 if want fmt; then
-    step "1/9 cargo fmt --all --check"
+    step "1/10 cargo fmt --all --check"
     run "fmt" cargo fmt --all --check
 else
     skip "fmt"
 fi
 
 if want clippy; then
-    step "2/9 cargo clippy (-D warnings, all targets)"
+    step "2/10 cargo clippy (-D warnings, all targets)"
     run "clippy" cargo clippy --workspace --all-targets -- -D warnings
 else
     skip "clippy"
 fi
 
 if want test; then
-    step "3/9 cargo test (workspace)"
+    step "3/10 cargo test (workspace)"
     run "test" cargo test --workspace
 else
     skip "test"
 fi
 
 if want bench; then
-    step "4/9 bench 编译检查 (--no-run)"
+    step "4/10 bench 编译检查 (--no-run)"
     run "bench compile" cargo bench -p meridian-bench --no-run
 else
     skip "bench"
 fi
 
+# S-15 生产化：meridian-monitor 二进制构建 + `--once` 健康烟测（空 WAL → ok → exit 0）。
+# Rust 主门禁的一部分（不跳过）：监控是部署面第一道可观测探针，编译坏了等于运维盲区。
+# WAL 用 mktemp 唯一名（不删旧重建同一路径）。注意：ROOT 是普通 shell 变量，**不 export**，
+# 不能在嵌套 `bash -c '...'` 里引用（为空 → WAL 路径解析到 Windows 根 → os error 3）。
+# 因此在外部 shell 算好 WAL 路径再直接传参，无需嵌套 bash。
+if want monitor; then
+    step "5/10 meridian-monitor 构建 + --once 健康烟测 (S-15b)"
+    run "monitor build" cargo build -p meridian-monitor --bin meridian-monitor
+    W="$(mktemp -u "$ROOT/target/monitor-smoke-XXXXXX.wal")"
+    run "monitor --once" cargo run -q -p meridian-monitor --bin meridian-monitor -- --wal "$W" --once
+else
+    skip "monitor"
+fi
+
 if want perf; then
-    step "5/9 性能门禁 (release, --fail-over 15 抓灾难性回归)"
+    step "6/10 性能门禁 (release, --fail-over 15 抓灾难性回归)"
     run "perf gate" cargo run --release -p meridian-bench --bin gate -- --fail-over 15
 else
     skip "perf"
 fi
 
 if want alloc || want det; then
-    step "6/9 agg_sim 回归 (B8 热路径零分配 + B11 确定性)"
+    step "7/10 agg_sim 回归 (B8 热路径零分配 + B11 确定性)"
     if want alloc; then
         run "agg_sim B8 zero-alloc" cargo run --release -p meridian-bench --bin agg_sim -- --check-alloc
     else
@@ -94,7 +108,7 @@ fi
 # 可选外围——缺失不阻塞 Rust 主门禁。工具不在 PATH 时兜底查标准安装位置
 # （foundryup → ~/.foundry/bin；noirup → ~/.nargo/bin；bbup → ~/.bb）。
 if command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; then
-    step "7/9 solidity (forge build + test)"
+    step "8/10 solidity (forge build + test)"
     run "forge build+test" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts && forge build && forge test'
 else
     skip "forge 未找到 → solidity 门禁跳过"
@@ -102,7 +116,7 @@ fi
 
 if { command -v nargo >/dev/null 2>&1 || [ -x "$HOME/.nargo/bin/nargo" ]; } \
    && { command -v bb >/dev/null 2>&1 || [ -x "$HOME/.bb/bb" ]; }; then
-    step "8/9 ZK (smoke_zk + formal_zk)"
+    step "9/10 ZK (smoke_zk + formal_zk)"
     run "zk smoke" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/smoke_zk.sh'
     run "zk formal" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/formal_zk.sh'
 else
@@ -114,7 +128,9 @@ fi
 # m1_demo 用 release（100k 笔 debug 下 ~9min，release ~4s）；rust-smoke 场景小，debug 够。
 if { command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; } \
    && { command -v anvil >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/anvil" ]; }; then
-    step "9/9 rust-smoke Anvil 端到端 (S-11d) + M1 里程碑 demo (S-14a)"
+    step "10/10 rust-smoke Anvil 端到端 (S-11d) + M1 里程碑 demo (S-14a) + 部署脚本编译 (S-15a)"
+    # S-15a：deployer 编译门禁（alloy 依赖回归照妖镜；dry-run/--live 均不在此跑）。
+    run "deployer compile" bash -c 'cd contracts/rust-smoke && cargo build --bin deploy'
     run "rust-smoke" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run'
     run "m1_demo" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run --release --bin m1_demo'
 else
