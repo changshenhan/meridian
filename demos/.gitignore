@@ -1,0 +1,6 @@
+# 框架演示的运行时产物（本机路径相关，不提交）
+.venv/
+.wal/
+__pycache__/
+eliza/node_modules/
+eliza/character.json   # 每次运行按本机绝对路径重新生成
