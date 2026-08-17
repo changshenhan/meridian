@@ -856,6 +856,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-monitor"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "meridian-aggregator",
+ "meridian-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "meridian-sdk"
 version = "0.1.0"
 dependencies = [

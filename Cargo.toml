@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "aggregator", "bench", "mcp-server", "sdk"]
+members = ["core", "aggregator", "bench", "mcp-server", "sdk", "monitor"]
 
 [workspace.package]
 version = "0.1.0"

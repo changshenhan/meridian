@@ -1,0 +1,21 @@
+[package]
+name = "meridian-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Meridian 聚合器可观测性脚手架：Prometheus 文本导出 + /healthz 健康检查端点（S-15，std-only 零依赖）"
+
+[dependencies]
+meridian-aggregator = { workspace = true }
+meridian-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "meridian-monitor"
+path = "src/bin/main.rs"
+
+[dev-dependencies]
+# e2e：用真实密码学构造 WAL（agent Ed25519 签名意图）。
+ed25519-dalek = { workspace = true }

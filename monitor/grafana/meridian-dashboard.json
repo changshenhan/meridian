@@ -1,0 +1,99 @@
+{
+  "uid": "meridian-agg",
+  "title": "Meridian Aggregator",
+  "tags": ["meridian", "aggregator"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Ingest rate（刮取窗口均值，笔/s）",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(meridian_accepted_total[1m])",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "累计 accepted / rejected",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "refId": "A", "expr": "meridian_accepted_total", "legendFormat": "accepted {{instance}}" },
+        { "refId": "B", "expr": "meridian_rejected_total", "legendFormat": "rejected {{instance}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "待结算 epoch 积压",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 4 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "refId": "A", "expr": "meridian_pending_sealed" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "WAL 字节数",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [{ "refId": "A", "expr": "meridian_wal_bytes" }]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Uptime",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [{ "refId": "A", "expr": "meridian_uptime_seconds" }]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "已撤销委托",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [{ "refId": "A", "expr": "meridian_revoked_total" }]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(meridian_instance_info, instance)",
+        "multi": true,
+        "includeAll": true
+      }
+    ]
+  }
+}

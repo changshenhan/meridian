@@ -34,6 +34,7 @@ use meridian_core::error::Error;
 use meridian_core::ledger::{check_budget, BudgetState};
 use meridian_core::zk::SpendVerifier;
 
+use crate::health::HealthSnapshot;
 use crate::lattice::{ChainPublisher, EpochResult, NoopPublisher};
 use crate::proof::check_public_inputs_consistent;
 use crate::receipt::{IntentEnvelope, Receipt};
@@ -60,6 +61,24 @@ pub struct IngestConfig {
     pub wal_sync_every: usize,
     /// 每委托 nonce 集容量预置（B8 零分配的关键，`register` 时 provision）。
     pub nonce_capacity_per_delegation: usize,
+}
+
+impl IngestConfig {
+    /// S-15 生产默认（文档化起点，按负载调优，见 docs/ops.md §拓扑与调优）：
+    /// - `ledger_shards 32`：多核并发分片（吞吐随核数扩展）。
+    /// - `epoch_capacity 1_000_000`：百万笔/epoch，对齐运营结算节奏。
+    /// - `wal_sync_every 10_000`：万笔一批 fsync 摊薄磁盘 I/O；崩溃丢失窗口 = 至多
+    ///   一个批量（标准 WAL 语义，S-10c）。
+    /// - `nonce_capacity_per_delegation 4_096`：每委托一次性预置（稳态零分配）。
+    pub fn production() -> Self {
+        IngestConfig {
+            ledger_shards: 32,
+            epoch_capacity: 1_000_000,
+            epoch_secs: 60,
+            wal_sync_every: 10_000,
+            nonce_capacity_per_delegation: 4_096,
+        }
+    }
 }
 
 impl Default for IngestConfig {
@@ -453,6 +472,12 @@ pub struct Aggregator {
     revocations: RevocationSet,
     /// 全局接受序号（accepted 计数）。在分片锁内递增。
     seq: AtomicU64,
+    /// 会话拒绝计数（S-15 观测；零分配原子增量，**不**持久化——崩溃恢复后从 0 起）。
+    rejected: AtomicU64,
+    /// 本实例启动时刻（unix 秒；`snapshot()` 健康快照用）。
+    started_at: u64,
+    /// 实例标识（`meridian-<pid>`；S-15 多实例时每实例一 metrics endpoint）。
+    instance_id: String,
     now_fn: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -540,6 +565,9 @@ impl Aggregator {
             publisher: Box::new(NoopPublisher),
             revocations: RevocationSet::with_capacity(intents_expected / 1000),
             seq: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            started_at: now,
+            instance_id: format!("meridian-{}", std::process::id()),
             now_fn,
         }
     }
@@ -723,34 +751,34 @@ impl Aggregator {
         }
         // 1. 意图有效期（早退：过期意图不占窗口 / 账本）。
         if now > intent.expires_at {
-            return Receipt::rejected(ih, Error::EIntentExpired);
+            return self.reject(ih, Error::EIntentExpired);
         }
         // 2. 委托查表（未注册拒）。
         let reg = match self.registry.lookup(&intent.delegation_hash) {
             Some(r) => r,
-            None => return Receipt::rejected(ih, Error::EDelegUnknown),
+            None => return self.reject(ih, Error::EDelegUnknown),
         };
         // 2b. 撤销闸口（S-11）：注册表查找后立即查，最廉价——不耗 nonce / 窗口槽，撤销前已
         //     接受的意图仍留在承诺中支付（非追溯，TECH_SPEC §6.5）。
         if self.revocations.is_revoked(&intent.delegation_hash) {
-            return Receipt::rejected(ih, Error::ERevoked);
+            return self.reject(ih, Error::ERevoked);
         }
         // 3. agent 绑定：意图声明的 agent 必须与委托绑定的一致。
         if intent.agent != reg.delegation.agent {
-            return Receipt::rejected(ih, Error::EOrdering);
+            return self.reject(ih, Error::EOrdering);
         }
         // 4. Ed25519 快路径验签（证明前的廉价 DoS 闸门）。
         if let Err(e) = verify_intent(intent, &env.agent_sig, &reg.agent_pub) {
-            return Receipt::rejected(ih, e);
+            return self.reject(ih, e);
         }
         // 5. 验证明（登记以验证器返回值为准）。
         let pi = match self.verifier.verify(&env.proof) {
             Ok(pi) => pi,
-            Err(e) => return Receipt::rejected(ih, e),
+            Err(e) => return self.reject(ih, e),
         };
         // 6. 公共输入与信封一致（证明与信封不是同一笔意图 → 拒）。
         if let Err(e) = check_public_inputs_consistent(&pi, intent) {
-            return Receipt::rejected(ih, e);
+            return self.reject(ih, e);
         }
         // 7. 预留窗口槽（记账前入窗口 → 无回滚；满 / 密封自动换窗重试）。
         let slot = self.windows.reserve(ih, now);
@@ -767,7 +795,7 @@ impl Aggregator {
             Ok(seq) => seq,
             Err(e) => {
                 self.windows.finalize(&slot, 0, false);
-                return Receipt::rejected(ih, e);
+                return self.reject(ih, e);
             }
         };
         // 9. 定稿（accepted 入承诺）+ WAL。
@@ -917,6 +945,33 @@ impl Aggregator {
     /// 已接受总数（== 下一个待分配的 seq；测试 / 观测）。
     pub fn accepted_count(&self) -> u64 {
         self.seq.load(Ordering::Relaxed)
+    }
+
+    /// 拒绝计数（S-15 观测）：submit 的每个拒分支都走这里（零分配原子增量）。
+    /// 幂等 re-ack 不经过（既非 accept 也非 reject）；崩溃恢复后从 0 起（不持久化）。
+    #[inline(always)]
+    fn reject(&self, ih: [u8; 32], e: Error) -> Receipt {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        Receipt::rejected(ih, e)
+    }
+
+    /// 健康快照（S-15 监控/告警源）。无锁视图：只读原子 + 只读状态，不碰分片/窗口锁
+    /// （B8：抓快照不引入热路径争用）。详见 `health::HealthSnapshot` 口径注释。
+    pub fn snapshot(&self) -> HealthSnapshot {
+        HealthSnapshot {
+            instance_id: self.instance_id.clone(),
+            started_at_unix: self.started_at,
+            now: (self.now_fn)(),
+            accepted_count: self.seq.load(Ordering::Relaxed),
+            rejected_count: self.rejected.load(Ordering::Relaxed),
+            pending_sealed: self.pending_sealed(),
+            revoked_len: self.revoked_len(),
+            revocation_root: self.revocation_root(),
+            wal_len: self.wal.file_len().unwrap_or(0),
+            ledger_shards: self.cfg.ledger_shards,
+            epoch_capacity: self.cfg.epoch_capacity,
+            epoch_secs: self.cfg.epoch_secs,
+        }
     }
 }
 
