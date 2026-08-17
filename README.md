@@ -68,4 +68,4 @@ cd poc-delivery && cargo run --release
 
 ## 许可
 
-Apache-2.0。第三方依赖许可证见 `THIRD_PARTY.md`。
+Elastic-2.0。第三方依赖许可证见 `THIRD_PARTY.md`。

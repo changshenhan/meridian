@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 pragma solidity ^0.8.24;
 
 /// @title DSA —— Delegated Spend Authority 注册（Contract 模式，TECH_SPEC §7）

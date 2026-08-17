@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 pragma solidity ^0.8.24;
 
 /// @notice meridian-core `intent_hash` 的 Solidity 镜像（S-11 欺诈证明重算用）。

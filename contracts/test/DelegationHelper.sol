@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 pragma solidity ^0.8.24;
 
 /// @notice meridian-core `canonical_delegation` 的 Solidity 镜像（forge 测试 / alloy 冒烟共用）。

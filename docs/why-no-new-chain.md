@@ -106,4 +106,4 @@ credible.
 
 ---
 
-*Meridian · 2026-08-16 · Apache-2.0*
+*Meridian · 2026-08-16 · Elastic-2.0*

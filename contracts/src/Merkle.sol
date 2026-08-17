@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 pragma solidity ^0.8.24;
 
 /// @notice sha256 Merkle 包含验证器（S-11 欺诈证明用），与 aggregator/src/merkle.rs

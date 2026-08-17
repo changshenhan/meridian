@@ -199,7 +199,7 @@ S-09 → S-27; order is non-negotiable).
 
 ## 7. Project status
 
-- Code: public, Apache-2.0 (this repository).
+- Code: public, Elastic-2.0 (this repository).
 - The three PoC reports live in `docs/poc/`.
 - Spec v1.0: `TECH_SPEC.md` (binding; change spec first, then code).
 - Open invitation: agent frameworks that want a settlement primitive under their tool layer.

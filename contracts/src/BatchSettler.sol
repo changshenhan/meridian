@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 pragma solidity ^0.8.24;
 
 import {IntentHelper} from "./IntentHelper.sol";
