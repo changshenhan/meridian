@@ -69,6 +69,16 @@ fn bench_per_sec<F: FnMut()>(mut f: F) -> f64 {
     samples[ROUNDS / 2]
 }
 
+/// 短突发指标的运行间噪声中位化（S-35b，TECH_SPEC §8.3）：同一 fixture 复测 N 轮取
+/// 中位。0.2 s 级突发单次采样在共享 runner 上可假报 -17%（CI 两次实证，同签名
+/// -16.x% 两轮"确认"；重跑即绿——CI baseline 是同 run 同码现录的，同码两跑之差只能是
+/// runner 噪声）。与 `bench_per_sec` 的 S-14b 多轮中位同法，作用于「整段突发」粒度。
+fn median_of<F: FnMut() -> f64>(rounds: usize, mut f: F) -> f64 {
+    let mut samples: Vec<f64> = (0..rounds).map(|_| f()).collect();
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("finite sample"));
+    samples[rounds / 2]
+}
+
 fn sample_delegation() -> Delegation {
     Delegation {
         agent: [1u8; 20],
@@ -234,14 +244,18 @@ fn main() {
             // （验签 → SpendVerifier → 预算 → 入窗 → WAL），B5 口径的单线程基线。
             // B8 零分配 / B11 确定性是硬断言，走 agg_sim --check-alloc / --check-determinism
             // （CI 回归），不进吞吐 baseline。
+            // S-35b：测量窗仅 ~0.2 s 短突发，单次采样对共享 runner 噪声敏感（CI 两次
+            // 假报 -16.x% 见 §8.3）→ 同一 fixture 复测 5 轮取中位。
             (
                 "agg_kernel_ingest_ops".to_string(),
-                measure_kernel_single_threaded(&KernelBatch::build(KernelFixtureParams {
-                    n_agents: 32,
-                    per_agent: 200,
-                    now: 1_700_000_000,
-                    seed: MASTER_SEED,
-                })),
+                median_of(5, || {
+                    measure_kernel_single_threaded(&KernelBatch::build(KernelFixtureParams {
+                        n_agents: 32,
+                        per_agent: 200,
+                        now: 1_700_000_000,
+                        seed: MASTER_SEED,
+                    }))
+                }),
             ),
             // B7 排序 + 承诺（100k 笔）最佳墙钟（5 轮取最短），lattice 热路径回归。
             ("agg_kernel_b7_wall_ms".to_string(), b7_measure().0 * 1e3),
