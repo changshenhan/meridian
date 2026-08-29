@@ -18,7 +18,8 @@ use std::time::Instant;
 
 use meridian_aggregator::ingest::Aggregator;
 use meridian_aggregator::wire::{
-    AuthorizeRequest, AuthorizeResponse, GatewayError, IntentEnvelopeDto, ReceiptDto,
+    AuthorizeRequest, AuthorizeResponse, GatewayError, IntentEnvelopeDto, NextNonceResponse,
+    ReceiptDto,
 };
 
 /// 传输层错误码（§11 补充表；不进 core `Error` 内核枚举）。
@@ -199,6 +200,9 @@ impl Gateway {
             ("GET", p) if p.starts_with("/v1/receipts/") => {
                 self.handle_receipt_lookup(bearer, &p["/v1/receipts/".len()..])
             }
+            ("GET", p) if p.starts_with("/v1/nonce/") => {
+                self.handle_nonce_lookup(bearer, &p["/v1/nonce/".len()..])
+            }
             ("POST", _) | ("GET", _) => Response::error(404, E_MALFORMED, "unknown route"),
             _ => Response::error(405, E_MALFORMED, "method not allowed"),
         }
@@ -274,6 +278,36 @@ impl Gateway {
                 )
             }
             None => Response::error(404, E_NOT_FOUND, "receipt not found"),
+        }
+    }
+
+    /// S-31 只读下一 nonce 查询：`GET /v1/nonce/{delegation_hash}`（§6.7，§6.6 跨重启
+    /// 恢复面）。走租户闸（认证 + 限流）；GET 无 body。命中 → 200 + `NextNonceResponse`
+    /// （`max(已消耗) + 1` 安全下界）；未注册委托 → 404 `E_NOT_FOUND`。
+    fn handle_nonce_lookup(&self, bearer: Option<&str>, hash_hex: &str) -> Response {
+        if let Err(r) = self.gate(bearer) {
+            return r;
+        }
+        // 0x 前缀宽容（与 /v1/receipts 同口径）。
+        let hash_hex = hash_hex.strip_prefix("0x").unwrap_or(hash_hex);
+        let dh = match meridian_aggregator::wire::hex_to_bytes32(hash_hex) {
+            Ok(dh) => dh,
+            Err(e) => {
+                return Response::error(400, E_MALFORMED, format!("bad delegation_hash: {e}"))
+            }
+        };
+        match self.agg.next_nonce(&dh) {
+            Some(next) => {
+                let dto = NextNonceResponse {
+                    delegation_hash: hex::encode(dh),
+                    next_nonce: next,
+                };
+                Response::json(
+                    200,
+                    serde_json::to_string(&dto).expect("NextNonceResponse serializes"),
+                )
+            }
+            None => Response::error(404, E_NOT_FOUND, "delegation not registered"),
         }
     }
 

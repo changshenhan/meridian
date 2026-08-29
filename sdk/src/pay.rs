@@ -67,8 +67,8 @@ impl Default for RetryPolicy {
 /// 每委托的单调 spend_nonce 管理器。
 ///
 /// 契约：**仅上一笔定局（accepted 或永久拒绝）后才取下一个**——重试全程 nonce 固定，这是
-/// 双花防护的前提。进程内状态；跨进程崩溃恢复是 Phase 2 缝（依赖聚合器 WAL + 未来
-/// `next_nonce` 查询 RPC，README 记录）。
+/// 双花防护的前提。进程内状态；跨进程崩溃恢复经 [`NonceManager::resync`]（S-31：聚合器
+/// `GET /v1/nonce` 查询，§6.7，[`SdkClient::sync_nonce`](crate::SdkClient::sync_nonce) 包装）。
 pub struct NonceManager {
     next: RwLock<HashMap<[u8; 32], u64>>,
 }
@@ -93,6 +93,17 @@ impl NonceManager {
         let n = *cur;
         *cur = n + 1;
         n
+    }
+
+    /// S-31 跨重启恢复：把本地计数推进到 `max(本地, 远端)`。本地领先时**不动**
+    /// （避免并发客户端被回退重发撞已消耗 nonce）；返回生效值。
+    pub fn resync(&self, dh: &[u8; 32], remote_next: u64) -> u64 {
+        let mut map = self.next.write().expect("nonce manager poisoned");
+        let cur = map.entry(*dh).or_insert(0);
+        if remote_next > *cur {
+            *cur = remote_next;
+        }
+        *cur
     }
 }
 

@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use meridian_aggregator::receipt::{IntentEnvelope, Receipt};
 use meridian_aggregator::wire::{
-    AuthorizeRequest, AuthorizeResponse, GatewayError, IntentEnvelopeDto, ReceiptDto,
+    AuthorizeRequest, AuthorizeResponse, GatewayError, IntentEnvelopeDto, NextNonceResponse,
+    ReceiptDto,
 };
 use meridian_core::dsa::{AgentPubKey, SignedDelegation};
 
@@ -154,6 +155,24 @@ impl HttpTransport {
             _ => Err(Self::map_transport_status(status, &resp)),
         }
     }
+
+    /// S-31 只读下一 nonce 查询（§6.7，`NonceManager` 跨重启恢复）：delegation_hash →
+    /// `max(已消耗) + 1` 安全下界。`Ok(None)` = 404 `E_NOT_FOUND`（委托未注册）。
+    pub fn next_nonce(&self, dh: [u8; 32]) -> Result<Option<u64>, SdkError> {
+        let path = format!("/v1/nonce/{}", hex::encode(dh));
+        let (status, resp) = self
+            .request("GET", &path, None)
+            .map_err(SdkError::Transport)?;
+        match status {
+            200 => {
+                let dto: NextNonceResponse = serde_json::from_slice(&resp)
+                    .map_err(|e| SdkError::Local(format!("bad nonce response: {e}")))?;
+                Ok(Some(dto.next_nonce))
+            }
+            404 => Ok(None),
+            _ => Err(Self::map_transport_status(status, &resp)),
+        }
+    }
 }
 
 /// 尽力从 GatewayError JSON 提取 message；解析失败退回状态码描述。
@@ -195,5 +214,9 @@ impl Transport for HttpTransport {
         let dto: ReceiptDto = serde_json::from_slice(&resp)
             .map_err(|e| SdkError::Local(format!("bad receipt response: {e}")))?;
         dto.into_receipt().map_err(SdkError::Local)
+    }
+
+    fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError> {
+        Self::next_nonce(self, *dh)
     }
 }

@@ -131,6 +131,15 @@ impl ReceiptDto {
     }
 }
 
+/// `GET /v1/nonce/{delegation_hash}` 响应体（S-31，§6.7）。
+/// `next_nonce` = `max(已消耗 spend_nonce) + 1`——安全下界而非精确计数（聚合器不要求
+/// nonce 连续，只禁复用）；未注册委托 = 404 `E_NOT_FOUND`，不走本 DTO。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NextNonceResponse {
+    pub delegation_hash: String,
+    pub next_nonce: u64,
+}
+
 /// 网关错误体（传输层，§11 补充表：E_AUTH / E_RATE_LIMITED / E_MALFORMED）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GatewayError {

@@ -48,6 +48,8 @@
 pub trait Transport: Send + Sync {
     fn authorize(&self, sd: SignedDelegation, agent_pub: AgentPubKey) -> Result<(), SdkError>;
     fn submit(&self, env: &IntentEnvelope) -> Result<Receipt, SdkError>;
+    // S-31 只读查询：NonceManager 跨重启恢复（§6.6/§6.7）。
+    fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError>;
 }
 ```
 
@@ -75,10 +77,12 @@ let mut client = SdkClient::new(wallet, Box::new(transport));
 - **证明是占位的**：`PlaceholderProver`（proof 非空 + 公共输入与信封一致）与聚合器内置
   `FormatVerifier`（TEMPORARY）配套。真实 S-09 电路 prover 实现 core `SpendProver`，经
   `SdkClient::with_prover` 接入——`pay()` 与重试逻辑不用改。
-- **NonceManager 不持久化**：进程内单调计数；进程崩溃后跨重启的 nonce 恢复依赖聚合器
-  WAL（崩溃重建） + 未来聚合器的 `next_nonce` 查询 RPC（Phase 2 缝）。v1 的崩溃恢复
-  语义：重试窗口内重启会以先前定局 re-ack，不双花；重启后新支付从 nonce 0 重新计数，
-  与聚合器已消耗 nonce 集无冲突（聚合器按 intent_hash 去重，不按 nonce 序号）。
+- **NonceManager 不持久化**：进程内单调计数；进程崩溃后跨重启的 nonce 恢复经
+  [`SdkClient::sync_nonce`](S-31，查询网关 `GET /v1/nonce/{delegation_hash}`，§6.7)：
+  把本地计数推进到 `max(本地, 网关值)`（安全下界 = `max(已接受) + 1`，被拒 nonce 占位是
+  瞬态的、崩溃后不重建——被拒意图从未承诺任何东西，复用无害）再继续支付。不恢复直接
+  `pay()` 会撞已消耗 nonce（`E_NONCE` 定局拒绝——不双花，但不可用）。单进程不重启场景
+  无需调用。
 - **tower 未引入**：同步内核用 `RetryPolicy` 轻量实现同款退避（指数退避 + 封顶）。若
   S-13 的框架层需要 async，可将 `pay()` 重试搬进 async 包装，契约不变。
 

@@ -24,8 +24,8 @@
 //!
 //! - 证明 = [`PlaceholderProver`]（proof 非空 + 公共输入与信封一致），与聚合器内置的
 //!   `FormatVerifier`（TEMPORARY）配套。真实 S-09 电路 prover 实现 `SpendProver` 接入。
-//! - `NonceManager` 为进程内单调计数；进程崩溃后不持久化（跨重启恢复依赖聚合器 WAL + 未来
-//!   的 `next_nonce` 查询 RPC，Phase 2 缝，README 记录）。
+//! - `NonceManager` 为进程内单调计数；进程崩溃后不持久化——重启后经 [`SdkClient::sync_nonce`]
+//!   （S-31，聚合器 `GET /v1/nonce` 查询，§6.7）恢复计数再继续支付。
 
 pub mod attest;
 pub mod authorize;
@@ -190,6 +190,24 @@ impl SdkClient {
 
     pub(crate) fn next_nonce(&self, dh: &[u8; 32]) -> u64 {
         self.nonces.next(dh)
+    }
+
+    /// S-31 跨重启 nonce 恢复（§6.6）：查询聚合器（`GET /v1/nonce`，§6.7）并把本地
+    /// [`NonceManager`] 推进到 `max(本地, 网关值)`，返回生效值。重启后**先调用本方法再
+    /// 继续 `pay()`**——否则新支付从 nonce 0 起，与已消耗集冲突（§6.2 `E_NONCE` 拒绝，
+    /// 不双花但不可用）。
+    ///
+    /// 单进程不重启场景无需调用（`pay()` 语义不变）。本地领先时网关值被忽略——并发
+    /// 多客户端时各自单调推进，互不回退。未授权委托 → `SdkError::Local`（与 `pay()`
+    /// 前置闸一致）。传输失败按 `SdkError::Transport` 上抛（重试候选）。
+    pub fn sync_nonce(&self, dh: &[u8; 32]) -> Result<u64, SdkError> {
+        // 先验授权上下文：与 pay() 同一前置闸，未授权委托不产生查询。
+        self.agent_for(dh)?;
+        let remote = self
+            .transport
+            .next_nonce(dh)?
+            .ok_or_else(|| SdkError::Local("delegation not registered on aggregator".into()))?;
+        Ok(self.nonces.resync(dh, remote))
     }
 }
 

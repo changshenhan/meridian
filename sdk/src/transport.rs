@@ -20,7 +20,7 @@ use meridian_core::zk::SpendVerifier;
 
 use crate::error::{SdkError, TransportError};
 
-/// 聚合器连接。`pay` 重试只对 [`SdkError::Transport`] 触发；两种方法都应在定局时返回
+/// 聚合器连接。`pay` 重试只对 [`SdkError::Transport`] 触发；写方法都应在定局时返回
 /// `Ok`（含聚合器的业务拒绝 `Receipt`，由 SDK 映射为错误码）——传输失败才返回 `Err(Transport)`。
 pub trait Transport: Send + Sync {
     /// 注册委托（authorize 后端）。定局返回 `Ok(())`；传输失败 `Err(Transport)`。
@@ -29,6 +29,10 @@ pub trait Transport: Send + Sync {
     /// 提交意图信封（pay 后端）。聚合器侧幂等：同意图重发返回先前结果（accepted → 原 seq，
     /// 拒绝 → 原原因）。`Ok(receipt)` 即定局；`Err(Transport)` 是重试候选。
     fn submit(&self, env: &IntentEnvelope) -> Result<Receipt, SdkError>;
+
+    /// S-31 只读下一 nonce 查询（§6.7，[`crate::pay::NonceManager`] 跨重启恢复）。
+    /// `Ok(None)` = 委托未注册（404 `E_NOT_FOUND`）。
+    fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError>;
 }
 
 /// 进程内聚合器（S-12 内置传输）。
@@ -76,6 +80,10 @@ impl Transport for InProcessAggregator {
     fn submit(&self, env: &IntentEnvelope) -> Result<Receipt, SdkError> {
         Ok(self.agg.submit(env))
     }
+
+    fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError> {
+        Ok(self.agg.next_nonce(dh))
+    }
 }
 
 /// 断线模拟：丢弃前 `drop_count` 次 `submit` 响应（回执丢失，聚合器侧可能已接受）。
@@ -111,6 +119,11 @@ impl<T: Transport> Transport for DropFirstTransport<T> {
             return Err(SdkError::Transport(TransportError::Disconnected));
         }
         self.inner.submit(env)
+    }
+
+    // 只读查询：丢弃语义只针对 submit（nonce 查询本就无副作用，直通内层）。
+    fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError> {
+        self.inner.next_nonce(dh)
     }
 }
 
@@ -149,6 +162,11 @@ impl<T: Transport> Transport for ResponseLossTransport<T> {
             return Err(SdkError::Transport(TransportError::Disconnected));
         }
         Ok(receipt)
+    }
+
+    // 只读查询：丢失语义只针对 submit 回执（nonce 查询无副作用，直通内层）。
+    fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError> {
+        self.inner.next_nonce(dh)
     }
 }
 

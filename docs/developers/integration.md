@@ -56,8 +56,10 @@ let cred = client.attest(&transport_pubkey)?;   // 双钥绑定凭据
 - **证明占位**：`PlaceholderProver` + 聚合器 `FormatVerifier`（TEMPORARY）。真实 S-09
   电路 prover 实现 core `SpendProver`，经 `SdkClient::with_prover` 接入——`pay()` 与
   重试逻辑不用改。
-- **NonceManager 不持久化**：进程崩溃后跨重启的 nonce 恢复依赖聚合器 WAL + 未来
-  `next_nonce` RPC（Phase 2 缝）。v1 语义：重试窗口内重启以先前定局 re-ack，不双花。
+- **NonceManager 不持久化**：进程崩溃后跨重启的 nonce 恢复经 `SdkClient::sync_nonce`
+  （S-31：查询网关 `GET /v1/nonce/{delegation_hash}`，把本地计数推进到 `max(已接受) + 1`
+  安全下界）再继续支付；不恢复直接 `pay()` 撞已消耗 nonce（`E_NONCE` 拒绝——不双花，
+  但不可用）。重试窗口内重启以先前定局 re-ack，不双花。
 
 ---
 

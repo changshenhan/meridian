@@ -480,16 +480,19 @@ pub trait Ingest {
 3. 聚合器侧幂等（§6.2 幂等重发闸口）兜底重发：断线重发返回先前结果 → 不会把同一笔意图
    记两次（双花），也绝不会把一笔被拒绝的意图透传成成功。
 
-**传输形态**：`Transport` trait 抽象「聚合器连接」——`authorize` / `submit`。S-12 提供
-`InProcessAggregator`（进程内聚合器，测试与单进程嵌入用）；网络传输是 S-13 框架分发层
-的接缝。
+**传输形态**：`Transport` trait 抽象「聚合器连接」——`authorize` / `submit` /
+`next_nonce`（S-31 只读查询）。S-12 提供 `InProcessAggregator`（进程内聚合器，测试与
+单进程嵌入用）；网络传输是 S-13 框架分发层的接缝。
 
 **诚实边界**：
 - 证明 = `PlaceholderProver`（proof 非空 + 公共输入与信封一致），与聚合器内置
   `FormatVerifier`（TEMPORARY）配套；真实 S-09 电路 prover 实现 core `SpendProver`
   经 `SdkClient::with_prover` 接入，`pay()` 重试逻辑不变。
-- `NonceManager` 为进程内单调计数，崩溃后不持久化；跨重启恢复依赖聚合器 WAL + 未来
-  `next_nonce` 查询 RPC（Phase 2 缝，sdk/README 记录）。
+- `NonceManager` 为进程内单调计数，崩溃后不持久化。**跨重启恢复（S-31）**：重启后
+  经 `SdkClient::sync_nonce(delegation_hash)` 查询聚合器（§6.7 `GET /v1/nonce`）把本地
+  计数推进到 `max(已消耗) + 1` 后再继续支付——否则重启后的新支付从 nonce 0 重发，与
+  聚合器已消耗 nonce 集冲突（§6.2 跨意图复用 = `E_NONCE` 拒绝，不双花但不可用）。
+  单进程不重启场景无需调用（`pay()` 语义不变）。
 
 ### 6.7 网络 ingest API（S-29，多租户网关）
 
@@ -509,6 +512,7 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
 | POST | `/v1/authorize` | 注册委托（§6.2 摄入管线的 register 前置） | `Aggregator::register` |
 | POST | `/v1/intents` | 幂等提交意图信封（同意图重发返回先前结果，§6.2 幂等闸口） | `Aggregator::submit` |
 | GET | `/v1/receipts/{intent_hash}` | 只读回执查询（S-30a，x402 merchant 验证面） | `Aggregator::receipt` |
+| GET | `/v1/nonce/{delegation_hash}` | 只读下一 nonce 查询（S-31，SDK 跨重启恢复） | `Aggregator::next_nonce` |
 | GET | `/healthz` | 网关存活（含内核 `accepted_count` 快照） | — |
 
 **请求/响应（wire，JSON）**：
@@ -538,6 +542,27 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
   `(recipient, amount)` 扩展为 `(recipient, amount, seq)`（净额解析闭包忽略 seq 字段，
   lattice 接口不变）；查询走同一把 `Mutex`（只读路径，非热路径——热路径 B8 口径不变）。
   崩溃恢复后索引由 WAL 重放重建（未密封尾），已密封意图不可查（与修剪语义一致）。
+
+**只读下一 nonce 查询（S-31，§6.6 NonceManager 跨重启恢复，Phase 2 缝收口）**：
+
+- `GET /v1/nonce/<32B hex>`（可选 `0x` 前缀）→ `200` + `{"delegation_hash": "<64hex>",
+  "next_nonce": <u64>}`；未注册委托 → `404 {"error":{"code":"E_NOT_FOUND"}}`。走与
+  `/v1/receipts` 相同的租户闸（认证 + 限流；GET 无 body）。响应 DTO = `wire::NextNonceResponse`。
+- **语义**：`next_nonce = max(已消耗 spend_nonce) + 1`（空集 → 0）——是**安全下界**而非
+  精确计数：聚合器不要求 nonce 连续（§6.2 只禁复用），调用方从该值起跳过任意数值都不会
+  撞上已消耗集。取 max 而非 count，因为被拒意图同样消耗 nonce（§6.2 预算拒也占位）。
+- 内核侧：`Aggregator::next_nonce(&dh) -> Option<u64>`——分片账本只读派生（锁内扫该委托
+  nonce 记录集），`None` = 委托未注册。**热路径零改动**（`try_commit` 不加字段不加分支，
+  B8 口径不变）；扫描成本 O(已消耗数)，只读路径可接受（与 `receipt()` 同级）。**崩溃恢复
+  边界（诚实）**：WAL 只记录已接受意图——被拒 nonce 的占位是瞬态的、不重建（被拒意图从未
+  承诺任何东西，重启后该 nonce 复用无害），故恢复后的查询值 = `max(已接受) + 1`，可能**低于**
+  重启前。这仍是安全下界：任何大于该值的 nonce 绝不与已接受意图冲突（双花安全不变量
+  钉在「不撞已接受」上，不是「不撞已拒绝」）。nonce 记录不随 settle 修剪，恢复前后对已接受
+  集的查询一致。
+- SDK 侧：`Transport::next_nonce(&dh)`（trait 方法，`InProcessAggregator` / `HttpTransport`
+  同实现；404 → `Ok(None)`）；`SdkClient::sync_nonce(dh) -> Result<u64>`——查询并把本地
+  `NonceManager` 推进到 `max(本地计数, 网关值)`（本地领先时不动——避免并发客户端回退），
+  返回生效值。未授权委托 → `SdkError::Local`（与 `pay()` 前置闸一致）。
 
 **认证与多租户**：
 

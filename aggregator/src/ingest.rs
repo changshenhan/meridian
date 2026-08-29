@@ -303,6 +303,17 @@ impl ShardedState {
         let map = self.shards[idx].lock().expect("shard poisoned");
         map.get(dh).map(|st| st.nonces.len())
     }
+
+    /// S-31 只读派生：`max(已消耗 spend_nonce) + 1`（空集 → 0）。未 provision 的委托
+    /// → `None`。取 max 而非 count：被拒意图同样消耗 nonce（§6.2），且聚合器不要求
+    /// nonce 连续（只禁复用），调用方从该值起跳过任意数值都撞不上已消耗集。
+    /// O(已消耗数) 扫描——只读路径（§6.7 S-31），`try_commit` 热路径零改动（B8）。
+    pub fn next_nonce(&self, dh: &[u8; 32]) -> Option<u64> {
+        let idx = shard_of(dh, self.shards.len());
+        let map = self.shards[idx].lock().expect("shard poisoned");
+        map.get(dh)
+            .map(|st| st.nonces.keys().max().map_or(0, |n| n + 1))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +934,16 @@ impl Aggregator {
     /// 某委托已用 nonce 数（测试 / 观测）。
     pub fn nonce_count(&self, dh: &[u8; 32]) -> Option<usize> {
         self.state.nonce_count(dh)
+    }
+
+    /// S-31 只读下一 nonce 查询（§6.7）：`max(已消耗) + 1`，未注册委托 → `None`。
+    /// 崩溃恢复后由 WAL 重放重建（WAL 只含已接受意图——被拒 nonce 占位是瞬态的、
+    /// 不重建，被拒意图从未承诺任何东西，重启后复用无害）→ 恢复后查询值 =
+    /// `max(已接受) + 1`，可能低于重启前；仍是安全下界（大于它的 nonce 绝不撞已接受
+    /// 集）。nonce 不随 settle 修剪，恢复前后对已接受集一致。走分片同一把锁（只读
+    /// 路径，非热路径）。
+    pub fn next_nonce(&self, dh: &[u8; 32]) -> Option<u64> {
+        self.state.next_nonce(dh)
     }
 
     /// S-13a MCP 只读探针：`(dh, spend_nonce, intent_hash)` 是否已被接受？返回其 seq
@@ -2509,5 +2530,61 @@ mod tests {
             settle_all_and_check(&agg2, &expected2);
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// S-31：next_nonce = max(已消耗) + 1——被拒 nonce 同样占位（§6.2），跨意图跳号后
+    /// 取 max 而非 count；崩溃恢复后由 WAL 重放重建，查询结果与重启前一致。
+    #[test]
+    fn next_nonce_is_max_consumed_plus_one_and_survives_recovery() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("next-nonce");
+        let now = clock.load(Ordering::Relaxed);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        // register_default 内部构造同参委托 → delegation_hash 一致。
+        let dh = meridian_core::dsa::delegation_hash(&delegation([1u8; 20], 1_000, 1_000_000));
+
+        {
+            let agg = test_aggregator(&clock, &path);
+            // 未注册委托 → None（404 E_NOT_FOUND 的内核来源）。
+            assert_eq!(agg.next_nonce(&[9u8; 32]), None);
+            let (_, _agent_pub) = register_default(&agg, [1u8; 20]);
+            // 注册未消费 → 0。
+            assert_eq!(agg.next_nonce(&dh), Some(0));
+            // nonce 1、2 accepted。
+            assert!(
+                agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now))
+                    .accepted
+            );
+            assert!(
+                agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 20, 2, now))
+                    .accepted
+            );
+            // nonce 100 超单笔上限被拒——nonce 仍消耗（§6.2）→ next = 101（max 不是 count）。
+            let rej = agg.submit(&make_env(
+                dh, [1u8; 20], &agent_key, [0xCC; 20], 2_000, 100, now,
+            ));
+            assert!(!rej.accepted);
+            assert_eq!(rej.reject_reason, Some(Error::EBudgetPerSpend));
+            assert_eq!(agg.next_nonce(&dh), Some(101));
+            agg.wal.flush().unwrap();
+        } // 模拟崩溃：聚合器丢弃，只剩 WAL
+
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            test_cfg(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+        // 恢复边界（诚实）：WAL 只重放已接受意图 → 被拒 nonce 100 的占位消失，
+        // 查询值 = max(已接受) + 1 = 3（低于重启前，仍是安全下界）。
+        assert_eq!(agg2.next_nonce(&dh), Some(3));
+        // 恢复后从查询值继续支付：nonce 3 accepted（不撞已接受集）。
+        let r = agg2.submit(&make_env(dh, [1u8; 20], &agent_key, [0xEE; 20], 5, 3, now));
+        assert!(r.accepted);
+        assert_eq!(agg2.next_nonce(&dh), Some(4));
+        let _ = std::fs::remove_file(&path);
     }
 }

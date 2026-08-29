@@ -218,6 +218,36 @@ fn handle_receipt_lookup_gate_and_hash_validation() {
     assert!(r.body.contains(E_NOT_FOUND));
 }
 
+/// S-31 只读下一 nonce 查询闸门：与写端点同租户闸（401）+ 坏 hash 400 + 未注册委托
+/// 404 `E_NOT_FOUND`（0x 前缀宽容，与 /v1/receipts 同口径）。
+#[test]
+fn handle_nonce_lookup_gate_and_hash_validation() {
+    let (_p, agg) = aggregator("nonce-gate");
+    let gw = Gateway::with_tenants(agg, tenants_one("k1", "t1", 1_000), 64 * 1024);
+
+    // 无认证 → 401（只读端点走同一租户闸）。
+    let r = gw.handle("GET", "/v1/nonce/00", None, b"");
+    assert_eq!(r.status, 401);
+    assert!(r.body.contains(E_AUTH));
+
+    // 坏 hex / 错长度 → 400。
+    for bad in ["zz", "00", &hex::encode([1u8; 31])] {
+        let r = gw.handle("GET", &format!("/v1/nonce/{bad}"), Some("k1"), b"");
+        assert_eq!(r.status, 400, "bad hash {bad:?}");
+        assert!(r.body.contains(E_MALFORMED));
+    }
+
+    // 0x 前缀宽容；未注册委托 → 404 E_NOT_FOUND。
+    let r = gw.handle(
+        "GET",
+        &format!("/v1/nonce/0x{}", hex::encode([7u8; 32])),
+        Some("k1"),
+        b"",
+    );
+    assert_eq!(r.status, 404);
+    assert!(r.body.contains(E_NOT_FOUND));
+}
+
 #[test]
 fn handle_enforces_body_cap() {
     let (_p, agg) = aggregator("bodycap");
@@ -375,6 +405,75 @@ fn e2e_receipt_lookup_x402_merchant_flow() {
     let (status, body) = raw_get(&addr, &path, None);
     assert_eq!(status, 401);
     assert!(body.contains("E_AUTH"), "body: {body}");
+}
+
+/// S-31 跨重启 nonce 恢复：pay×2 后重启新客户端（同钱包）——不 sync 直接 pay 撞已消耗
+/// nonce（`E_NONCE` 业务拒）；`sync_nonce` 查询网关推进计数后 pay 成功；原始 GET 验证
+/// 线格式（`max(已消耗) + 1`，带认证 200 / 无认证 401 / 未注册 404）。
+#[test]
+fn e2e_next_nonce_query_restarts_sdk_recovery() {
+    let (addr, agg) = spawn_gateway("e2e-nonce");
+    let (wallet, owner) = wallet_and_owner();
+
+    // 第一段进程：authorize + pay×2。
+    {
+        let transport = HttpTransport::new(&addr, "e2e-key");
+        let mut client = SdkClient::new(wallet.clone(), Box::new(transport));
+        client.set_retry(RetryPolicy {
+            max_attempts: 3,
+            base_backoff_ms: 0,
+            max_backoff_ms: 0,
+        });
+        let rec = client.authorize(&owner, [1u8; 20], &limits(1_000)).unwrap();
+        let dh = rec.delegation_hash;
+        client.pay(&pay_params(dh, 42)).unwrap();
+        client.pay(&pay_params(dh, 43)).unwrap();
+    } // 模拟重启：客户端（含 NonceManager）丢弃，聚合器存活。
+
+    // 重启后的进程：新客户端从 nonce 0 重新计数。
+    let transport = HttpTransport::new(&addr, "e2e-key");
+    let mut client = SdkClient::new(wallet, Box::new(transport));
+    client.set_retry(RetryPolicy {
+        max_attempts: 3,
+        base_backoff_ms: 0,
+        max_backoff_ms: 0,
+    });
+    let rec = client.authorize(&owner, [1u8; 20], &limits(1_000)).unwrap();
+    let dh = rec.delegation_hash;
+
+    // 不恢复直接 pay → 跨意图复用 nonce 0 → E_NONCE（不双花，但不可用）。
+    let err = client.pay(&pay_params(dh, 44)).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "E_NONCE",
+        "expected nonce reuse rejection: {err:?}"
+    );
+
+    // sync_nonce：查网关 → 推进到 max(已接受) + 1 = 2 → 后续支付正常。
+    assert_eq!(client.sync_nonce(&dh).unwrap(), 2);
+    let r = client.pay(&pay_params(dh, 44)).unwrap();
+    assert_eq!(r.spend_nonce, 2, "恢复后从网关值起计");
+    assert_eq!(client.sync_nonce(&dh).unwrap(), 3, "支付后计数同步推进");
+
+    // 原始 GET 线格式：带认证 200（delegation_hash 回显 + next_nonce）；无认证 401。
+    let path = format!("/v1/nonce/{}", hex::encode(dh));
+    let (status, body) = raw_get(&addr, &path, Some("e2e-key"));
+    assert_eq!(status, 200);
+    assert!(
+        body.contains(&format!("\"next_nonce\":{}", 3)),
+        "body: {body}"
+    );
+    assert!(body.contains(&hex::encode(dh)), "body: {body}");
+    let (status, body) = raw_get(&addr, &path, None);
+    assert_eq!(status, 401);
+    assert!(body.contains("E_AUTH"), "body: {body}");
+
+    // 未注册委托 → 404；SDK 视角 = Ok(None)（未注册 → sync_nonce 报 Local）。
+    let transport2 = HttpTransport::new(&addr, "e2e-key");
+    assert!(transport2.next_nonce([0xEE; 32]).unwrap().is_none());
+
+    // 聚合器句柄同源一致。
+    assert_eq!(agg.next_nonce(&dh), Some(3));
 }
 
 #[test]

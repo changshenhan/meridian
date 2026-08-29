@@ -292,3 +292,50 @@ fn pay_before_authorize_is_local_error() {
     drop(client);
     let _ = std::fs::remove_file(&path);
 }
+
+/// S-31 跨重启 nonce 恢复（§6.6）：pay×2 → 模拟重启（新客户端、NonceManager 从 0 起）
+/// → 不恢复直接 pay 撞已消耗 nonce（E_NONCE 业务拒，不双花但不可用）→ `sync_nonce`
+/// 推进到网关值后支付正常；本地领先时网关值被忽略（并发客户端不回退）。
+#[test]
+fn sync_nonce_recovers_after_restart() {
+    let (path, agg) = aggregator("sync-nonce");
+    let (wallet, owner) = wallet_and_owner();
+
+    // 第一段进程：authorize + pay×2（nonce 0、1）。
+    let dh = {
+        let transport = InProcessAggregator::from_inner(Arc::clone(&agg));
+        let mut client = SdkClient::new(wallet.clone(), Box::new(transport));
+        fast_retry(&mut client, 3);
+        let rec = client.authorize(&owner, [1u8; 20], &limits(1_000)).unwrap();
+        let dh = rec.delegation_hash;
+        client.pay(&pay_params(dh, 42)).unwrap();
+        client.pay(&pay_params(dh, 43)).unwrap();
+        dh
+    }; // 模拟重启：客户端（含 NonceManager）丢弃，聚合器存活。
+
+    // 重启后的进程：新客户端从 nonce 0 重新计数。
+    let transport = InProcessAggregator::from_inner(Arc::clone(&agg));
+    let mut client = SdkClient::new(wallet, Box::new(transport));
+    fast_retry(&mut client, 3);
+    let rec = client.authorize(&owner, [1u8; 20], &limits(1_000)).unwrap();
+    assert_eq!(rec.delegation_hash, dh);
+
+    // 不恢复直接 pay → 跨意图复用 nonce 0 → E_NONCE（定局拒绝，不重试）。
+    let err = client.pay(&pay_params(dh, 44)).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "E_NONCE",
+        "expected nonce reuse rejection: {err:?}"
+    );
+
+    // sync_nonce：查询推进到 max(已接受) + 1 = 2（被拒 nonce 0 已在账，取 2）→ 支付正常。
+    // 注意：本地 NonceManager 因刚才那次 E_NONCE 定局已推进到 1，网关值 2 取 max 生效。
+    assert_eq!(client.sync_nonce(&dh).unwrap(), 2);
+    let r = client.pay(&pay_params(dh, 44)).unwrap();
+    assert_eq!(r.spend_nonce, 2);
+
+    // 本地领先保护：手动推进本地计数到 10 后 sync 不回退。
+    assert_eq!(client.pay(&pay_params(dh, 45)).unwrap().spend_nonce, 3);
+    assert_eq!(agg.next_nonce(&dh), Some(4));
+    let _ = std::fs::remove_file(&path);
+}
