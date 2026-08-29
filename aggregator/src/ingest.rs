@@ -42,8 +42,9 @@ use crate::revocation::RevocationSet;
 use crate::wal::{DecodedRecord, Wal};
 use crate::window::{EpochWindow, WindowEntry};
 
-/// 意图索引条目：intent_hash → (recipient, amount)。净额解析源（§6.3 步骤 D）。
-type IntentRef = ([u8; 20], u64);
+/// 意图索引条目：intent_hash → (recipient, amount, seq)。净额解析源（§6.3 步骤 D，
+/// resolve 闭包忽略 seq）；seq 供只读回执查询（S-30a `receipt()`）。
+type IntentRef = ([u8; 20], u64, u64);
 /// WAL 重放的已接受意图元组：
 /// (seq, intent_hash, delegation_hash, spend_nonce, amount, now, recipient)。
 type ReplayIntent = (u64, [u8; 32], [u8; 32], u64, u64, u64, [u8; 20]);
@@ -677,7 +678,7 @@ impl Aggregator {
                 agg.intents
                     .lock()
                     .expect("intents poisoned")
-                    .insert(ih, (recipient, amount));
+                    .insert(ih, (recipient, amount, seq));
             }
         }
         // 4. 重建未密封窗口 + epoch 编号接到已密封序列之后。
@@ -815,7 +816,7 @@ impl Aggregator {
         self.intents
             .lock()
             .expect("intents poisoned")
-            .insert(ih, (pi.recipient, pi.amount));
+            .insert(ih, (pi.recipient, pi.amount, seq));
         // 10. 满窗即封。
         self.windows.maybe_rotate(now);
         Receipt::accepted(ih, seq)
@@ -849,7 +850,7 @@ impl Aggregator {
                 .lock()
                 .expect("intents poisoned")
                 .get(ih)
-                .copied()
+                .map(|&(r, a, _seq)| (r, a))
         };
         // 撤销根快照（S-11）：本 epoch 承诺时的撤销集稀疏根，随 commit 上链；不并入承诺树
         // （承诺根的叶索引是欺诈证明位置，独立锚定撤销根）。
@@ -940,6 +941,22 @@ impl Aggregator {
     /// 已注册委托绑定的 agent 公钥）。
     pub fn registered(&self, dh: &[u8; 32]) -> Option<RegisteredDelegation> {
         self.registry.lookup(dh)
+    }
+
+    /// S-30a 只读回执查询（x402 merchant 验证面，§6.7）：intent_hash → 受理回执（seq）。
+    ///
+    /// 语义边界（诚实）：命中 = **已接受且未结算**——意图索引随 `settle_epoch` 按 epoch
+    /// 修剪，已结算意图返回 `None`；被拒意图不入索引（拒绝回执是瞬态响应，不持久化）
+    /// 同样 `None`。即 `None` ≠ 未支付：终局保证在链上净额，商户侧验证必须在 epoch
+    /// 时延内完成（x402-adapter.md §4.2）。走意图索引同一把 `Mutex`（只读路径，非热路径
+    /// ——热路径 B8 口径不变）；崩溃恢复后由 WAL 重放重建（未密封尾，与修剪语义一致）。
+    pub fn receipt(&self, intent_hash: &[u8; 32]) -> Option<Receipt> {
+        let (_, _, seq) = *self
+            .intents
+            .lock()
+            .expect("intents poisoned")
+            .get(intent_hash)?;
+        Some(Receipt::accepted(*intent_hash, seq))
     }
 
     /// 已接受总数（== 下一个待分配的 seq；测试 / 观测）。
@@ -1534,6 +1551,66 @@ mod tests {
         ));
         // 索引已修剪：再 settle 同 epoch → 缺失解析 → None（不会重复记账 / 记录）。
         assert!(agg.settle_epoch(&sealed[0]).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-30a 只读回执查询：接受命中（seq 一致）、被拒/从未见 → None、结算修剪 → None。
+    #[test]
+    fn receipt_lookup_hits_before_settle_and_none_after() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("receipt");
+        let mut cfg = test_cfg();
+        cfg.epoch_capacity = 2;
+        let c = Arc::clone(&clock);
+        let wal = Wal::open(&path, 100_000).unwrap();
+        let agg = Aggregator::with_clock(
+            cfg,
+            Box::new(FormatVerifier),
+            wal,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        );
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+
+        // 接受 → 命中：accepted 回执含同一 seq。
+        let env1 = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+        let r1 = agg.submit(&env1);
+        assert!(r1.accepted);
+        let ih1 = intent_hash(&env1.intent);
+        let got = agg.receipt(&ih1).expect("accepted intent queryable");
+        assert!(got.accepted);
+        assert_eq!(got.seq, r1.seq);
+        assert_eq!(got.intent_hash, ih1);
+        assert_eq!(got.reject_reason, None);
+
+        // 被拒意图不入索引（拒绝回执是瞬态响应）→ None。
+        let env2 = make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 2_000, 2, now);
+        let r2 = agg.submit(&env2);
+        assert!(!r2.accepted);
+        assert_eq!(agg.receipt(&intent_hash(&env2.intent)), None);
+
+        // 从未见 → None。
+        assert_eq!(agg.receipt(&[0xEE; 32]), None);
+
+        // 结算修剪 → None（查询方语义：404 ≠ 未支付，终局保证在链上净额）。
+        clock.store(now + 1, Ordering::Relaxed);
+        assert!(
+            agg.submit(&make_env(
+                dh,
+                [1u8; 20],
+                &agent_key,
+                [0xCC; 20],
+                10,
+                3,
+                now + 1
+            ))
+            .accepted
+        );
+        let sealed = agg.take_sealed();
+        assert_eq!(sealed.len(), 1);
+        agg.settle_epoch(&sealed[0]).expect("settle ok");
+        assert_eq!(agg.receipt(&ih1), None);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -7,7 +7,8 @@
 //! - 429 / 5xx → `Transport(Other)` —— **重试候选**（请求未进内核或内核内部错误，
 //!   nonce 固定重发安全）
 //! - 200 → 定局：`ReceiptDto::into_receipt`（业务拒绝原样透传 `reject_reason`）
-//! - 400 / 401 / 413 → `Local` —— 配置/协议错误，不自动重试
+//! - 400 / 401 / 404 / 413 → `Local` —— 配置/协议错误，不自动重试
+//!   （404 仅只读查询 `receipt()`：未命中 → `Ok(None)`，§6.7 S-30a）
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -121,9 +122,9 @@ impl HttpTransport {
     }
 
     fn map_transport_status(status: u16, body: &[u8]) -> SdkError {
-        // 400/401/413 = 配置/协议错误：定局，不重试。其余（429/5xx/未知）= 重试候选。
+        // 400/401/404/413 = 配置/协议错误：定局，不重试。其余（429/5xx/未知）= 重试候选。
         match status {
-            400 | 401 | 413 => {
+            400 | 401 | 404 | 413 => {
                 let msg = gateway_error_message(body, status);
                 SdkError::Local(msg)
             }
@@ -132,6 +133,25 @@ impl HttpTransport {
             s => SdkError::Transport(TransportError::Other(format!(
                 "unexpected gateway status {s}"
             ))),
+        }
+    }
+
+    /// S-30a 只读回执查询（x402 merchant 验证面，§6.7）：intent_hash → 受理回执。
+    /// `Ok(None)` = 404 `E_NOT_FOUND`（已结算修剪 / 被拒 / 从未见——**404 ≠ 未支付**，
+    /// 终局保证在链上净额）；`Ok(Some)` = accepted 回执（含 seq）。
+    pub fn receipt(&self, intent_hash: [u8; 32]) -> Result<Option<Receipt>, SdkError> {
+        let path = format!("/v1/receipts/{}", hex::encode(intent_hash));
+        let (status, resp) = self
+            .request("GET", &path, None)
+            .map_err(SdkError::Transport)?;
+        match status {
+            200 => {
+                let dto: ReceiptDto = serde_json::from_slice(&resp)
+                    .map_err(|e| SdkError::Local(format!("bad receipt response: {e}")))?;
+                Ok(Some(dto.into_receipt().map_err(SdkError::Local)?))
+            }
+            404 => Ok(None),
+            _ => Err(Self::map_transport_status(status, &resp)),
         }
     }
 }

@@ -508,6 +508,7 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
 |---|---|---|---|
 | POST | `/v1/authorize` | 注册委托（§6.2 摄入管线的 register 前置） | `Aggregator::register` |
 | POST | `/v1/intents` | 幂等提交意图信封（同意图重发返回先前结果，§6.2 幂等闸口） | `Aggregator::submit` |
+| GET | `/v1/receipts/{intent_hash}` | 只读回执查询（S-30a，x402 merchant 验证面） | `Aggregator::receipt` |
 | GET | `/healthz` | 网关存活（含内核 `accepted_count` 快照） | — |
 
 **请求/响应（wire，JSON）**：
@@ -521,6 +522,22 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
 - 信封 JSON 由 `aggregator::wire` 的 `IntentEnvelopeDto`/`ReceiptDto` 承载（serde derive，
   与内核类型 `From` 互转）；gateway 与 sdk 共用同一 DTO 定义——wire 形状单一来源，禁止
   两侧各自手写 JSON 结构。
+
+**只读回执查询（S-30a，x402 适配层缺口 1，docs/x402-adapter.md §4）**：
+
+- `GET /v1/receipts/<32B hex>`（可选 `0x` 前缀）→ `200` + `ReceiptDto`（accepted 回执，
+  含 seq）；未命中 → `404 {"error":{"code":"E_NOT_FOUND"}}`。走与写端点相同的租户闸
+  （认证 + 限流；无 body 上限——GET 无 body）。`E_NOT_FOUND` 是传输层补充码（§11），
+  不进内核枚举。
+- **语义边界（诚实）**：查询命中 = **已接受且未结算**——意图索引（§6.3 步骤 D 的净额
+  解析源，`IntentRef`）随 `settle_epoch` 按 epoch 修剪，已结算意图查询返回 404；被拒
+  意图不入索引（拒绝回执是瞬态响应，不持久化）也不可查。即：**404 ≠ 未支付**，商户
+  侧验证必须在 epoch 时延内完成（x402 敞口口径见 x402-adapter §4.2——Receipt 即受理
+  凭证，终局保证在链上净额，不在网关）。
+- 内核侧：`Aggregator::receipt(&intent_hash) -> Option<Receipt>`——意图索引值从
+  `(recipient, amount)` 扩展为 `(recipient, amount, seq)`（净额解析闭包忽略 seq 字段，
+  lattice 接口不变）；查询走同一把 `Mutex`（只读路径，非热路径——热路径 B8 口径不变）。
+  崩溃恢复后索引由 WAL 重放重建（未密封尾），已密封意图不可查（与修剪语义一致）。
 
 **认证与多租户**：
 
@@ -538,6 +555,7 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
 |---|---|---|
 | 200 | 内核 Receipt（accepted 或 E_* 业务拒绝） | 定局 |
 | 400 | JSON 不合法 / 字段缺失 / hex 非法（`E_MALFORMED`） | 定局（重发同请求无害，但不自动重试） |
+| 404 | 只读查询未命中（`E_NOT_FOUND`，仅 `/v1/receipts`） | 定局（重发同查询无害，结果不变） |
 | 401 | Bearer 缺失/未知（`E_AUTH`） | 配置错误，不重试 |
 | 413 | 请求体 > 64 KiB | 不重试（信封远小于此） |
 | 429 | 租户限流（`E_RATE_LIMITED`） | **重试候选**（退避） |
@@ -797,6 +815,7 @@ contract BatchSettler {
 | `E_AUTH` | Bearer 缺失/未知租户 | 401 | 否 |
 | `E_RATE_LIMITED` | 租户令牌桶超限（未进内核，无 seq） | 429 | 是（退避） |
 | `E_MALFORMED` | JSON/字段/hex 不合法 | 400 | 否 |
+| `E_NOT_FOUND` | 只读查询未命中（回执不存在 / 已结算修剪 / 被拒——**404 ≠ 未支付**，§6.7） | 404 | 否 |
 
 ---
 

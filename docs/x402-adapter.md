@@ -1,6 +1,6 @@
 # x402 结算适配层 — 设计稿 v0（S-30 立项，未实现）
 
-> 状态：**立项设计稿**（2026-08-29 拍板立项）。实现前先升级进 TECH_SPEC（先改 spec 后改码）。
+> 状态：**立项设计稿**（2026-08-29 拍板立项）；S-30a 已实现（2026-08-30）。实现前先升级进 TECH_SPEC（先改 spec 后改码）。
 > 背景：MASTER_PLAN 计划审读问题 ⑤——x402 竞争窗口缺席。x402（HTTP 402 原生支付，
 > Coinbase 主推）正在成为 agent 按请求付费的事实协议层；Meridian 的正确站位是
 > **x402 的结算后端**（卖水），不是再造一个付费协议。
@@ -54,7 +54,11 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
 ## 4. 缺口清单（诚实边界）
 
 1. **只读查询端点**：`/v1/receipts/{intent_hash}` 返回 Receipt（含 seq）——merchant
-   侧验证用。S-29 未暴露，需小改 gateway（只读、走租户闸）。
+   侧验证用。**已实现（S-30a）**：内核 `Aggregator::receipt()`（意图索引扩展 seq）+
+   gateway `GET /v1/receipts/{hash}`（租户闸共用，404 `E_NOT_FOUND`，0x 前缀宽容）+
+   SDK `HttpTransport::receipt()`。**语义边界（诚实）**：命中 = 已接受且**未结算**——
+   索引随 settle 按 epoch 修剪、被拒意图不可查，**404 ≠ 未支付**；merchant 验证须在
+   epoch 时延内完成（§4.2），终局保证在链上净额。TECH_SPEC §6.7 已落盘。
 2. **确认时延**：Meridian 是 epoch 级终局（10s 密封 + 链上承诺），x402 merchant 预期
    准即时。v1 方案：**Receipt 即受理凭证**（运营者债券兜底 + 幂等重发可复验），商户
    风险敞口 ≤ 1 epoch——这与"债券/罚没"安全模型一致，需在白标合同里写明。
@@ -65,7 +69,9 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
 
 ## 5. 排期建议
 
-1. S-30a：`/v1/receipts` 只读端点 + gateway 测试（小，~半天砖）。
+1. S-30a：`/v1/receipts` 只读端点 + gateway 测试（小，~半天砖）。**已完成（2026-08-30）**——
+   测试：aggregator `receipt_lookup_hits_before_settle_and_none_after` + gateway
+   `handle_receipt_lookup_gate_and_hash_validation` / `e2e_receipt_lookup_x402_merchant_flow`。
 2. S-30b：SDK 侧 x402 fetch 拦截（`X402Client` wrapper，schema `meridian-v1`）。
 3. S-30c：facilitator 参考实现（axum/tokio 允许——merchant 侧不在内核热路径）。
 4. EIP-3009 桥视生态牵引再排。

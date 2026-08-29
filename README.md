@@ -55,7 +55,7 @@ cd contracts/rust-smoke && cargo run --release --bin m1_demo
 # 监控（S-15）：健康检查 + Prometheus 指标端点
 cargo run -p meridian-monitor --bin meridian-monitor -- --wal <path> --once        # 一次快照
 cargo run -p meridian-monitor --bin meridian-monitor -- --wal <path> --port 9100   # HTTP 服务
-# 网络 ingest 网关（S-29）：POST /v1/authorize、/v1/intents + GET /healthz
+# 网络 ingest 网关（S-29）：POST /v1/authorize、/v1/intents + GET /v1/receipts/{hash}（S-30a）+ /healthz
 cargo run -p meridian-gateway --bin meridian-gateway -- gateway.json
 # 性能基座
 cargo run -p meridian-bench --bin gate -- --record          # 记录 baseline（3 整轮取中位）

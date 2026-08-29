@@ -17,7 +17,7 @@ use meridian_aggregator::wal::Wal;
 use meridian_core::dsa::owner_signing_key_from_bytes;
 use meridian_gateway::http::serve;
 use meridian_gateway::{
-    Config, Gateway, TenantConf, TenantTable, E_AUTH, E_MALFORMED, E_RATE_LIMITED,
+    Config, Gateway, TenantConf, TenantTable, E_AUTH, E_MALFORMED, E_NOT_FOUND, E_RATE_LIMITED,
 };
 use meridian_sdk::{
     AgentWallet, DelegationLimits, HttpTransport, PayParams, RetryPolicy, SdkClient, SdkError,
@@ -188,6 +188,36 @@ fn handle_rejects_unknown_route_and_method() {
     assert_eq!(gw.handle("PUT", "/v1/intents", Some("k1"), b"").status, 405);
 }
 
+/// S-30a 只读回执查询闸门：与写端点同租户闸（401）+ 坏 hash 400 + 未命中 404
+/// `E_NOT_FOUND`（0x 前缀宽容）。
+#[test]
+fn handle_receipt_lookup_gate_and_hash_validation() {
+    let (_p, agg) = aggregator("receipt-gate");
+    let gw = Gateway::with_tenants(agg, tenants_one("k1", "t1", 1_000), 64 * 1024);
+
+    // 无认证 → 401（只读端点走同一租户闸）。
+    let r = gw.handle("GET", "/v1/receipts/00", None, b"");
+    assert_eq!(r.status, 401);
+    assert!(r.body.contains(E_AUTH));
+
+    // 坏 hex / 错长度 → 400。
+    for bad in ["zz", "00", &hex::encode([1u8; 31])] {
+        let r = gw.handle("GET", &format!("/v1/receipts/{bad}"), Some("k1"), b"");
+        assert_eq!(r.status, 400, "bad hash {bad:?}");
+        assert!(r.body.contains(E_MALFORMED));
+    }
+
+    // 0x 前缀宽容；未命中 → 404 E_NOT_FOUND（非 400——hash 格式对、只是没有回执）。
+    let r = gw.handle(
+        "GET",
+        &format!("/v1/receipts/0x{}", hex::encode([7u8; 32])),
+        Some("k1"),
+        b"",
+    );
+    assert_eq!(r.status, 404);
+    assert!(r.body.contains(E_NOT_FOUND));
+}
+
 #[test]
 fn handle_enforces_body_cap() {
     let (_p, agg) = aggregator("bodycap");
@@ -261,7 +291,7 @@ fn e2e_authorize_and_pay_over_http() {
     assert_eq!(agg.total_spent(&dh), Some(49));
 
     // healthz 反映内核计数。
-    let (status, body) = raw_get(&addr, "/healthz");
+    let (status, body) = raw_get(&addr, "/healthz", None);
     assert_eq!(status, 200);
     assert!(
         body.contains("\"accepted_count\":2"),
@@ -274,11 +304,16 @@ fn e2e_authorize_and_pay_over_http() {
     assert!(body.contains("E_AUTH"), "body: {body}");
 }
 
-/// 无认证 GET（healthz 不走租户闸）。
-fn raw_get(addr: &str, path: &str) -> (u16, String) {
+/// GET（可选 Bearer；healthz 不走租户闸，`/v1/receipts` 走）。
+fn raw_get(addr: &str, path: &str, bearer: Option<&str>) -> (u16, String) {
     let mut s = std::net::TcpStream::connect(addr).expect("connect");
-    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").as_bytes())
-        .unwrap();
+    let auth = bearer
+        .map(|b| format!("Authorization: Bearer {b}\r\n"))
+        .unwrap_or_default();
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: t\r\n{auth}Connection: close\r\n\r\n").as_bytes(),
+    )
+    .unwrap();
     let mut resp = String::new();
     s.read_to_string(&mut resp).unwrap();
     let status: u16 = resp
@@ -291,6 +326,55 @@ fn raw_get(addr: &str, path: &str) -> (u16, String) {
         .map(|(_, b)| b.to_string())
         .unwrap_or_default();
     (status, body)
+}
+
+/// S-30a x402 merchant 验证流：pay 后凭 intent_hash 查受理回执（seq 一致）；
+/// 未受理 hash → None；原始 GET 走租户闸（带认证 200 / 无认证 401）。
+#[test]
+fn e2e_receipt_lookup_x402_merchant_flow() {
+    let (addr, agg) = spawn_gateway("e2e-receipt");
+    let transport = HttpTransport::new(&addr, "e2e-key");
+    let (wallet, owner) = wallet_and_owner();
+    let mut client = SdkClient::new(wallet, Box::new(transport));
+    client.set_retry(RetryPolicy {
+        max_attempts: 3,
+        base_backoff_ms: 0,
+        max_backoff_ms: 0,
+    });
+
+    let rec = client.authorize(&owner, [1u8; 20], &limits(1_000)).unwrap();
+    let dh = rec.delegation_hash;
+    let r1 = client.pay(&pay_params(dh, 42)).unwrap();
+
+    // merchant 侧独立客户端（同租户 key）：payload 只带 intent_hash → 查询受理回执。
+    let merchant = HttpTransport::new(&addr, "e2e-key");
+    let got = merchant
+        .receipt(r1.intent_hash)
+        .expect("query ok")
+        .expect("accepted intent queryable");
+    assert!(got.accepted);
+    assert_eq!(got.seq, r1.seq);
+    assert_eq!(got.intent_hash, r1.intent_hash);
+    assert_eq!(got.reject_reason, None);
+
+    // 聚合器句柄同源一致。
+    assert_eq!(agg.receipt(&r1.intent_hash).unwrap().seq, r1.seq);
+
+    // 从未见过的 hash → Ok(None)。
+    assert!(merchant.receipt([0xEE; 32]).unwrap().is_none());
+
+    // 原始 GET：带认证 200 + ReceiptDto；无认证 401（只读端点走租户闸）。
+    let path = format!("/v1/receipts/{}", hex::encode(r1.intent_hash));
+    let (status, body) = raw_get(&addr, &path, Some("e2e-key"));
+    assert_eq!(status, 200);
+    assert!(body.contains("\"accepted\":true"), "body: {body}");
+    assert!(
+        body.contains(&format!("\"seq\":{}", r1.seq)),
+        "body: {body}"
+    );
+    let (status, body) = raw_get(&addr, &path, None);
+    assert_eq!(status, 401);
+    assert!(body.contains("E_AUTH"), "body: {body}");
 }
 
 #[test]

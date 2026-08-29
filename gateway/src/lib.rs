@@ -25,6 +25,9 @@ use meridian_aggregator::wire::{
 pub const E_AUTH: &str = "E_AUTH";
 pub const E_RATE_LIMITED: &str = "E_RATE_LIMITED";
 pub const E_MALFORMED: &str = "E_MALFORMED";
+/// 只读查询未命中（S-30a `/v1/receipts`）：不存在 / 已结算修剪 / 被拒。
+/// **404 ≠ 未支付**——终局保证在链上净额（§6.7 语义边界）。
+pub const E_NOT_FOUND: &str = "E_NOT_FOUND";
 
 /// 网关配置（JSON 文件形态，§6.7）。
 ///
@@ -193,6 +196,9 @@ impl Gateway {
                 self.handle_authorized(bearer, body, Self::handle_authorize)
             }
             ("POST", "/v1/intents") => self.handle_authorized(bearer, body, Self::handle_intents),
+            ("GET", p) if p.starts_with("/v1/receipts/") => {
+                self.handle_receipt_lookup(bearer, &p["/v1/receipts/".len()..])
+            }
             ("POST", _) | ("GET", _) => Response::error(404, E_MALFORMED, "unknown route"),
             _ => Response::error(405, E_MALFORMED, "method not allowed"),
         }
@@ -210,6 +216,25 @@ impl Gateway {
         )
     }
 
+    /// 共用租户闸：认证 → 限流（§6.7 顺序固定）。GET 只读路径与 POST 写路径同闸。
+    fn gate(&self, bearer: Option<&str>) -> Result<(), Response> {
+        let Some((tenant, rpm)) = self.tenants.lookup(bearer) else {
+            return Err(Response::error(
+                401,
+                E_AUTH,
+                "missing or unknown bearer key",
+            ));
+        };
+        if !self.limiter.try_acquire(tenant, *rpm) {
+            return Err(Response::error(
+                429,
+                E_RATE_LIMITED,
+                "tenant rate limit exceeded",
+            ));
+        }
+        Ok(())
+    }
+
     /// 认证 → 限流 → body 上限 → 分发。共用闸门顺序固定（§6.7）。
     fn handle_authorized(
         &self,
@@ -217,16 +242,39 @@ impl Gateway {
         body: &[u8],
         f: fn(&Self, &[u8]) -> Response,
     ) -> Response {
-        let Some((tenant, rpm)) = self.tenants.lookup(bearer) else {
-            return Response::error(401, E_AUTH, "missing or unknown bearer key");
-        };
-        if !self.limiter.try_acquire(tenant, *rpm) {
-            return Response::error(429, E_RATE_LIMITED, "tenant rate limit exceeded");
+        if let Err(r) = self.gate(bearer) {
+            return r;
         }
         if body.len() > self.max_body {
             return Response::error(413, E_MALFORMED, "request body too large");
         }
         f(self, body)
+    }
+
+    /// S-30a 只读回执查询：`GET /v1/receipts/{intent_hash}`（§6.7）。走租户闸
+    /// （认证 + 限流）；GET 无 body，不做 body 上限检查。
+    /// 命中 → 200 + ReceiptDto（accepted 回执）；未命中 → 404 `E_NOT_FOUND`
+    /// （**404 ≠ 未支付**：已结算修剪 / 被拒 / 从未见——终局保证在链上净额）。
+    fn handle_receipt_lookup(&self, bearer: Option<&str>, hash_hex: &str) -> Response {
+        if let Err(r) = self.gate(bearer) {
+            return r;
+        }
+        // 0x 前缀宽容（x402 生态惯例是 0x hex）；其余不合法 → 400。
+        let hash_hex = hash_hex.strip_prefix("0x").unwrap_or(hash_hex);
+        let ih = match meridian_aggregator::wire::hex_to_bytes32(hash_hex) {
+            Ok(ih) => ih,
+            Err(e) => return Response::error(400, E_MALFORMED, format!("bad intent_hash: {e}")),
+        };
+        match self.agg.receipt(&ih) {
+            Some(r) => {
+                let dto = ReceiptDto::from_receipt(&r);
+                Response::json(
+                    200,
+                    serde_json::to_string(&dto).expect("ReceiptDto serializes"),
+                )
+            }
+            None => Response::error(404, E_NOT_FOUND, "receipt not found"),
+        }
     }
 
     fn handle_authorize(&self, body: &[u8]) -> Response {
