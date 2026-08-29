@@ -38,7 +38,8 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     layer.resize(n, EMPTY_LEAF);
     while layer.len() > 1 {
         let mut next = Vec::with_capacity(layer.len() / 2);
-        for pair in layer.chunks_exact(2) {
+        // as_chunks（clippy 1.98 chunks_exact_to_as_chunks）：层数恒为 2 的幂，余块恒空。
+        for pair in layer.as_chunks::<2>().0 {
             let mut buf = [0u8; 64];
             buf[..32].copy_from_slice(&pair[0]);
             buf[32..].copy_from_slice(&pair[1]);
@@ -68,7 +69,7 @@ pub fn inclusion_proof(leaves: &[[u8; 32]], index: usize) -> Option<(usize, Vec<
     while layer.len() > 1 {
         siblings.push(layer[idx ^ 1]);
         let mut next = Vec::with_capacity(layer.len() / 2);
-        for pair in layer.chunks_exact(2) {
+        for pair in layer.as_chunks::<2>().0 {
             let mut buf = [0u8; 64];
             buf[..32].copy_from_slice(&pair[0]);
             buf[32..].copy_from_slice(&pair[1]);
