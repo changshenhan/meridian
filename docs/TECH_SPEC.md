@@ -642,7 +642,8 @@ v1 不消费（epoch 结算语义下 merchant 对账走网关查询，facilitato
 
 crate `meridian-facilitator`（`facilitator/`）。x402 缺口清单的 merchant 验证面参考
 实现：**受保护资源服务器**如何接 `meridian-v1` 支付——验证逻辑全部落在"对 Meridian
-网关查回执"，零密码学依赖（S-30a 的查询接口即验证接口）。
+网关查回执"，零密码学依赖（S-30a 的查询接口即验证接口）。S-32 起该 crate 另含可选的
+EIP-3009 兼容桥（含 ecrecover，见 §6.10）；本节的"零密码学"指 `meridian-v1` 路径。
 
 **形态决策**：std-only 手写 HTTP/1.1（§6.7 同先例，thread-per-connection、单请求
 close 模式）；axum/tokio 虽允许（merchant 侧不在内核热路径）但不必要——参考实现的
@@ -668,6 +669,67 @@ close 模式）；axum/tokio 虽允许（merchant 侧不在内核热路径）但
 **三角色 e2e 验收**：X402Client（agent，HttpFetch）→ facilitator `402` → `pay`
 （经真网关 + 真聚合器）→ `X-PAYMENT` 重放 → facilitator 查网关回执 → `200`；
 另验伪造 `intentHash` → `402`。
+
+### 6.10 x402 适配层 · EIP-3009 兼容桥（S-32，docs/x402-adapter.md §4 缺口 3）
+
+**问题**：存量 x402 client 只会说标准 `exact` scheme（签 EIP-3009
+`transferWithAuthorization`），不会说 `meridian-v1`。桥 = facilitator 侧把标准
+payload **验签后转投 Meridian 摄取**，merchant 侧零感知（仍是"查网关回执"单一
+验证面，§6.9 不变）。
+
+**形态**：`facilitator/src/eip3009.rs`（模块 `Eip3009Bridge`）。新增依赖
+`k256`（workspace 已有，ecrecover 用）与 `sha3`（keccak256 用）——**不引新外部
+依赖**；EIP-712 的 `abi.encode` 为定长类型序列，手写拼接（全 32B word）。
+
+**402 体（双 scheme）**：`accepts[]` 增第二条 `scheme: "exact"` 条目，
+`PaymentRequirements` 增可选 `extra: {name, version}`（serde default + skip——
+EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段不动。
+
+**桥接流程（`X-PAYMENT` scheme == `"exact"` 时）**：
+
+1. 解析标准 payload：`{"x402Version", "scheme": "exact", "network", "resource",
+   "payload": {"signature": "<0x 65B r||s||v>", "authorization": {"from", "to",
+   "value": "<原子单位字符串>", "validAfter", "validBefore", "nonce":
+   "<0x 32B>"}}}`（camelCase，与 §6.8 同 wire 惯例）。
+2. 绑定校验（fail-fast → 402）：`network` / `resource` 与配置一致；
+   `authorization.to == payTo`；`value == maxAmountRequired`（原子单位，超 u64
+   拒）；`validAfter <= now < validBefore`。
+3. **EIP-712 验签**（ecrecover，链下密码学）：domain（`name` / `version` /
+   `chainId` / `verifyingContract` 来自配置）+ `TransferWithAuthorization`
+   typehash → keccak256 → k256 `recover_from_prehash`（v ∈ {0,1,27,28} 宽容）→
+   恢复地址（`keccak256(pubkey)[12..32]`）== `from`，否则 402。
+4. **转投 Meridian 摄取（垫付模型）**：facilitator 以自身身份（`AgentWallet` +
+   owner key，均来自配置种子）经 `SdkClient::authorize` 注册一张委托（限额来自
+   配置，惰性首用注册），随后 `SdkClient::pay` 桥接意图：`recipient = to`、
+   `amount = value`、`category = sha256(host + path)`（§6.8 同映射）、
+   `memo = keccak256(规范序列化 authorization ++ signature)[..32]`（对账指纹）、
+   `expires_at = min(validBefore, now + maxTimeoutSeconds)`。`spend_nonce` 走
+   `NonceManager`（§6.6 幂等语义不变）。摄取仍走**全量 DSA 闸口**（预算/速率/
+   撤销/ZK 证明），桥不旁路任何协议层检查。
+5. **重放闸**：进程内 `(from, eip3009_nonce) → intent_hash` 映射——同 payload
+   重放不再摄取，直接落 §6.9 的回执查询路径（accepted → 200 / 未命中 → 402）。
+6. 桥的 `SdkError` 不透传内部细节：摄取失败统一 402（业务拒绝）或 503（网关
+   不可达，fail-closed 同 §6.9）。
+
+**诚实边界（v1）**：
+
+- **EIP-3009 的链上执行不在本件**（不调 `transferWithAuthorization`）——client
+  → 运营商的清算是运营商侧账务（`memo` 指纹 + 原始 payload 留档），merchant
+  收到的是 Meridian 净额。桥只做"验签 + 摄取"，不碰资产。
+- **垫付模型**：被消费的是运营商自己的 Meridian 预算——client 信用风险由白标
+  合同承担（§4.2 受理凭证同口径），不是协议层担保。
+- **重放闸进程内存态**：重启丢失后同一 EIP-3009 payload 可能再次摄取（双花的是
+  运营商自身预算；merchant 侧按净额结算不受影响）。持久化去重是后续项。
+- EIP-712 domain 由配置显式给出（USDC on Base：name `"USD Coin"` / version
+  `"2"` / chainId 8453 / `0x8335…2913`），v1 不做域自动发现（`eip712Domain`
+  扩展随上游演进）。
+- EIP-3009 `nonce` 不查 USDC 合约状态（不提交链上，无需）；`value` 以 u64 直通
+  Meridian `Amount`（超上限即拒，见 2）。
+
+**验收**：模块单测（EIP-712 digest 构造 / ecrecover 往返 / 坏 v / 冒充 from /
+`to` / `value` 不符 / 时间窗 / 超额）+ `handle` 纯分发单测（exact 路径绑定与
+重放闸）+ 真 socket e2e（真聚合器 + 真网关：标准 exact client → 桥摄取 → 200；
+重放同 payload → 200 且不再摄取；伪造签名 / `to` 不符 / 过期 → 402）。
 
 ---
 

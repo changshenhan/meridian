@@ -63,7 +63,18 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
    准即时。v1 方案：**Receipt 即受理凭证**（运营者债券兜底 + 幂等重发可复验），商户
    风险敞口 ≤ 1 epoch——这与"债券/罚没"安全模型一致，需在白标合同里写明。
 3. **EIP-3009 兼容模式**：存量 x402 client 不会说 `meridian-v1`。可选桥：facilitator
-   接受标准 EIP-3009 payload 后转投 Meridian 摄取（ merchant 无感）——实现成本第二优先。
+   接受标准 EIP-3009 payload 后转投 Meridian 摄取（ merchant 无感）。**已实现
+   （S-32，2026-08-30，TECH_SPEC §6.10）**：facilitator `eip3009` 模块——标准 `exact`
+   payload 解析（`validAfter`/`validBefore` 数字与字符串宽容）→ 绑定校验（network /
+   resource / `to == payTo` / `value == maxAmountRequired` / 时间窗）→ EIP-712 验签
+   （k256 ecrecover + keccak256，v 宽容 0/1 与 27/28）→ 垫付转投 Meridian 摄取
+   （facilitator 以自身委托走全量 DSA 闸口，桥不旁路任何协议层检查）→ 重放闸
+   （`(from, eip3009 nonce) → intent_hash`，重放直接落 S-30c 回执查询）。**诚实边界**：
+   EIP-3009 的链上执行不在本件（client→运营商清算 = 运营商侧账务，memo 指纹留档）；
+   被消费的是运营商自己的预算（垫付，client 信用风险由白标合同承担）；重放闸进程内存态
+   （重启后同 payload 可能再次摄取，双花的是运营商预算，merchant 净额不受影响）；
+   EIP-712 domain 由配置显式给出。测试：eip3009 单测 7 + facilitator handle 纯分发 2 +
+   真 socket e2e（exact client → 真摄取真记账 1 笔 → 重放不摄取 → 伪造 402）。
 4. **规范上游**：x402 规范仍在演进，scheme 扩展注册路径未定——设计稿按"自定义 scheme"
    起步，跟进上游后再标准化。
 
@@ -92,4 +103,4 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
    e2e——X402Client(HttpFetch) → facilitator 402 → 真网关 pay 真记账 → 重放 → 回执验证
    200 / 伪造 intentHash → 402 / 网关宕机 → 503）。**诚实边界**：单资源模型、明文 HTTP
    （TLS 反代终结）、不产 `X-PAYMENT-RESPONSE`、结算侧不在本件。
-4. EIP-3009 桥视生态牵引再排。
+4. EIP-3009 桥：**已完成（S-32，2026-08-30，TECH_SPEC §6.10）**——见缺口清单 3。

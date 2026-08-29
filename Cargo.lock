@@ -844,11 +844,14 @@ name = "meridian-facilitator"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "k256",
  "meridian-aggregator",
  "meridian-core",
  "meridian-gateway",
  "meridian-sdk",
+ "serde",
  "serde_json",
+ "sha3",
 ]
 
 [[package]]

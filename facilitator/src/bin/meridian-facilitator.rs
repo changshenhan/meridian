@@ -8,11 +8,19 @@
 //! - `MERIDIAN_NETWORK`（缺省 `base`）/ `MERIDIAN_ASSET`（可选）
 //! - `MERIDIAN_MAX_TIMEOUT`（缺省 60）/ `MERIDIAN_PROTECTED`（缺省示例 JSON）
 //! - `PORT`（缺省 9500）
+//!
+//! EIP-3009 兼容桥（S-32，TECH_SPEC §6.10，可选）：
+//! - `MERIDIAN_BRIDGE=1` 启用——402 体附 `exact` 条目，接受标准 EIP-3009 payload。
+//! - `MERIDIAN_BRIDGE_AGENT_SEED` / `MERIDIAN_BRIDGE_OWNER_SEED`（启用时必填，0x 32B hex）
+//! - `MERIDIAN_BRIDGE_DOMAIN_NAME`（缺省 `USD Coin`）/ `MERIDIAN_BRIDGE_DOMAIN_VERSION`（缺省 `2`）
+//! - `MERIDIAN_BRIDGE_CHAIN_ID`（缺省 8453）/ 域合约缺省取 `MERIDIAN_ASSET`（USDC 主网）
 
 use std::net::TcpListener;
 use std::sync::Arc;
 
+use meridian_facilitator::eip3009::{BridgeConfig, Eip3009Bridge, Eip3009Domain};
 use meridian_facilitator::{Facilitator, FacilitatorConfig};
+use meridian_sdk::DelegationLimits;
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -22,28 +30,96 @@ fn env_req(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("missing required env {name}"))
 }
 
+fn env_seed(name: &str) -> [u8; 32] {
+    let raw = env_req(name);
+    let hexed = raw.strip_prefix("0x").unwrap_or(&raw);
+    hex::decode(hexed)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+        .unwrap_or_else(|| panic!("{name} must be 0x 32B hex"))
+}
+
+fn env_addr20(name: &str, default: &str) -> [u8; 20] {
+    let raw = env_or(name, default);
+    let hexed = raw.strip_prefix("0x").unwrap_or(&raw);
+    hex::decode(hexed)
+        .ok()
+        .and_then(|v| <[u8; 20]>::try_from(v).ok())
+        .unwrap_or_else(|| panic!("{name} must be 0x 20B hex"))
+}
+
+/// 桥配置（`MERIDIAN_BRIDGE=1` 时启用；缺种子即 panic——配置错误启动即暴露）。
+fn bridge_config(gateway_addr: String, gateway_bearer: String, asset: &str) -> BridgeConfig {
+    BridgeConfig {
+        gateway_addr,
+        gateway_bearer,
+        domain: Eip3009Domain {
+            name: env_or("MERIDIAN_BRIDGE_DOMAIN_NAME", "USD Coin"),
+            version: env_or("MERIDIAN_BRIDGE_DOMAIN_VERSION", "2"),
+            chain_id: env_or("MERIDIAN_BRIDGE_CHAIN_ID", "8453")
+                .parse()
+                .expect("MERIDIAN_BRIDGE_CHAIN_ID"),
+            verifying_contract: env_addr20("MERIDIAN_BRIDGE_ASSET", asset),
+        },
+        agent_seed: env_seed("MERIDIAN_BRIDGE_AGENT_SEED"),
+        owner_seed: env_seed("MERIDIAN_BRIDGE_OWNER_SEED"),
+        limits: DelegationLimits {
+            max_per_spend: env_or("MERIDIAN_BRIDGE_MAX_PER_SPEND", "1000000000")
+                .parse()
+                .expect("MERIDIAN_BRIDGE_MAX_PER_SPEND"),
+            rate_window_secs: 60,
+            rate_max_per_window: env_or("MERIDIAN_BRIDGE_RATE_MAX", "10000000000")
+                .parse()
+                .expect("MERIDIAN_BRIDGE_RATE_MAX"),
+            total_cap: env_or("MERIDIAN_BRIDGE_TOTAL_CAP", "100000000000")
+                .parse()
+                .expect("MERIDIAN_BRIDGE_TOTAL_CAP"),
+            categories: vec![],
+            not_before: 0,
+            expires_at: u64::MAX,
+        },
+    }
+}
+
 fn main() {
+    let gateway_addr = env_req("MERIDIAN_GATEWAY_ADDR");
+    let gateway_bearer = env_req("MERIDIAN_GATEWAY_BEARER");
+    let asset = env_or(
+        "MERIDIAN_ASSET",
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    );
     let cfg = FacilitatorConfig {
-        gateway_addr: env_req("MERIDIAN_GATEWAY_ADDR"),
-        gateway_bearer: env_req("MERIDIAN_GATEWAY_BEARER"),
         resource: env_req("MERIDIAN_RESOURCE"),
         pay_to: env_req("MERIDIAN_PAY_TO"),
         amount: env_req("MERIDIAN_AMOUNT"),
         network: env_or("MERIDIAN_NETWORK", "base"),
-        asset: std::env::var("MERIDIAN_ASSET").ok(),
         max_timeout_seconds: env_or("MERIDIAN_MAX_TIMEOUT", "60")
             .parse()
             .expect("MERIDIAN_MAX_TIMEOUT"),
         protected_body: env_or("MERIDIAN_PROTECTED", r#"{"served":"by-meridian-x402"}"#),
+        gateway_addr: gateway_addr.clone(),
+        gateway_bearer: gateway_bearer.clone(),
+        asset: Some(asset.clone()),
     };
+    let bridge = if env_or("MERIDIAN_BRIDGE", "0") == "1" {
+        Some(Eip3009Bridge::new(bridge_config(
+            gateway_addr,
+            gateway_bearer,
+            &asset,
+        )))
+    } else {
+        None
+    };
+    let bridge_enabled = bridge.is_some();
     let addr = format!("127.0.0.1:{}", env_or("PORT", "9500"));
 
-    let facilitator = Arc::new(Facilitator::new(cfg));
+    let facilitator = Arc::new(Facilitator::with_bridge(cfg, bridge));
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| panic!("bind {addr}: {e}"));
     eprintln!(
-        "meridian-facilitator: serving http://{addr} resource={} gateway={}",
+        "meridian-facilitator: serving http://{addr} resource={} gateway={} eip3009-bridge={}",
         facilitator.config().resource,
-        facilitator.config().gateway_addr
+        facilitator.config().gateway_addr,
+        bridge_enabled
     );
     if let Err(e) = meridian_facilitator::http::serve(facilitator, listener) {
         panic!("serve: {e}");

@@ -72,6 +72,18 @@ pub struct PaymentRequirements {
     pub max_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset: Option<String>,
+    /// `exact` scheme 专属：EIP-3009 域参数（S-32，TECH_SPEC §6.10）。
+    /// `meridian-v1` 条目不产出该字段（skip），Deserialize 缺省 None——旧 wire 兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<Eip3009Extra>,
+}
+
+/// EIP-3009 签名域参数（`extra`，x402 `exact` scheme 惯例）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Eip3009Extra {
+    pub name: String,
+    pub version: String,
 }
 
 impl PaymentRequirements {
@@ -548,6 +560,7 @@ mod tests {
             pay_to: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C".into(),
             max_timeout_seconds: Some(30),
             asset: None,
+            extra: None,
         };
         assert_eq!(req.amount().unwrap(), 10_000);
         assert_eq!(
@@ -600,6 +613,49 @@ mod tests {
         assert_eq!(pr.accepts[1].scheme, "meridian-v1");
         assert_eq!(pr.accepts[1].amount().unwrap(), 10_000);
         assert_eq!(pr.accepts[1].max_timeout_seconds, None);
+        // exact 条目可携带 EIP-3009 域参数（S-32）；meridian-v1 条目缺省 None（旧 wire 兼容）。
+        assert_eq!(pr.accepts[0].extra, None);
+    }
+
+    #[test]
+    fn payment_requirements_extra_eip3009_domain_roundtrip() {
+        let body = r#"{
+            "x402Version": 1,
+            "accepts": [{
+                "scheme": "exact",
+                "network": "base",
+                "maxAmountRequired": "10000",
+                "resource": "https://api.example.com/data",
+                "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+                "extra": {"name": "USD Coin", "version": "2"}
+            }]
+        }"#;
+        let pr: PaymentRequired = serde_json::from_str(body).expect("parse 402 body");
+        assert_eq!(
+            pr.accepts[0].extra,
+            Some(Eip3009Extra {
+                name: "USD Coin".into(),
+                version: "2".into()
+            })
+        );
+        // 产出侧 skip_serializing_if：meridian-v1 条目不出现 extra 键。
+        let plain = serde_json::to_string(&PaymentRequired {
+            x402_version: X402_VERSION,
+            error: None,
+            accepts: vec![PaymentRequirements {
+                scheme: SCHEME.into(),
+                network: "base".into(),
+                max_amount_required: "10000".into(),
+                resource: "https://api.example.com/data".into(),
+                description: None,
+                pay_to: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C".into(),
+                max_timeout_seconds: Some(30),
+                asset: None,
+                extra: None,
+            }],
+        })
+        .expect("serialize");
+        assert!(!plain.contains("extra"));
     }
 
     #[test]

@@ -13,7 +13,12 @@ description = "Meridian x402 merchant reference implementation (S-30c)"
 [dependencies]
 meridian-sdk = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 hex = { workspace = true }
+# EIP-3009 兼容桥（S-32，§6.10）：ecrecover + keccak256——均为 workspace 既有依赖，
+# 不引新外部包。桥不进内核热路径（§6.9 同口径）。
+k256 = { workspace = true }
+sha3 = { workspace = true }
 
 # e2e：真聚合器 + 真网关（三角色验收）。
 [dev-dependencies]

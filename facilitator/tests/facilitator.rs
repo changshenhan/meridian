@@ -17,14 +17,18 @@ use meridian_aggregator::ingest::{Aggregator, IngestConfig};
 use meridian_aggregator::proof::FormatVerifier;
 use meridian_aggregator::wal::Wal;
 use meridian_core::dsa::owner_signing_key_from_bytes;
+use meridian_facilitator::eip3009::{
+    eip3009_digest, keccak256, parse_addr20, Authorization, BridgeConfig, Eip3009Bridge,
+    Eip3009Domain, ExactPayload, ExactPayment,
+};
 use meridian_facilitator::{Facilitator, FacilitatorConfig};
 use meridian_gateway::http::serve as gateway_serve;
 use meridian_gateway::{Gateway, TenantConf, TenantTable};
 use meridian_sdk::x402::{
-    base64url_encode, Fetch, HttpFetch, ResourceRequest, X402Client, X402Outcome,
+    base64url_encode, Fetch, HttpFetch, PaymentRequired, ResourceRequest, X402Client, X402Outcome,
 };
 use meridian_sdk::{
-    AgentWallet, DelegationLimits, HttpTransport, PaymentRequired, RetryPolicy, SdkClient, SdkError,
+    AgentWallet, DelegationLimits, HttpTransport, RetryPolicy, SdkClient, SdkError,
 };
 
 // ---------------------------------------------------------------------------
@@ -159,7 +163,18 @@ fn scheme_network_resource_binding_enforced() {
     let resource = "http://api.example.com/weather";
     let f = facilitator(resource);
 
-    // 错 scheme。
+    // 错 scheme（未知 scheme）。
+    let h = payment_header(
+        "other",
+        NETWORK,
+        resource,
+        &format!("0x{}", hex::encode([1u8; 32])),
+    );
+    let r = f.handle("GET", "/", Some(&h));
+    assert_eq!(r.status, 402);
+    assert!(r.body.contains("unsupported scheme"), "{}", r.body);
+
+    // exact scheme 未配桥 → 402（S-32：桥是可选件）。
     let h = payment_header(
         "exact",
         NETWORK,
@@ -168,7 +183,7 @@ fn scheme_network_resource_binding_enforced() {
     );
     let r = f.handle("GET", "/", Some(&h));
     assert_eq!(r.status, 402);
-    assert!(r.body.contains("unsupported scheme"), "{}", r.body);
+    assert!(r.body.contains("exact scheme not enabled"), "{}", r.body);
 
     // 错 network。
     let h = payment_header(
@@ -208,6 +223,225 @@ fn scheme_network_resource_binding_enforced() {
     let r = f.handle("GET", "/", Some(&h));
     assert_eq!(r.status, 402);
     assert!(r.body.contains("must be 32 bytes"), "{}", r.body);
+}
+
+// ---------------------------------------------------------------------------
+// 1b. S-32：exact scheme（EIP-3009 桥）纯分发单测——桥校验在摄取前返回，
+//     不经 socket（网关地址无监听也不触达）。
+// ---------------------------------------------------------------------------
+
+/// 指向"无人监听端口"的带桥 facilitator。
+fn facilitator_with_bridge(resource: &str, gateway_addr: &str) -> Facilitator {
+    Facilitator::with_bridge(
+        FacilitatorConfig {
+            gateway_addr: gateway_addr.into(),
+            gateway_bearer: "unused".into(),
+            resource: resource.into(),
+            pay_to: PAY_TO.into(),
+            amount: AMOUNT.into(),
+            network: NETWORK.into(),
+            asset: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into()),
+            max_timeout_seconds: 30,
+            protected_body: "{\"weather\":\"clear+28C\"}".into(),
+        },
+        Some(Eip3009Bridge::new(bridge_config(gateway_addr))),
+    )
+}
+
+fn bridge_config(gateway_addr: &str) -> BridgeConfig {
+    BridgeConfig {
+        gateway_addr: gateway_addr.into(),
+        gateway_bearer: GATEWAY_KEY.into(),
+        domain: Eip3009Domain {
+            name: "USD Coin".into(),
+            version: "2".into(),
+            chain_id: 8453,
+            verifying_contract: parse_addr20("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+                .expect("asset addr"),
+        },
+        agent_seed: [0xAAu8; 32],
+        owner_seed: [0xBBu8; 32],
+        limits: limits(),
+    }
+}
+
+/// 构造参数（避免 8 参函数——clippy too_many_arguments）。
+struct ExactSpec<'a> {
+    domain: &'a Eip3009Domain,
+    /// `authorization.from` 的 key 种子。
+    from_seed: [u8; 32],
+    /// 签名 key 种子（与 `from_seed` 不同即伪造签名）。
+    signer_seed: [u8; 32],
+    to: &'a str,
+    value: &'a str,
+    valid_after: u64,
+    valid_before: u64,
+    nonce: [u8; 32],
+}
+
+/// 构造标准 `exact` payload。
+fn exact_payment(spec: &ExactSpec) -> ExactPayment {
+    let from_key = k256::ecdsa::SigningKey::from_bytes(&spec.from_seed.into()).expect("from key");
+    let signer = k256::ecdsa::SigningKey::from_bytes(&spec.signer_seed.into()).expect("signer key");
+    let point = from_key.verifying_key().to_encoded_point(false);
+    let from: [u8; 20] = keccak256(&point.as_bytes()[1..65])[12..]
+        .try_into()
+        .expect("20 bytes");
+    let auth = Authorization {
+        from: format!("0x{}", hex::encode(from)),
+        to: spec.to.into(),
+        value: spec.value.into(),
+        valid_after: spec.valid_after,
+        valid_before: spec.valid_before,
+        nonce: format!("0x{}", hex::encode(spec.nonce)),
+    };
+    let digest = eip3009_digest(spec.domain, &auth).expect("digest");
+    let (sig, rid) = signer.sign_prehash_recoverable(&digest).expect("sign");
+    let mut sig65 = sig.to_bytes().to_vec();
+    sig65.push(rid.to_byte());
+    ExactPayment {
+        x402_version: 1,
+        scheme: "exact".into(),
+        network: NETWORK.into(),
+        resource: "http://fac.example.com/weather".into(),
+        payload: ExactPayload {
+            signature: format!("0x{}", hex::encode(&sig65)),
+            authorization: auth,
+        },
+    }
+}
+
+fn exact_header(payment: &ExactPayment) -> String {
+    base64url_encode(&serde_json::to_vec(payment).expect("serialize exact payload"))
+}
+
+fn valid_window() -> (u64, u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    (now - 10, now + 600)
+}
+
+#[test]
+fn exact_scheme_402_advertises_both_schemes() {
+    let f = facilitator_with_bridge("http://fac.example.com/weather", "127.0.0.1:1");
+    let r = f.handle("GET", "/", None);
+    assert_eq!(r.status, 402);
+    let pr: PaymentRequired = serde_json::from_str(&r.body).expect("parse 402 body");
+    assert_eq!(pr.accepts.len(), 2);
+    assert_eq!(pr.accepts[0].scheme, "meridian-v1");
+    assert_eq!(pr.accepts[1].scheme, "exact");
+    // exact 条目带 EIP-3009 域参数（extra）；meridian-v1 条目不带。
+    let extra = pr.accepts[1].extra.as_ref().expect("extra");
+    assert_eq!(extra.name, "USD Coin");
+    assert_eq!(extra.version, "2");
+    assert!(pr.accepts[0].extra.is_none());
+}
+
+#[test]
+fn exact_scheme_binding_and_signature_enforced() {
+    let f = facilitator_with_bridge("http://fac.example.com/weather", "127.0.0.1:1");
+    let domain = Eip3009Domain {
+        name: "USD Coin".into(),
+        version: "2".into(),
+        chain_id: 8453,
+        verifying_contract: parse_addr20("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+            .expect("asset addr"),
+    };
+    let (after, before) = valid_window();
+
+    // to != payTo → 402。
+    let p = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [1u8; 32],
+        signer_seed: [1u8; 32],
+        to: "0x1111111111111111111111111111111111111111",
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x42; 32],
+    });
+    let r = f.handle("GET", "/", Some(&exact_header(&p)));
+    assert_eq!(r.status, 402);
+    assert!(r.body.contains("authorization.to != payTo"), "{}", r.body);
+
+    // value != maxAmountRequired → 402。
+    let p = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [1u8; 32],
+        signer_seed: [1u8; 32],
+        to: PAY_TO,
+        value: "999",
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x42; 32],
+    });
+    let r = f.handle("GET", "/", Some(&exact_header(&p)));
+    assert_eq!(r.status, 402);
+    assert!(r.body.contains("value != maxAmountRequired"), "{}", r.body);
+
+    // 时间窗外 → 402。
+    let p = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [1u8; 32],
+        signer_seed: [1u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: before + 10,
+        valid_before: before + 20,
+        nonce: [0x42; 32],
+    });
+    let r = f.handle("GET", "/", Some(&exact_header(&p)));
+    assert_eq!(r.status, 402);
+    assert!(r.body.contains("outside validity window"), "{}", r.body);
+
+    // 伪造签名（签名 key != from 的 key）→ 402 EIP-3009 signature invalid。
+    let p = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [1u8; 32],
+        signer_seed: [9u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x42; 32],
+    });
+    let r = f.handle("GET", "/", Some(&exact_header(&p)));
+    assert_eq!(r.status, 402);
+    assert!(r.body.contains("EIP-3009 signature invalid"), "{}", r.body);
+
+    // resource 绑定（重放头里的资源不是本服务器）→ 402。
+    let mut p = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [1u8; 32],
+        signer_seed: [1u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x42; 32],
+    });
+    p.resource = "http://other.example.com/x".into();
+    let r = f.handle("GET", "/", Some(&exact_header(&p)));
+    assert_eq!(r.status, 402);
+    assert!(r.body.contains("resource mismatch"), "{}", r.body);
+
+    // network 绑定 → 402。
+    let mut p = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [1u8; 32],
+        signer_seed: [1u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x42; 32],
+    });
+    p.network = "sepolia".into();
+    let r = f.handle("GET", "/", Some(&exact_header(&p)));
+    assert_eq!(r.status, 402);
+    assert!(r.body.contains("network mismatch"), "{}", r.body);
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +566,30 @@ fn e2e_gateway_down_is_503_fail_closed() {
     assert!(body.contains("E_GATEWAY_UNAVAILABLE"), "{body}");
 }
 
+/// 起带桥 facilitator（随机端口，后台线程）。
+fn spawn_facilitator_with_bridge(gateway_addr: &str, resource: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let f = Arc::new(Facilitator::with_bridge(
+        FacilitatorConfig {
+            gateway_addr: gateway_addr.into(),
+            gateway_bearer: GATEWAY_KEY.into(),
+            resource: resource.into(),
+            pay_to: PAY_TO.into(),
+            amount: AMOUNT.into(),
+            network: NETWORK.into(),
+            asset: None,
+            max_timeout_seconds: 30,
+            protected_body: "{\"weather\":\"clear+28C\"}".into(),
+        },
+        Some(Eip3009Bridge::new(bridge_config(gateway_addr))),
+    ));
+    std::thread::spawn(move || {
+        let _ = meridian_facilitator::http::serve(f, listener);
+    });
+    format!("http://{addr}/")
+}
+
 /// 裸 socket GET（带 X-PAYMENT 头）→ (status, body)。HttpFetch 只支持无头请求，
 /// 伪造头场景直接打 socket。
 fn raw_get_with_payment(url: &str, payment: &str) -> (u16, String) {
@@ -366,3 +624,68 @@ fn _fetch_is_object_safe() -> Box<dyn Fetch> {
 // 供 clippy：SdkError / PaymentRequired 引用保活（若上游重构导致未用则同步删）。
 #[allow(dead_code)]
 fn _type_witness(_: SdkError, _: PaymentRequired) {}
+
+// ---------------------------------------------------------------------------
+// 4. S-32：EIP-3009 兼容桥 e2e——标准 exact client（不会说 meridian-v1）→
+//    桥验签转投摄取 → 真网关真记账 → 回执放行；重放不再摄取；伪造 → 402。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_exact_scheme_bridge_ingests_verifies_and_dedups_replay() {
+    let (gw_addr, wal, agg) = spawn_gateway("e2e-eip3009");
+    let url = spawn_facilitator_with_bridge(&gw_addr, "http://fac.example.com/weather");
+    let domain = Eip3009Domain {
+        name: "USD Coin".into(),
+        version: "2".into(),
+        chain_id: 8453,
+        verifying_contract: parse_addr20("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+            .expect("asset addr"),
+    };
+    let (after, before) = valid_window();
+
+    //（402 体双 scheme 已在纯分发单测 exact_scheme_402_advertises_both_schemes 覆盖。）
+
+    // 标准 exact client（真 EIP-3009 签名）付款 → 桥摄取 → 真记账 → 200 放行。
+    let payment = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [1u8; 32],
+        signer_seed: [1u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x42; 32],
+    });
+    let header = exact_header(&payment);
+    let (status, body) = raw_get_with_payment(&url, &header);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, "{\"weather\":\"clear+28C\"}");
+    assert_eq!(
+        agg.accepted_count(),
+        1,
+        "bridge must ingest exactly one intent"
+    );
+
+    // 重放同 payload → 200（回执命中）且不再摄取（重放闸）。
+    let (status2, body2) = raw_get_with_payment(&url, &header);
+    assert_eq!(status2, 200, "{body2}");
+    assert_eq!(agg.accepted_count(), 1, "replay must not re-ingest");
+
+    // 伪造签名（签名 key != from 的 key）→ 402，不摄取。
+    let forged = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [2u8; 32],
+        signer_seed: [9u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x43; 32],
+    });
+    let (status3, body3) = raw_get_with_payment(&url, &exact_header(&forged));
+    assert_eq!(status3, 402, "{body3}");
+    assert_eq!(agg.accepted_count(), 1);
+
+    drop(agg);
+    let _ = std::fs::remove_file(&wal);
+}
