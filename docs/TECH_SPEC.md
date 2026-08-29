@@ -569,6 +569,50 @@ keep-alive（`Connection: close` 尊重客户端显式关闭）；请求读超�
 S-15 部署清单项）；无指标端点（monitor `server.rs` 独立刮取）；`/v1/intents` 批量端点
 （`submit_batch`）不暴露（单请求单意图，批量走 SDK 侧并发）。
 
+### 6.8 x402 适配层 · 客户端（S-30b，docs/x402-adapter.md §2.1）
+
+站位：Meridian 是 **x402 的结算后端**（卖水），不是再造付费协议。本节 = agent 侧
+fetch 拦截：标准 x402 资源服务器回 `402` 后，把 `paymentRequirements`（scheme
+`meridian-v1`）映射成 [`SdkClient::pay`] 意图，支付后带 `X-PAYMENT` 头重放请求。
+crate：`sdk::x402`（std-only，与 crate 其余部分同同步口径）。
+
+**线格式（对齐 x402 v1 惯例；自定义 scheme 起步，上游注册路径跟进后标准化）**：
+
+- 402 响应体（消费侧字段，camelCase、金额恒字符串）：`{"x402Version": 1,
+  "accepts": [{"scheme", "network", "maxAmountRequired": "<原子单位字符串>",
+  "resource": "<URL>", "description", "payTo": "<0x 20B>", "maxTimeoutSeconds",
+  "asset"}]}`。v1 只消费 `scheme == "meridian-v1"` 的条目（多条取首条）；无则
+  `SdkError::Local`（不伪装成其它 scheme 的 client）。
+- `X-PAYMENT` 头（base64url 无 padding 的 JSON，`{"x402Version", "scheme":
+  "meridian-v1", "network", "resource", "payload": {"intentHash": "<0x 32B>",
+  "seq", "spendNonce"}}`）。merchant 验证 = 对网关查 `GET /v1/receipts/{intentHash}`
+  （§6.7 S-30a），accepted 即放行——**信封不内嵌**（离线验签是 S-30c facilitator 缝）。
+
+**字段映射（x402 → SpendIntent，docs/x402-adapter.md §3）**：
+
+| x402 字段 | Meridian 字段 | 语义 |
+|---|---|---|
+| `payTo` | `intent.recipient` | 0x 20B EVM 地址直通 |
+| `maxAmountRequired` | `intent.amount` | USDC 6 decimals 原子单位直通（字符串解析） |
+| `resource` | `intent.category` | `sha256(host + path)`——类目是 owner 白名单的粗粒度路由控制，query 不绑定（诚实边界） |
+| `resource`（全文） | `intent.memo` | `sha256(resource)[..32]` 请求指纹（审计对账用） |
+| `maxTimeoutSeconds` | `intent.expires_at` | `now + maxTimeout`（缺省 60s）——支付有效期绑定服务器要求 |
+| `spend_nonce` | `NonceManager` | 幂等语义 §6.6 不变 |
+| `network` / `asset` | 回显进 payload | v1 仅 Base USDC，网关部署配置裁决 |
+
+**执行流**：`X402Client::request` → `Fetch::fetch`（HTTP 执行器接缝）→ 非 402 原样
+返回（`X402Outcome::Free`）→ 402 → 映射 → `SdkClient::pay`（固定 nonce + 幂等重试，
+§6.6）→ `X-PAYMENT` 重放 → 二次 402 = `SdkError::Local`（支付被资源服务器拒绝，不重试）；
+否则 `X402Outcome::Paid { response, proof }`（proof 含 intent_hash/seq/spend_nonce，
+供对账）。
+
+**接缝与诚实边界（v1）**：`Fetch` trait 由调用方注入；内置 `HttpFetch` 仅支持明文
+`http://`（手写 TcpStream，与 §6.7 同口径），**https 资源须注入 HTTPS 客户端**（如
+reqwest 包装）；base64url 手写实现（RFC 4648 向量锁定，不引新依赖）；每
+`X402Client` 绑定一张委托（`delegation_hash`）；`X-PAYMENT-RESPONSE` 结算回执头
+v1 不消费（epoch 结算语义下 merchant 对账走网关查询，facilitator /verify /settle
+是 S-30c 范围）。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）

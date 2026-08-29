@@ -1,6 +1,6 @@
-# x402 结算适配层 — 设计稿 v0（S-30 立项，未实现）
+# x402 结算适配层 — 设计稿 v0（S-30 立项）
 
-> 状态：**立项设计稿**（2026-08-29 拍板立项）；S-30a 已实现（2026-08-30）。实现前先升级进 TECH_SPEC（先改 spec 后改码）。
+> 状态：**立项设计稿**（2026-08-29 拍板立项）；S-30a / S-30b 已实现（2026-08-30），S-30c 待排。实现前先升级进 TECH_SPEC（先改 spec 后改码，S-30b = §6.8）。
 > 背景：MASTER_PLAN 计划审读问题 ⑤——x402 竞争窗口缺席。x402（HTTP 402 原生支付，
 > Coinbase 主推）正在成为 agent 按请求付费的事实协议层；Meridian 的正确站位是
 > **x402 的结算后端**（卖水），不是再造一个付费协议。
@@ -72,6 +72,16 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
 1. S-30a：`/v1/receipts` 只读端点 + gateway 测试（小，~半天砖）。**已完成（2026-08-30）**——
    测试：aggregator `receipt_lookup_hits_before_settle_and_none_after` + gateway
    `handle_receipt_lookup_gate_and_hash_validation` / `e2e_receipt_lookup_x402_merchant_flow`。
-2. S-30b：SDK 侧 x402 fetch 拦截（`X402Client` wrapper，schema `meridian-v1`）。
+2. S-30b：SDK 侧 x402 fetch 拦截（`X402Client` wrapper，schema `meridian-v1`）。**已完成
+   （2026-08-30，TECH_SPEC §6.8）**：`sdk::x402` 模块——402 体解析（`accepts[]` camelCase、
+   金额恒字符串原子单位、`payTo` 0x 20B）、字段映射（payTo→recipient /
+   maxAmountRequired→amount / resource→category=sha256(host+path) query 不绑定 /
+   memo=sha256(resource) 指纹 / maxTimeoutSeconds→expires_at 缺省 60s）、`SdkClient::pay`
+   管线直通（幂等重试 §6.6 不变）、`X-PAYMENT` 重放（base64url 无 padding 手写实现，
+   RFC 4648 向量锁定）。接缝：`Fetch` trait 可注入 HTTPS 客户端；内置 `HttpFetch` 仅
+   `http://`（手写 TcpStream，真 socket 测试覆盖）。**诚实边界**：类别白名单在账本
+   （TEMPORARY 管线）不强制——强制点 = ZK 电路断言 4（§5.2）与 Contract 模式链上，
+   SDK 测试已固化此边界。测试：sdk 单测 5 + 集成 7（e2e 402→pay→重放全链路真记账 +
+   `Aggregator::receipt` 回执可查）。
 3. S-30c：facilitator 参考实现（axum/tokio 允许——merchant 侧不在内核热路径）。
 4. EIP-3009 桥视生态牵引再排。

@@ -889,6 +889,7 @@ dependencies = [
  "k256",
  "meridian-aggregator",
  "meridian-core",
+ "serde",
  "serde_json",
  "sha2",
  "sha3",

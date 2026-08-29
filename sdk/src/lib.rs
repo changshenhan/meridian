@@ -34,12 +34,18 @@ pub mod identity;
 pub mod pay;
 pub mod transport;
 pub mod transport_http;
+pub mod x402;
 
 pub use error::{SdkError, TransportError};
 pub use identity::{owner_did, AgentWallet, DelegationLimits};
 pub use pay::{NonceManager, PayParams, PayReceipt, RetryPolicy};
 pub use transport::{DropFirstTransport, InProcessAggregator, ResponseLossTransport, Transport};
 pub use transport_http::HttpTransport;
+pub use x402::{
+    base64url_encode, category_from_resource, Fetch, HttpFetch, MeridianPayload, PaymentPayload,
+    PaymentRequired, PaymentRequirements, ResourceRequest, ResourceResponse, X402Client,
+    X402Outcome, X402Proof,
+};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
