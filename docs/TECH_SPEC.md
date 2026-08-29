@@ -341,20 +341,23 @@ expires_at / revocation_root / now）为准（接口已设计成"返回即登记
 | Phase 2 | 电路内"递归聚合"：N 笔 → 1 个聚合证明 | 摊销到近乎固定成本 |
 
 > 诚实预算：100μs/笔是**目标线**。owner ECDSA 电路外（§5.2），电路内是 BabyJubJub EdDSA +
-> pedersen Merkle + sha256——单验证 ~ms 级（§5.5 实测）。**S-18 评估（`docs/zk-batch-verify-eval.md`）**：
-> 批验证（v1.1）只摊薄固定成本（配对合成、setup 共享），每证明的 MSM 主成本不跨证明共享——
-> 分析上 256 笔/批现实的摊薄约 0.5-2ms/笔（in-process wrapper 去掉 CLI 启动后），**100μs/笔
-> 单靠批验证不可达，需递归聚合（Phase 2/4）才击穿**；若批验证实测不到线，按诚实修订调整预算。
-> 基准（§8）会产生真实数字回填预算表。
+> pedersen Merkle + sha256——单验证 ~ms 级（§5.5 实测）。**S-18 评估 + 实测（`docs/zk-batch-verify-eval.md` §5）**：
+> 批验证（v1.1）只摊薄固定成本（配对合成、setup 共享），每证明的 MSM 主成本不跨证明共享。S-18
+> 在参考机（32 核 WSL2）实测两处硬结论：① BB 6.0.0-nightly.20260724 的 CLI `batch_verify`
+> 对 UltraHonk **无 handler**（`No handler for subcommand`，仅 Chonk folding 栈可用）、msgpack
+> schema 亦仅有 `ChonkBatchVerify`——**BB 原生批验证对本 flavor（evm-no-zk keccak）客观不可用**；
+> ② 延迟分解实测 CLI 进程开销仅 0.77ms p50（占 15.5%），纯验证数学 ≈4.21ms 为主导成本（MSM），
+> in-process wrapper 收益上界 ~15%。**100μs/笔 单靠批验证不可达，需递归聚合（Phase 2/4）才击穿**；
+> B4 预算线按诚实修订执行（§8.2）。
 
 ### 5.5 约束预算（目标 + S-09 实测）
 
 | 项 | 目标 | S-09 实测（CI run 31934410549） |
 |---|---|---|
 | 电路约束数 | < 2^18 | **66736**（`bb gates` circuit_size；含 sha256 intent_hash + pedersen Merkle + Jubjub EdDSA） |
-| 证明生成（agent 侧，桌面级） | p50 < 1s | 1.8457s（CI 2 核共享 runner，`bb prove` 进程含 witness 加载；桌面级/优化留待 Phase 4） |
-| 单证明验证（聚合器） | < 10ms | **7.62ms p99 PASS**（`bb verify` CLI 进程含启动开销，纯验证数学更小） |
-| 批验证摊薄（≥256 笔/批） | ≤ 100μs / 笔 | 7.62ms/笔 CLI 上界；S-18 分析（`docs/zk-batch-verify-eval.md`）估计 in-process + 批验证 ~0.5-2ms/笔，**100μs 需递归聚合**（Phase 2/4）；真实测待 nargo/bb 环境 |
+| 证明生成（agent 侧，桌面级） | p50 < 1s | **0.325s**（S-18 参考机 32 核 WSL2 本机实测；CI 2 核共享 runner 1.8457s） |
+| 单证明验证（聚合器） | < 10ms | **5.14ms p99 PASS**（参考机 32 核 WSL2；延迟分解：CLI 开销 0.77ms p50 / 15.5%，纯数学 ≈4.21ms 主导；CI 2 核 7.62ms） |
+| 验证摊薄（≥256 笔/批） | ≤ 100μs / 笔（**S-18 诚实修订**，见 §8.2） | 参考机实测单验证 CLI 上界 **4983.8μs/笔**（32 核）；BB 原生批验证对 UltraHonk 不可用（实证，`docs/zk-batch-verify-eval.md` §5）；**100μs 需递归聚合**（Phase 2/4） |
 
 **S-05 基线**（run 31926682045）：最小版 = 6880 ACIR opcodes + 1289 Brillig opcodes。
 **S-09 完整版**（run 31934410549）：circuit_size = **66736**，ACIR opcodes = 9044（`bb gates`
@@ -579,7 +582,7 @@ contract BatchSettler {
 | B1 | delegation 签名/验签 | ops/s, p99 | 验签 > 50k ops/s | 回归 >1% 红 |
 | B2 | ZK 证明生成（agent 侧） | p50/p99, 约束数 | p50 < 1s | 回归 >5% 红 |
 | B3 | ZK 单验证 | p99 | < 10ms | 回归 >5% 红 |
-| B4 | ZK 批验证（≥256 笔） | 摊薄 μs/笔 | ≤ 100μs（**S-18 评估**：单靠批验证不可达，需递归聚合；见 `docs/zk-batch-verify-eval.md`） | 回归 >5% 红 |
+| B4 | ZK 验证摊薄（≥256 笔/批） | 摊薄 μs/笔 | **S-18 诚实修订**（实测见 `docs/zk-batch-verify-eval.md` §5）：BB 原生批验证对 UltraHonk 不可用（CLI 无 handler + msgpack 仅 Chonk，实证）；实线 = 单验证 CLI 上界 **4983.8μs/笔**（参考机 32 核）；**≤100μs/笔 挂递归聚合（Phase 2/4）** | 回归 >5% 红 |
 | B5 | 聚合器摄入吞吐 | 笔/s（1/8/64 线程） | 单实例 ≥ 100k 笔/s | 回归 >1% 红 |
 | B6 | 摄入端到端延迟 | p99 | ≤ 50ms | 回归 >1% 红 |
 | B7 | 排序+承诺（100k 笔） | 耗时, 内存峰值 | < 1s, < 1GB | 回归 >1% 红 |

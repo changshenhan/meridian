@@ -1,8 +1,8 @@
 # ZK 批验证评估（S-18 代码侧先行）
 
-> 状态：**分析评估**。真批验证实测待 nargo/bb（Linux）环境就绪后回填（本机未装，
-> 门禁 `[SKIP]`）。本文是**诚实口径的分析评估**：用已实测的单验证数字 + UltraPlonk
-> 成本结构推断批验证的边界，不做账面达标。
+> 状态：**实测收口（2026-08-29）**。nargo/bb 工具链已在参考机（本机 WSL2，32 核）落地，
+> 门禁真跑 + 延迟分解 + 批验证接口实证完成，B4 预算线已按诚实修订执行（§5/§6）。
+> §2/§3 保留初稿分析口径，被实测修正的结论以 §4/§5/§6 为准。
 
 ## 1. 目标线与现状
 
@@ -44,27 +44,51 @@ UltraPlonk/UltraHonk 单证明验证成本结构（按量级）：
 - 需要 Borromean/honk recursion 工具链支持（BB nightly 已具备递归能力）。
 - 聚合证明的验证仍是单次 UltraPlonk 验证（~ms 级），摊到 N 笔 → 100μs 量级可达。
 
-## 4. 落地方案与门禁修订建议
+## 4. 落地方案与门禁修订建议（S-18 实测后定局）
 
-| 选项 | 手段 | 摊薄效果（分析） | 建议 |
+| 选项 | 手段 | 摊薄效果 | 结论（实测后） |
 |---|---|---|---|
-| A（先落地） | BB 原生批验证 + in-process wrapper（免 CLI 启动） | ~0.5-2ms/笔 | **S-18 主落地项**：省掉 CLI 进程启动 + 配对合成均摊 |
-| B（击穿线） | 递归聚合 N 笔 → 1 证明 | 近固定成本 / N → **100μs 可达** | Phase 2/4 立项，本步只预研 |
-| C（诚实修订） | 若 A 实测达不到 100μs，**修订 B4 预算线**为批验证实线（如 ≤2ms/笔），100μs 挂递归里程碑 | — | 备选，绝不账面达标 |
-
-**in-process wrapper 才是大头**：7.62ms 里 CLI 进程启动 + witness/文件 IO 占比显著，
-纯数学单验证远小于此。S-18 先做一个 Rust 内嵌 BB 验证的最小 wrapper（或调用 bb 的
-`verify` 批量接口），把 CLI 启动开销拿掉，实测纯验证 + 批验证摊薄。
+| A（先落地） | BB 原生批验证 + in-process wrapper（免 CLI 启动） | ~0.5-2ms/笔（分析） | **否决（实证）**：BB 6.0.0-nightly.20260724 的 CLI `batch_verify` 仅注册了帮助文本、实际执行 `No handler for subcommand batch_verify`；msgpack schema 亦仅有 `ChonkBatchVerify`（folding 栈，非本 flavor）——**BB 原生批验证对 UltraHonk（evm-no-zk keccak）客观不可用** |
+| A'（半项） | 仅 in-process wrapper（拿掉 CLI 启动） | **上界 ~15%（0.77ms/笔）** | 收益有限（实测分解见 §5）：CLI 进程开销 p50 仅 0.77ms / 15.5%，纯验证数学 ≈4.21ms 才是主导（MSM）——**推翻本文件初稿"CLI 开销占比显著"的假设** |
+| B（击穿线） | 递归聚合 N 笔 → 1 证明 | 近固定成本 / N → **100μs 可达** | Phase 2/4 立项，本步只预研（维持） |
+| **C（诚实修订）** | **修订 B4 预算线**：实线 = 单验证 CLI 上界 4983.8μs/笔（参考机 32 核）；≤100μs/笔 挂递归聚合里程碑（Phase 2/4） | — | **已执行**（TECH_SPEC §8.2 / §5.5 已回填） |
 
 ## 5. 实测前置条件（待环境）
 
-- nargo（`~/.nargo/bin`）+ bb（`~/.bb`，6.0.0-nightly，需 `-t evm-no-zk` 与 `write_vk/prove/verify`
-  一致的 UltraKeccakFlavor）——本机未装，verify.sh ZK 步 `[SKIP]`。
-- 落地后回填：`formal_bench.py` 的 B4 单元格（批验证摊薄 μs/笔），并更新 §8.2。
-- 借 neuralzoo Linux 服务器或 WSL 补齐工具链（门禁注释已标注路径）。
+## 5. 实测（S-18 收尾，2026-08-29，参考机 = 本机 WSL2）
+
+- **环境**：Win11 Home + WSL2（Ubuntu 24.04 rootfs，D:\WSL VHD），**32 核 / 15G**；
+  nargo 1.0.0-beta.26 + bb 6.0.0-nightly.20260724（与 circuits/README 配对一致）。
+  此前 Windows 侧缺的 VirtualMachinePlatform feature 经 DISM 启用 + 重启后落地。
+  （曾评估借 neuralzoo Linux 服务器，老板拍板不部署生产服务器、只用本机。）
+- **门禁真跑**：`smoke_zk.sh` 5/5（prove 98.66MiB → verify ultra_honk 32 线程 →
+  公共输入回读 97 fields → 负向篡改正确拒绝）+ `formal_zk.sh` 8/8（gen-witness →
+  prove/verify/公共输入回读(121)/负向篡改/B2/B3/B4 计时 + 约束门禁 66736 < 2^18 →
+  `write_solidity_verifier` UltraKeccakFlavor EVM 验证器）。
+- **B2/B3/B4 参考机实测**（`circuits/bench/baseline_s09.json`，本机不入库）：
+
+  | 项 | CI 2 核（旧基线） | 参考机 32 核（S-18 实测） |
+  |---|---|---|
+  | B2 prove p50 | 1.8457s | **0.325s**（目标 <1s PASS） |
+  | B3 verify p99 | 7.62ms | **5.14ms**（目标 <10ms PASS） |
+  | B4 摊薄 CLI 上界 | 7623.4μs/笔 | **4983.8μs/笔** |
+
+- **延迟分解（40 轮，python 计时 subprocess）**：
+
+  | 项 | p50 | 占比 |
+  |---|---|---|
+  | `bb --version`（进程 + 库初始化，无数学） | 0.77ms | **15.5%** |
+  | `bb verify`（全流程） | 4.97ms | 100% |
+  | 纯验证数学上界（含 vk/proof IO） | ≈4.21ms | 主导（MSM） |
+
+- **批验证接口实证**：`bb batch_verify --help` 存在（"Batch-verify multiple Chonk
+  proofs"）但执行即 `No handler for subcommand batch_verify`——帮助文本注册了 handler
+  没实现；msgpack schema 全量扫（`bb msgpack schema`）仅有 `ChonkBatchVerify` /
+  `ChonkBatchVerifier{Start,Queue,Stop}`，无任何 UltraHonk 批验证入口。
 
 ## 6. 结论一句话
 
-**批验证是改善手段不是目标达成手段**：先落地 in-process + 批验证拿掉 CLI 启动与固定成本
-（分析 ~0.5-2ms/笔），**100μs/笔 依赖递归聚合**（Phase 2/4 预研已启动）；若批验证实测仍
-达不到 100μs，按 C 选项诚实修订预算线，不凑数。
+**初稿的批验证路线实测后关闭**：BB 原生批验证对 UltraHonk 不存在（实证），in-process
+wrapper 收益上界仅 ~15%（CLI 开销 0.77ms/15.5%，MSM 纯数学才是主导）——**100μs/笔 只能
+靠递归聚合（Phase 2/4）**；C 选项诚实修订已执行（B4 实线 = 单验证 CLI 上界 4983.8μs/笔
+参考机实测，≤100μs 挂递归里程碑），不凑数。
