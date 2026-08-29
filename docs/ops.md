@@ -63,11 +63,14 @@ WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪�
 | `meridian_wal_bytes` | gauge | WAL 文件字节数 |
 | `meridian_uptime_seconds` | gauge | 实例运行时长 |
 | `meridian_ingest_rate_last_window` | gauge | 最近一次刮取窗口平均速率（增量/时长） |
+| `meridian_submit_duration_seconds` | histogram | `submit` 全路径 API 延迟（接受/拒绝/re-ack 一律计时；log2 μs 桶 ×32，`le` 累计 + `_sum`/`_count`，TECH_SPEC §6.11） |
+| `meridian_submit_duration_p99_seconds` | gauge | 预计算 p99（log2 桶**上界**近似；精确分位数用 `_bucket` 跑 `histogram_quantile`） |
 | `meridian_epoch_capacity` / `meridian_ledger_shards` | gauge | 生产拓扑参数 |
 | `meridian_instance_info` | gauge | 实例标识（label `instance`） |
 
-**诚实边界**：吞吐是刮取窗口均值，**不是 p99**（p99 需热路径直方图，会碰 B8 零分配底线，
-后续按需加、先测影响）。`rejected` 不持久化。Grafana 面板 `monitor/grafana/meridian-dashboard.json`
+**诚实边界**：吞吐是刮取窗口均值，不是 p99；p99 由 S-35 热路径直方图提供（桶上界近似，
+会话计数不持久化——崩溃恢复后从 0 起）。直方图埋点为固定桶原子增量 + 两次 `Instant::now()`，
+热路径仍零分配（B8 复测口径见 TECH_SPEC §8.2）。Grafana 面板 `monitor/grafana/meridian-dashboard.json`
 用 `rate(meridian_accepted_total[1m])` 看吞吐——因为计数语义在刮取器侧做增量，不误导为 counter。
 
 ## 5. 告警阈值建议
@@ -78,9 +81,11 @@ WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪�
 | `/healthz` 503 | 任一检查降级 | `ledger_consistent` 优先——接管 WAL 核对账本 |
 | `meridian_pending_sealed` | > 3 | 结算消费端阻塞，尽快 process_pending |
 | `meridian_rejected_total` 激增 | 环比 | 客户端配置漂移或重放攻击，查错误码分布 |
+| `meridian_submit_duration_p99_seconds` | > 0.05（B6 目标 50 ms） | 热路径退化（分片争用 / WAL 慢盘 / 验证变贵），对照 `_bucket` 定位量级 |
 
 ## 6. 与 S-15 后续的接缝
 
-- monitor 是 **scrape 语义**的只读视图；真热路径直方图/p99、多实例集群指标聚合是后续项。
+- monitor 是 **scrape 语义**的只读视图；热路径直方图/p99 已由 S-35 兑现（TECH_SPEC §6.11），
+  剩余后续项：多实例集群指标聚合。
 - `deploy --live` 上链（Base Sepolia → 主网）需要真实操作者密钥与 gas，属**外向动作**，
   代码已就绪（dry-run 默认），实际执行等明确指示。

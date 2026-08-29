@@ -4,6 +4,7 @@
 //! （计数语义由刮取器按增量处理，见 crate 文档——诚实：不加 counter 语义误导）。
 
 use meridian_aggregator::health::HealthSnapshot;
+use meridian_aggregator::hist::LatencySnapshot;
 
 /// 单条样本（渲染前构造，便于测试断言）。
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +56,7 @@ pub fn render_prometheus(s: &HealthSnapshot, ingest_rate: f64) -> String {
     for sample in samples(s, ingest_rate, info_label) {
         out.push_str(&sample.render());
     }
+    out.push_str(&render_submit_duration(&s.submit_latency, &s.instance_id));
     out
 }
 
@@ -124,9 +126,67 @@ pub fn samples(s: &HealthSnapshot, ingest_rate: f64, instance: String) -> Vec<Pr
     ]
 }
 
+/// 桶 `i` 的 Prometheus `le` 值（秒）：桶上界 `2^(i+1)` μs = `2^(i+1) / 1e6` s。
+/// f64 除法的最短往返表示对 2 的幂 + 1e6 精确还原（如 1048576/1e6 → "1.048576"）。
+fn le_label(i: usize) -> String {
+    format!("{}", (1u64 << (i + 1)) as f64 / 1e6)
+}
+
+/// `submit` 全路径延迟：Prometheus histogram 家族（`le` 累计 + `_sum`/`_count`）+
+/// 预计算 p99 gauge（TECH_SPEC §6.11）。
+///
+/// 口径诚实：p99 是 log2 桶**上界**近似；精确分位数请在 Grafana 对 `_bucket` 跑
+/// `histogram_quantile`。会话计数不持久化——实例重启后 `_count` 从 0 重爬
+/// （`rate()` 在重启点会失真，用 `histogram_quantile` 的绝对快照口径）。
+pub fn render_submit_duration(l: &LatencySnapshot, instance: &str) -> String {
+    const BASE: &str = "meridian_submit_duration_seconds";
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# HELP {BASE} submit 全路径 API 延迟（接受/拒绝/re-ack 一律计时；log2 μs 桶 ×32，TECH_SPEC §6.11）。\n"
+    ));
+    out.push_str(&format!("# TYPE {BASE} histogram\n"));
+    let mut cum = 0u64;
+    for (i, &b) in l.buckets.iter().enumerate() {
+        cum += b;
+        out.push_str(&format!(
+            "{BASE}_bucket{{instance=\"{}\",le=\"{}\"}} {cum}\n",
+            escape_label(instance),
+            le_label(i)
+        ));
+    }
+    out.push_str(&format!(
+        "{BASE}_bucket{{instance=\"{}\",le=\"+Inf\"}} {}\n",
+        escape_label(instance),
+        l.count
+    ));
+    out.push_str(&format!(
+        "{BASE}_sum{{instance=\"{}\"}} {}\n",
+        escape_label(instance),
+        l.sum_us as f64 / 1e6
+    ));
+    out.push_str(&format!(
+        "{BASE}_count{{instance=\"{}\"}} {}\n",
+        escape_label(instance),
+        l.count
+    ));
+    // 预计算 p99（Grafana 直用；μs → 秒）。
+    let p99_name = "meridian_submit_duration_p99_seconds";
+    out.push_str(&format!(
+        "# HELP {p99_name} submit 延迟 p99（log2 桶上界近似；精确分位数用 _bucket 跑 histogram_quantile）。\n"
+    ));
+    out.push_str(&format!("# TYPE {p99_name} gauge\n"));
+    out.push_str(&format!(
+        "{p99_name}{{instance=\"{}\"}} {}\n",
+        escape_label(instance),
+        l.p99_us() as f64 / 1e6
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meridian_aggregator::hist::BUCKETS;
 
     fn snap() -> HealthSnapshot {
         HealthSnapshot {
@@ -139,6 +199,7 @@ mod tests {
             revoked_len: 0,
             revocation_root: [0; 32],
             wal_len: 4096,
+            submit_latency: LatencySnapshot::default(),
             ledger_shards: 8,
             epoch_capacity: 1000,
             epoch_secs: 60,
@@ -180,5 +241,81 @@ mod tests {
         // 同秒双刮取（dt=0）与时钟异常（负）都不除零、不产生无穷。
         assert_eq!(rate_from_delta(100, 0.0), 0.0);
         assert_eq!(rate_from_delta(100, -1.0), 0.0);
+    }
+
+    /// S-35：histogram 家族渲染——`le` 累计语义、+Inf == _count、p99 gauge 在场。
+    #[test]
+    fn renders_submit_duration_histogram() {
+        let mut l = LatencySnapshot::default();
+        l.buckets[0] = 2; // 亚微秒 + [1,2) μs
+        l.buckets[6] = 1; // [64, 128) μs
+        l.count = 3;
+        l.sum_us = 100;
+        let text = render_submit_duration(&l, "meridian-123");
+
+        // 家族头：一个 HELP + 一个 TYPE（histogram），不是逐样本 gauge。
+        assert_eq!(
+            text.matches("# HELP meridian_submit_duration_seconds ")
+                .count(),
+            1
+        );
+        assert!(text.contains("# TYPE meridian_submit_duration_seconds histogram"));
+        // le 升序 + 累计：桶 0 → 2，桶 6 累计 → 3。
+        assert!(text.contains(
+            "meridian_submit_duration_seconds_bucket{instance=\"meridian-123\",le=\"0.000002\"} 2"
+        ));
+        assert!(text.contains(
+            "meridian_submit_duration_seconds_bucket{instance=\"meridian-123\",le=\"0.000064\"} 2"
+        ));
+        assert!(text.contains(
+            "meridian_submit_duration_seconds_bucket{instance=\"meridian-123\",le=\"0.000128\"} 3"
+        ));
+        assert!(text.contains(
+            "meridian_submit_duration_seconds_bucket{instance=\"meridian-123\",le=\"+Inf\"} 3"
+        ));
+        // 有限 le 桶数 == BUCKETS，累计值单调不减。
+        let cum: Vec<u64> = text
+            .lines()
+            .filter(|x| x.contains("_bucket{") && !x.contains("+Inf"))
+            .map(|x| x.rsplit(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(cum.len(), BUCKETS);
+        assert!(cum.windows(2).all(|w| w[0] <= w[1]), "le 累计必须单调不减");
+        assert!(
+            text.contains("meridian_submit_duration_seconds_sum{instance=\"meridian-123\"} 0.0001")
+        );
+        assert!(
+            text.contains("meridian_submit_duration_seconds_count{instance=\"meridian-123\"} 3")
+        );
+        // p99：累计 2/3 < 99% → 落桶 6 → 上界 128 μs = 0.000128 s。
+        assert!(text
+            .contains("meridian_submit_duration_p99_seconds{instance=\"meridian-123\"} 0.000128"));
+    }
+
+    /// S-35：空直方图渲染不 NaN、p99 = 0；总渲染流含直方图家族。
+    #[test]
+    fn empty_histogram_renders_zero_p99() {
+        let text = render_submit_duration(&LatencySnapshot::default(), "t");
+        assert!(text.contains("meridian_submit_duration_seconds_count{instance=\"t\"} 0"));
+        assert!(text.contains("meridian_submit_duration_p99_seconds{instance=\"t\"} 0"));
+        assert!(!text.contains("NaN"), "空直方图不得产生 NaN");
+        // render_prometheus 集成：gauge 家族 + histogram 家族同流。
+        let full = render_prometheus(&snap(), 0.5);
+        assert!(full.contains("# TYPE meridian_submit_duration_seconds histogram"));
+        assert_eq!(
+            full.matches("# TYPE meridian_submit_duration_seconds histogram")
+                .count(),
+            1,
+            "histogram 家族只导出一次"
+        );
+    }
+
+    /// le 标签格式抽查：首桶 2 μs、末桶上界 2^32 μs（秒记）。
+    #[test]
+    fn le_label_format() {
+        assert_eq!(le_label(0), "0.000002");
+        assert_eq!(le_label(6), "0.000128");
+        assert_eq!(le_label(19), "1.048576");
+        assert_eq!(le_label(BUCKETS - 1), "4294.967296");
     }
 }

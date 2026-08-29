@@ -5,11 +5,13 @@
 //! 长连接可换 hyper/axum，接口不变）。
 //!
 //! 设计：刮取式监控（Prometheus 语义）。聚合器进程（或本脚手架`restore`一个 WAL 副本）
-//! 暴露 `/metrics`（Prometheus 文本）+ `/healthz`（JSON，200/503）。吞吐/p99 由刮取器按
-//! 两次快照的 `accepted_count` 增量推算——**不在热路径埋点**（B8 零分配 + 无锁）。
+//! 暴露 `/metrics`（Prometheus 文本）+ `/healthz`（JSON，200/503）。吞吐由刮取器按
+//! 两次快照的 `accepted_count` 增量推算；p99 由 S-35 热路径直方图提供（固定桶原子增量，
+//! 仍不在热路径引入分配或锁——B8 口径不变，TECH_SPEC §6.11）。
 //!
 //! 诚实边界：`rejected` 是会话计数（崩溃恢复后从 0 起）；吞吐为最近一次刮取间隔的均值，
-//! 不是 p99（p99 需热路径直方图，S-15 后续按需加，届时评估 B8 影响）。
+//! 不是 p99；直方图 p99 是 log2 桶**上界**近似（精确分位数用 `_bucket` 跑
+//! `histogram_quantile`），同样会话口径、不持久化。
 
 pub mod health;
 pub mod metrics;

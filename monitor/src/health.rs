@@ -96,6 +96,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meridian_aggregator::hist::LatencySnapshot;
 
     fn snap() -> HealthSnapshot {
         HealthSnapshot {
@@ -108,6 +109,7 @@ mod tests {
             revoked_len: 0,
             revocation_root: [0; 32],
             wal_len: 4096,
+            submit_latency: LatencySnapshot::default(),
             ledger_shards: 8,
             epoch_capacity: 1000,
             epoch_secs: 60,

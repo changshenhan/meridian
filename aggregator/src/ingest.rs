@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use meridian_core::dsa::{
     delegation_hash, intent_hash, verify_intent, AgentPubKey, Delegation, SignedDelegation,
@@ -35,6 +36,7 @@ use meridian_core::ledger::{check_budget, BudgetState};
 use meridian_core::zk::SpendVerifier;
 
 use crate::health::HealthSnapshot;
+use crate::hist::LatencyHistogram;
 use crate::lattice::{ChainPublisher, EpochResult, NoopPublisher};
 use crate::proof::check_public_inputs_consistent;
 use crate::receipt::{IntentEnvelope, Receipt};
@@ -486,6 +488,9 @@ pub struct Aggregator {
     seq: AtomicU64,
     /// 会话拒绝计数（S-15 观测；零分配原子增量，**不**持久化——崩溃恢复后从 0 起）。
     rejected: AtomicU64,
+    /// `submit` 全路径延迟直方图（S-35，TECH_SPEC §6.11）：固定桶原子增量，零分配零锁
+    /// （B8 口径不变）。会话计数不持久化（同 `rejected`），崩溃恢复后从 0 起。
+    latency: LatencyHistogram,
     /// 本实例启动时刻（unix 秒；`snapshot()` 健康快照用）。
     started_at: u64,
     /// 实例标识（`meridian-<pid>`；S-15 多实例时每实例一 metrics endpoint）。
@@ -578,6 +583,7 @@ impl Aggregator {
             revocations: RevocationSet::with_capacity(intents_expected / 1000),
             seq: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            latency: LatencyHistogram::new(),
             started_at: now,
             instance_id: format!("meridian-{}", std::process::id()),
             now_fn,
@@ -747,7 +753,18 @@ impl Aggregator {
     }
 
     /// 摄取单条意图（TECH_SPEC §6.2 管线，见模块文档）。永远返回 `Receipt`（不 panic，除非 WAL 失败）。
+    ///
+    /// S-35：外层计时包装——`submit` 全路径（接受/拒绝/幂等 re-ack 一律）记入延迟直方图
+    /// （调用方观测到的 API 延迟）；内层 `submit_inner` 是原管线，B8 复测口径含本埋点。
     pub fn submit(&self, env: &IntentEnvelope) -> Receipt {
+        let t0 = Instant::now();
+        let r = self.submit_inner(env);
+        self.latency.record_us(t0.elapsed().as_micros() as u64);
+        r
+    }
+
+    /// 原摄取管线（S-35 前的 `submit` 本体，§6.2 十步顺序不变）。
+    fn submit_inner(&self, env: &IntentEnvelope) -> Receipt {
         let now = (self.now_fn)();
         let intent = &env.intent;
         let ih = intent_hash(intent);
@@ -1006,6 +1023,7 @@ impl Aggregator {
             revoked_len: self.revoked_len(),
             revocation_root: self.revocation_root(),
             wal_len: self.wal.file_len().unwrap_or(0),
+            submit_latency: self.latency.snapshot(),
             ledger_shards: self.cfg.ledger_shards,
             epoch_capacity: self.cfg.epoch_capacity,
             epoch_secs: self.cfg.epoch_secs,
@@ -2530,6 +2548,52 @@ mod tests {
             settle_all_and_check(&agg2, &expected2);
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// S-35：submit 全路径一律计时——接受、拒绝、幂等 re-ack 每次 `submit` 调用恰计一次；
+    /// 会话口径（不持久化），新实例从 0 起。
+    #[test]
+    fn latency_histogram_counts_every_submit_call() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("hist");
+        let agg = test_aggregator(&clock, &path);
+        assert_eq!(agg.snapshot().submit_latency.count, 0, "新实例零计数");
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        // 2 笔接受 + 1 笔预算拒（2_000 > max_per_spend=1_000）。
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now))
+                .accepted
+        );
+        assert!(
+            agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 20, 2, now))
+                .accepted
+        );
+        let rej = agg.submit(&make_env(
+            dh, [1u8; 20], &agent_key, [0xCC; 20], 2_000, 3, now,
+        ));
+        assert_eq!(rej.reject_reason, Some(Error::EBudgetPerSpend));
+        // 幂等 re-ack（同意图重发）也计一次。
+        let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+        assert!(agg.submit(&env).accepted);
+        let s = agg.snapshot().submit_latency;
+        assert_eq!(s.count, 4, "接受×3（含 re-ack）+ 拒绝×1，每次调用恰计一次");
+        assert!(s.sum_us > 0, "4 笔真实提交必有非零耗时");
+        assert!(s.p99_us() > 0, "非空直方图 p99 必非零");
+        assert_eq!(s.buckets.iter().sum::<u64>(), s.count, "Σ桶 == count");
+        // 会话口径：恢复重建后直方图从 0 起（WAL 只记账本事实）。
+        agg.wal.flush().unwrap();
+        let c = Arc::clone(&clock);
+        let (agg2, _) = Aggregator::restore_from_wal(
+            test_cfg(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert_eq!(agg2.snapshot().submit_latency.count, 0, "恢复后直方图重置");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// S-31：next_nonce = max(已消耗) + 1——被拒 nonce 同样占位（§6.2），跨意图跳号后

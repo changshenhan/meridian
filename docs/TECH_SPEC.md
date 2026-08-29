@@ -761,6 +761,40 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
 → 同 payload 重放 200 且 `accepted_count` 不变（重启后重放闸仍命中）；新 nonce 正常摄取
 （闸不误挡））。
 
+### 6.11 热路径延迟直方图（S-35，ops.md §5 挂账项收口）
+
+S-15 立「不在热路径埋点」的口径时把 p99 挂账为「后续按需加、先测影响」。本节兑现：
+固定桶无锁直方图，**热路径仍零分配、零锁**（B8 口径不变），以两次 `Instant::now()` +
+一次原子 `fetch_add` 的常数代价换 p99 可观测性。
+
+**形态（`aggregator/src/hist.rs`，`LatencyHistogram`）**：
+
+- 32 个 log2 微秒桶（`[AtomicU64; 32]`）+ `count` / `sum_us` 两个原子计数器。桶 `i`
+  覆盖 `[2^i, 2^(i+1))` μs（桶 0 含 0 = 亚微秒），`bucket_of(us)` = `floor(log2(us))`
+  下取整、≥2^31 μs 一律钳入桶 31（上界 ≈ 2147 s，超过即告警态，不需要更宽）。
+- 计量点：`Aggregator::submit` 全路径（接受、拒绝、幂等 re-ack 一律计时）——语义是
+  **调用方观测到的 API 延迟**，不是内核分段耗时。
+- 查询：`snapshot()` 逐桶 `load(Relaxed)` 拷出 `LatencySnapshot`（纯只读，不碰任何
+  锁，B8：抓快照不引入热路径争用）；`p99_us()` 取最小累计占比 ≥ 99% 的桶的
+  **上界** `2^(i+1)` μs。
+
+**诚实边界**：
+
+- p99 是 **log2 桶上界近似**，不是精确分位数（桶内均匀分布不假设）；要精确分布用
+  `/metrics` 的 `_bucket` 原始累计值自算（Prometheus `histogram_quantile`）。
+- 会话计数，**不持久化**（同 `rejected` 口径）：崩溃恢复后直方图从 0 起；WAL 只记录
+  账本事实，延迟分布属瞬态观测。
+- `sum_us` 用 u64 微秒整数累加（亚微秒部分归桶 0 不进和）——`_sum` 是下界口径。
+
+**导出（`monitor/src/metrics.rs`）**：Prometheus histogram 家族
+`meridian_submit_duration_seconds_bucket{le=...}`（32 个有限 `le` 升序 +
+`+Inf`，累计语义）/ `_sum` / `_count`（`# TYPE ... histogram`），外加预计算的
+`meridian_submit_duration_p99_seconds` gauge（Grafana 直用；精确分位数请在
+Grafana 侧对 `_bucket` 跑 `histogram_quantile`）。`le` 值以秒记（`2^i μs = 2^(i-6) s`）。
+
+**性能账（B5/B6/B8 复测口径）**：埋点代价 = 每次 `submit` 两次 `Instant::now()` +
+1 次 `fetch_add(Relaxed)`，无分支外的新分配。实测影响见 §8.2 B5 注（S-35 回填）。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）
@@ -890,6 +924,13 @@ contract BatchSettler {
 > **180.9 ms / 0 分配**（基线记录）；B11 同 seed 两跑 lattice 输出一致（**PASS**）。
 > 口径：全管线含 `SpendVerifier`（本阶段 `FormatVerifier`，TEMPORARY，与 PoC ② 同口径）。
 > CI 只跑回归门禁（B8/B11 硬断言 + gate 吞吐基线），全量验收在参考机 `agg_sim`。
+
+> **S-35 实测回填（§6.11 热路径埋点性能账，Windows 实测机 P-core 钉定，gate 9 轮中位
+> vs `bench/baseline.json`）**：`aggregator_ingest_ops` **-0.48%**（kernel 口径）/
+> **+3.69%**（bench 口径，run-to-run 噪声带内）、B7 墙钟 +4.75%、RSS +1.55%（< 3% 硬
+> 阈值）——均在 gate ±15% 与历史噪声带（±17%）内，**B5/B6/B8 口径不变**（B8 分配数
+> 仍 = 0，`agg_sim --check-alloc` 复测通过）。结论：每次 `submit` 两次 `Instant::now()`
+> + 3 次 `fetch_add(Relaxed)` 对 ~22 μs/笔 的单线程稳态成本 < 1%，被噪声淹没。
 
 > **S-14b/S-18 实测回填（`bench/baseline.json`，Windows x86_64 release 实测机，单线程
 > `gate` 全指标）**：B1 `verify_delegation_ops` **19,558/s**、`sign_delegation_ops`

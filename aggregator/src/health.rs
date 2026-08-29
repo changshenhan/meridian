@@ -7,8 +7,11 @@
 //! - `accepted_count` / `rejected_count` 是**会话**计数（`rejected` 不持久化；崩溃恢复
 //!   后从 0 起，accepted 由 WAL 重放精确重建）。
 //! - `rejected` 计**实际拒绝**：幂等 re-ack（同意图重发）不计 accepted 也不计 rejected。
-//! - 吞吐 / p99 由外部刮取器按两次快照的 `accepted_count` 增量推算（单机或集群维度），
-//!   不在热路径埋点（零分配 + 不引入锁）。
+//! - 吞吐由外部刮取器按两次快照的 `accepted_count` 增量推算（单机或集群维度）；
+//!   p99 由 S-35 热路径直方图（`hist::LatencySnapshot`）提供——固定桶原子增量，仍不在
+//!   热路径引入分配或锁（B8 口径不变），会话计数不持久化。
+
+use crate::hist::LatencySnapshot;
 
 /// 单次抓取的健康快照（无锁视图）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +34,8 @@ pub struct HealthSnapshot {
     pub revocation_root: [u8; 32],
     /// WAL 文件字节数（崩溃恢复边界可见性）。
     pub wal_len: u64,
+    /// `submit` 全路径延迟直方图快照（S-35，会话计数不持久化；TECH_SPEC §6.11）。
+    pub submit_latency: LatencySnapshot,
     // 生产拓扑参数（告警阈值 / 容量规划参考）。
     pub ledger_shards: usize,
     pub epoch_capacity: usize,
@@ -47,6 +52,7 @@ impl HealthSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hist::LatencySnapshot;
 
     #[test]
     fn uptime_is_saturating_and_forward() {
@@ -60,6 +66,7 @@ mod tests {
             revoked_len: 0,
             revocation_root: [0; 32],
             wal_len: 0,
+            submit_latency: LatencySnapshot::default(),
             ledger_shards: 8,
             epoch_capacity: 100,
             epoch_secs: 60,
