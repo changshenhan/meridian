@@ -33,11 +33,13 @@ pub mod error;
 pub mod identity;
 pub mod pay;
 pub mod transport;
+pub mod transport_http;
 
 pub use error::{SdkError, TransportError};
 pub use identity::{owner_did, AgentWallet, DelegationLimits};
 pub use pay::{NonceManager, PayParams, PayReceipt, RetryPolicy};
 pub use transport::{DropFirstTransport, InProcessAggregator, ResponseLossTransport, Transport};
+pub use transport_http::HttpTransport;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

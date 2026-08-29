@@ -840,6 +840,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-gateway"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "k256",
+ "meridian-aggregator",
+ "meridian-core",
+ "meridian-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "meridian-mcp"
 version = "0.1.0"
 dependencies = [
@@ -872,9 +885,11 @@ name = "meridian-sdk"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "hex",
  "k256",
  "meridian-aggregator",
  "meridian-core",
+ "serde_json",
  "sha2",
  "sha3",
 ]

@@ -46,6 +46,29 @@ impl Error {
             Error::EDelegUnknown => "E_DELEG_UNKNOWN",
         }
     }
+
+    /// 规格码的逆映射（S-29 wire 层 roundtrip 用；未知码返回 None）。
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "E_DELEG_EXPIRED" => Error::EDelegExpired,
+            "E_DELEG_SIG" => Error::EDelegSig,
+            "E_INTENT_SIG" => Error::EIntentSig,
+            "E_PROOF" => Error::EProof,
+            "E_BUDGET_PER_SPEND" => Error::EBudgetPerSpend,
+            "E_BUDGET_RATE" => Error::EBudgetRate,
+            "E_BUDGET_TOTAL" => Error::EBudgetTotal,
+            "E_NONCE" => Error::ENonce,
+            "E_REVOKED" => Error::ERevoked,
+            "E_INTENT_EXPIRED" => Error::EIntentExpired,
+            "E_INTENT_HASH" => Error::EIntentHash,
+            "E_CATEGORY" => Error::ECategory,
+            "E_SEQ" => Error::ESeq,
+            "E_ORDERING" => Error::EOrdering,
+            "E_ATTEST_BIND" => Error::EAttestBind,
+            "E_DELEG_UNKNOWN" => Error::EDelegUnknown,
+            _ => return None,
+        })
+    }
 }
 
 impl fmt::Display for Error {

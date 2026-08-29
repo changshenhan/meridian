@@ -22,3 +22,4 @@ pub mod receipt;
 pub mod revocation;
 pub mod wal;
 pub mod window;
+pub mod wire;

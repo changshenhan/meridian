@@ -31,6 +31,7 @@ Meridian 做"AI Agent 之间怎么互相花钱、互相信任"的标准 + 参考
 ```
 core/          DSA 授权原语 + 预算账本（meridian-core）
 aggregator/    结算内核：ingest / commitment lattice / WAL / 净额（meridian-aggregator）
+gateway/       S-29 网络 ingest 网关：多租户 Bearer + 每租户令牌桶，std-only HTTP/1.1（meridian-gateway）
 sdk/           Agent 集成层：authorize / pay / attest + 幂等重试（meridian-sdk）
 mcp-server/    MCP stdio 服务器：5 工具、keyless（meridian-mcp）
 monitor/       S-15 可观测性：/metrics Prometheus 文本 + /healthz 健康判定（std-only）
@@ -54,6 +55,8 @@ cd contracts/rust-smoke && cargo run --release --bin m1_demo
 # 监控（S-15）：健康检查 + Prometheus 指标端点
 cargo run -p meridian-monitor --bin meridian-monitor -- --wal <path> --once        # 一次快照
 cargo run -p meridian-monitor --bin meridian-monitor -- --wal <path> --port 9100   # HTTP 服务
+# 网络 ingest 网关（S-29）：POST /v1/authorize、/v1/intents + GET /healthz
+cargo run -p meridian-gateway --bin meridian-gateway -- gateway.json
 # 性能基座
 cargo run -p meridian-bench --bin gate -- --record          # 记录 baseline（3 整轮取中位）
 cargo run -p meridian-bench --bin gate                       # 与 baseline 比较，疑似回归自动复测

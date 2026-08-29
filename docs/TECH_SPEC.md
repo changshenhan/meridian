@@ -491,6 +491,66 @@ pub trait Ingest {
 - `NonceManager` 为进程内单调计数，崩溃后不持久化；跨重启恢复依赖聚合器 WAL + 未来
   `next_nonce` 查询 RPC（Phase 2 缝，sdk/README 记录）。
 
+### 6.7 网络 ingest API（S-29，多租户网关）
+
+S-12 留的传输接缝兑现：外部 agent/数据市场经网络接入聚合器（S-16 集成谈判的硬前置）。
+crate：`meridian-gateway`（`gateway/`）+ `aggregator::wire`（wire DTO 单一来源）+
+`sdk::transport_http::HttpTransport`（agent 侧客户端）。
+
+**形态决策（记录在案）**：std-only 手写 HTTP/1.1 线程网关，**不引入 tokio/axum**——
+聚合器是同步内核（§4.5 单写者分片 + B8 零分配热路径），monitor `server.rs` 已立 std-only
+HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Aggregator` 经 `Arc` 共享给
+连接线程池，吞吐目标 = 网关层不是瓶颈（内核实测 576k 笔/s，B5）。
+
+**端点（v1.0）**：
+
+| 方法 | 路径 | 语义 | 对应内核 |
+|---|---|---|---|
+| POST | `/v1/authorize` | 注册委托（§6.2 摄入管线的 register 前置） | `Aggregator::register` |
+| POST | `/v1/intents` | 幂等提交意图信封（同意图重发返回先前结果，§6.2 幂等闸口） | `Aggregator::submit` |
+| GET | `/healthz` | 网关存活（含内核 `accepted_count` 快照） | — |
+
+**请求/响应（wire，JSON）**：
+
+- `POST /v1/authorize`：`{"signed_delegation": SignedDelegation, "agent_pub": <32B hex>}`
+  → `200 {"registered": true}`；业务拒绝 → `200/4xx {"error": {"code": "E_*"}}`
+- `POST /v1/intents`：`{"intent": SpendIntent, "agent_sig": <64B hex>, "proof": SpendProof}`
+  （`Signature64` 同款 hex 编码先例）→ **HTTP 200 + Receipt JSON**——**业务拒绝是定局
+  响应不是传输错误**（`{"intent_hash": hex, "accepted": false, "reject_reason": "E_*",
+  "seq": 0}`），SDK 对 `E_*` **永不重试**（幂等重试语义 §6.6 不变，重试只由传输层失败触发）。
+- 信封 JSON 由 `aggregator::wire` 的 `IntentEnvelopeDto`/`ReceiptDto` 承载（serde derive，
+  与内核类型 `From` 互转）；gateway 与 sdk 共用同一 DTO 定义——wire 形状单一来源，禁止
+  两侧各自手写 JSON 结构。
+
+**认证与多租户**：
+
+- `Authorization: Bearer <key>`；租户表 = JSON 配置文件（`{"<key>": {"tenant": "<id>",
+  "rpm": <上限>}}`），网关启动时加载。诚实边界：v1 无租户热更新/撤销 UI（重启生效），
+  无密钥轮换端点。
+- **每租户令牌桶**（容量=burst，速率=rpm/60）：std 原子实现，`Mutex<桶态>` 按 tenant
+  分桶。超限 → `429 E_RATE_LIMITED`（该请求**未进内核**，无 seq、无记账，可安全重试）。
+- 无/错 key → `401 E_AUTH`。`E_AUTH`/`E_RATE_LIMITED`/`E_MALFORMED` 是**传输层错误码**
+  （§11 补充表），不进 core `Error` 内核枚举——内核语义零改动。
+
+**HTTP 状态映射**：
+
+| 状态 | 场景 | SDK 视角 |
+|---|---|---|
+| 200 | 内核 Receipt（accepted 或 E_* 业务拒绝） | 定局 |
+| 400 | JSON 不合法 / 字段缺失 / hex 非法（`E_MALFORMED`） | 定局（重发同请求无害，但不自动重试） |
+| 401 | Bearer 缺失/未知（`E_AUTH`） | 配置错误，不重试 |
+| 413 | 请求体 > 64 KiB | 不重试（信封远小于此） |
+| 429 | 租户限流（`E_RATE_LIMITED`） | **重试候选**（退避） |
+| 5xx | 内核 panic/内部错误（v1 不发生：内核 WAL 失败即 panic，由进程管理器兜底） | 重试候选 |
+
+**并发与健壮性**：thread-per-connection + 信号量上限（`max_connections`，默认 256）；
+keep-alive（`Connection: close` 尊重客户端显式关闭）；请求读超时 5s；请求体上限 64 KiB。
+网关崩溃恢复 = 内核语义（WAL 重放，S-10c），网关自身无状态。
+
+**诚实边界（v1）**：明文 HTTP——TLS 由部署拓扑的反代终结（生产部署前必须有 TLS 终结点，
+S-15 部署清单项）；无指标端点（monitor `server.rs` 独立刮取）；`/v1/intents` 批量端点
+（`submit_batch`）不暴露（单请求单意图，批量走 SDK 侧并发）。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）
@@ -729,6 +789,14 @@ contract BatchSettler {
 | `E_SEQ` | 摄取序号冲突 |
 | `E_ORDERING` | 承诺与重排不一致（欺诈信号） |
 | `E_09` | 未定义（预留） |
+
+**传输层错误码（S-29 wire 层，不进内核 `Error` 枚举）**：
+
+| 码 | 含义 | HTTP 状态 | SDK 重试 |
+|---|---|---|---|
+| `E_AUTH` | Bearer 缺失/未知租户 | 401 | 否 |
+| `E_RATE_LIMITED` | 租户令牌桶超限（未进内核，无 seq） | 429 | 是（退避） |
+| `E_MALFORMED` | JSON/字段/hex 不合法 | 400 | 否 |
 
 ---
 

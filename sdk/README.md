@@ -51,9 +51,24 @@ pub trait Transport: Send + Sync {
 }
 ```
 
-S-12 提供 `InProcessAggregator`（进程内聚合器，测试与单进程嵌入用）。**网络传输是 S-13
-框架分发层的接缝**——独立 agent 进程对接真实聚合器服务时实现同一 trait 即可，`pay()`
-重试与幂等逻辑不变。
+S-12 提供 `InProcessAggregator`（进程内聚合器，测试与单进程嵌入用）。**S-29 兑现网络
+传输**：`HttpTransport`（`transport_http.rs`，std-only TcpStream 手写 HTTP/1.1，不引
+tokio）对接 `meridian-gateway`——`pay()` 重试与幂等逻辑不变。
+
+### HttpTransport 错误映射（TECH_SPEC §6.7 状态表）
+
+| 网关响应 | SdkError | 重试 |
+|---|---|---|
+| 200 + Receipt（含 `E_*` 业务拒绝） | 定局（拒绝经 `SdkError::Meridian` 透传） | 拒绝不重试 |
+| 400 / 401 / 413 | `Local`（配置/协议错误） | 否 |
+| 429（租户限流，未进内核） | `Transport(Other)` | 是（退避） |
+| 5xx | `Transport(Other)` | 是 |
+| 连接失败 / 超时 | `Transport(Disconnected / Timeout)` | 是 |
+
+```rust
+let transport = HttpTransport::new("127.0.0.1:9400", "<bearer-key>");
+let mut client = SdkClient::new(wallet, Box::new(transport));
+```
 
 ## 诚实边界
 
