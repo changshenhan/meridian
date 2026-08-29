@@ -14,8 +14,10 @@
 //! - `MERIDIAN_BRIDGE_AGENT_SEED` / `MERIDIAN_BRIDGE_OWNER_SEED`（启用时必填，0x 32B hex）
 //! - `MERIDIAN_BRIDGE_DOMAIN_NAME`（缺省 `USD Coin`）/ `MERIDIAN_BRIDGE_DOMAIN_VERSION`（缺省 `2`）
 //! - `MERIDIAN_BRIDGE_CHAIN_ID`（缺省 8453）/ 域合约缺省取 `MERIDIAN_ASSET`（USDC 主网）
+//! - `MERIDIAN_BRIDGE_REPLAY_JOURNAL`（可选，S-33 重放闸持久化文件路径；缺省进程内存态）
 
 use std::net::TcpListener;
+use std::path::Path;
 use std::sync::Arc;
 
 use meridian_facilitator::eip3009::{BridgeConfig, Eip3009Bridge, Eip3009Domain};
@@ -102,11 +104,24 @@ fn main() {
         asset: Some(asset.clone()),
     };
     let bridge = if env_or("MERIDIAN_BRIDGE", "0") == "1" {
-        Some(Eip3009Bridge::new(bridge_config(
-            gateway_addr,
-            gateway_bearer,
-            &asset,
-        )))
+        let bc = bridge_config(gateway_addr, gateway_bearer, &asset);
+        Some(match std::env::var("MERIDIAN_BRIDGE_REPLAY_JOURNAL").ok() {
+            // S-33：持久化重放闸——启动重建闸表（坏行跳过计数），日志打开失败即退出
+            // （配置错误启动即暴露，同缺种子 panic 口径）。
+            Some(p) => {
+                let path = Path::new(&p);
+                let b = Eip3009Bridge::open(bc, path)
+                    .unwrap_or_else(|e| panic!("open replay journal {p}: {e}"));
+                eprintln!(
+                    "meridian-facilitator: replay journal {} loaded={} skipped={}",
+                    p,
+                    b.seen_len(),
+                    b.skipped_journal_lines()
+                );
+                b
+            }
+            None => Eip3009Bridge::new(bc),
+        })
     } else {
         None
     };

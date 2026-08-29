@@ -4,6 +4,8 @@
 //! - **三角色真 socket e2e**：X402Client（HttpFetch）→ facilitator 402 → 真网关 pay
 //!   （真密码学 + 真聚合器记账）→ X-PAYMENT 重放 → facilitator 查网关回执 → 200；
 //!   伪造 intentHash → 402。
+//! - **S-33 重放闸持久化**：facilitator 带 ReplayJournal 摄取 → 销毁重建（同日志路径）
+//!   → 同 payload 重放 200 且不重复摄取；新 nonce 正常摄取。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -566,10 +568,18 @@ fn e2e_gateway_down_is_503_fail_closed() {
     assert!(body.contains("E_GATEWAY_UNAVAILABLE"), "{body}");
 }
 
-/// 起带桥 facilitator（随机端口，后台线程）。
-fn spawn_facilitator_with_bridge(gateway_addr: &str, resource: &str) -> String {
+/// 起带桥 facilitator（随机端口，后台线程）。`journal` 非空 = S-33 持久化重放闸。
+fn spawn_facilitator_with_bridge(
+    gateway_addr: &str,
+    resource: &str,
+    journal: Option<&std::path::Path>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
+    let bridge = match journal {
+        Some(p) => Eip3009Bridge::open(bridge_config(gateway_addr), p).expect("open journal"),
+        None => Eip3009Bridge::new(bridge_config(gateway_addr)),
+    };
     let f = Arc::new(Facilitator::with_bridge(
         FacilitatorConfig {
             gateway_addr: gateway_addr.into(),
@@ -582,7 +592,7 @@ fn spawn_facilitator_with_bridge(gateway_addr: &str, resource: &str) -> String {
             max_timeout_seconds: 30,
             protected_body: "{\"weather\":\"clear+28C\"}".into(),
         },
-        Some(Eip3009Bridge::new(bridge_config(gateway_addr))),
+        Some(bridge),
     ));
     std::thread::spawn(move || {
         let _ = meridian_facilitator::http::serve(f, listener);
@@ -633,7 +643,7 @@ fn _type_witness(_: SdkError, _: PaymentRequired) {}
 #[test]
 fn e2e_exact_scheme_bridge_ingests_verifies_and_dedups_replay() {
     let (gw_addr, wal, agg) = spawn_gateway("e2e-eip3009");
-    let url = spawn_facilitator_with_bridge(&gw_addr, "http://fac.example.com/weather");
+    let url = spawn_facilitator_with_bridge(&gw_addr, "http://fac.example.com/weather", None);
     let domain = Eip3009Domain {
         name: "USD Coin".into(),
         version: "2".into(),
@@ -688,4 +698,77 @@ fn e2e_exact_scheme_bridge_ingests_verifies_and_dedups_replay() {
 
     drop(agg);
     let _ = std::fs::remove_file(&wal);
+}
+
+// ---------------------------------------------------------------------------
+// 5. S-33：重放闸持久化——facilitator 带日志摄取 1 笔 → 销毁重建（同日志路径）→
+//    同 payload 重放 200 且不再摄取（重启后重放闸仍命中）；新 nonce 正常摄取。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_replay_gate_survives_bridge_restart() {
+    let (gw_addr, wal, agg) = spawn_gateway("e2e-replay-journal");
+    let journal = std::env::temp_dir().join(format!(
+        "meridian-fac-e2e-journal-{}-{:x}.jsonl",
+        std::process::id(),
+        0x533_0001u32
+    ));
+    let _ = std::fs::remove_file(&journal);
+
+    let domain = Eip3009Domain {
+        name: "USD Coin".into(),
+        version: "2".into(),
+        chain_id: 8453,
+        verifying_contract: parse_addr20("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+            .expect("asset addr"),
+    };
+    let (after, before) = valid_window();
+    let payment = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [4u8; 32],
+        signer_seed: [4u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x77; 32],
+    });
+    let header = exact_header(&payment);
+
+    // 第一生命周期：摄取 1 笔并落日志。
+    let url =
+        spawn_facilitator_with_bridge(&gw_addr, "http://fac.example.com/weather", Some(&journal));
+    let (status, body) = raw_get_with_payment(&url, &header);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(agg.accepted_count(), 1);
+
+    // 第二生命周期（重启）：同日志路径重建——同 payload 重放命中闸表，不再摄取。
+    let url2 =
+        spawn_facilitator_with_bridge(&gw_addr, "http://fac.example.com/weather", Some(&journal));
+    let (status2, body2) = raw_get_with_payment(&url2, &header);
+    assert_eq!(status2, 200, "重启后重放闸仍命中 → 回执放行: {body2}");
+    assert_eq!(
+        agg.accepted_count(),
+        1,
+        "restarted bridge must not re-ingest the same payload"
+    );
+
+    // 新 nonce 不被误挡（闸只挡已登记键）。
+    let fresh = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [4u8; 32],
+        signer_seed: [4u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x78; 32],
+    });
+    let (status3, body3) = raw_get_with_payment(&url2, &exact_header(&fresh));
+    assert_eq!(status3, 200, "{body3}");
+    assert_eq!(agg.accepted_count(), 2);
+
+    drop(agg);
+    let _ = std::fs::remove_file(&wal);
+    let _ = std::fs::remove_file(&journal);
 }

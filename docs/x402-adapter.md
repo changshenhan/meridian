@@ -71,10 +71,13 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
    （facilitator 以自身委托走全量 DSA 闸口，桥不旁路任何协议层检查）→ 重放闸
    （`(from, eip3009 nonce) → intent_hash`，重放直接落 S-30c 回执查询）。**诚实边界**：
    EIP-3009 的链上执行不在本件（client→运营商清算 = 运营商侧账务，memo 指纹留档）；
-   被消费的是运营商自己的预算（垫付，client 信用风险由白标合同承担）；重放闸进程内存态
-   （重启后同 payload 可能再次摄取，双花的是运营商预算，merchant 净额不受影响）；
+   被消费的是运营商自己的预算（垫付，client 信用风险由白标合同承担）；重放闸 S-32 为
+   进程内存态，**S-33（2026-08-30）已持久化**——append-only JSONL 日志（摄取成功先内存
+   登记再落盘 sync_data，重启重建闸表，坏行跳过计数），落盘失败 503 `E_REPLAY_JOURNAL`
+   fail-closed（TECH_SPEC §6.10，bin 经 `MERIDIAN_BRIDGE_REPLAY_JOURNAL` 启用，缺省仍内存态）；
    EIP-712 domain 由配置显式给出。测试：eip3009 单测 7 + facilitator handle 纯分发 2 +
-   真 socket e2e（exact client → 真摄取真记账 1 笔 → 重放不摄取 → 伪造 402）。
+   真 socket e2e（exact client → 真摄取真记账 1 笔 → 重放不摄取 → 伪造 402）
+   + S-33 增量（journal 单测 4 + open 重建 1 + 重启后重放闸 e2e 1）。
 4. **规范上游**：x402 规范仍在演进，scheme 扩展注册路径未定——设计稿按"自定义 scheme"
    起步，跟进上游后再标准化。
 
@@ -104,3 +107,6 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
    200 / 伪造 intentHash → 402 / 网关宕机 → 503）。**诚实边界**：单资源模型、明文 HTTP
    （TLS 反代终结）、不产 `X-PAYMENT-RESPONSE`、结算侧不在本件。
 4. EIP-3009 桥：**已完成（S-32，2026-08-30，TECH_SPEC §6.10）**——见缺口清单 3。
+   重放闸持久化（S-32 诚实边界"持久化去重是后续项"）：**已完成（S-33，2026-08-30，
+   TECH_SPEC §6.10）**——`ReplayJournal` append-only JSONL + 启动重建 + 落盘失败
+   503 fail-closed；残余边界（磁盘故障窗口、日志线性增长）见 TECH_SPEC §6.10。

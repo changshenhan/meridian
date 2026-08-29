@@ -704,7 +704,10 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
    `amount = value`、`category = sha256(host + path)`（§6.8 同映射）、
    `memo = keccak256(规范序列化 authorization ++ signature)[..32]`（对账指纹）、
    `expires_at = min(validBefore, now + maxTimeoutSeconds)`。`spend_nonce` 走
-   `NonceManager`（§6.6 幂等语义不变）。摄取仍走**全量 DSA 闸口**（预算/速率/
+   `NonceManager`（§6.6 幂等语义不变）；S-33 起 `register_operator` 注册后接
+   [`SdkClient::sync_nonce`]（S-31）——持久化重放闸把"重启"变成受支持场景，而
+   `authorize` 的 delegation nonce 是进程内自增（重启归零 → 同 delegation_hash），不恢复
+   则首笔支付撞已消耗 nonce（`E_NONCE` 定局拒）。摄取仍走**全量 DSA 闸口**（预算/速率/
    撤销/ZK 证明），桥不旁路任何协议层检查。
 5. **重放闸**：进程内 `(from, eip3009_nonce) → intent_hash` 映射——同 payload
    重放不再摄取，直接落 §6.9 的回执查询路径（accepted → 200 / 未命中 → 402）。
@@ -718,8 +721,18 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
   收到的是 Meridian 净额。桥只做"验签 + 摄取"，不碰资产。
 - **垫付模型**：被消费的是运营商自己的 Meridian 预算——client 信用风险由白标
   合同承担（§4.2 受理凭证同口径），不是协议层担保。
-- **重放闸进程内存态**：重启丢失后同一 EIP-3009 payload 可能再次摄取（双花的是
-  运营商自身预算；merchant 侧按净额结算不受影响）。持久化去重是后续项。
+- **重放闸持久化（S-33，2026-08-30）**：S-32 的重放闸是进程内存态（重启丢失后同一
+  EIP-3009 payload 可能再次摄取，双花的是运营商自身预算）。S-33 收口：`facilitator/src/replay.rs`
+  的 `ReplayJournal`——append-only JSONL，每行 `{"from","nonce","intentHash"}`（0x 20B/32B hex，
+  camelCase 同 §6.10 wire 惯例），摄取成功后**先内存登记、再落盘**（单行 write + `flush` +
+  `sync_data`，崩溃最坏丢尾部半行）；`Eip3009Bridge::open(cfg, path)` 启动时重放日志重建闸表，
+  坏行（崩溃撕裂 / 损坏）跳过并计数（`skipped_journal_lines()` 可观测，不阻断重启）。
+  日志写失败 → `BridgeError::Journal` → **503 fail-closed**（`E_REPLAY_JOURNAL`，运维故障
+  不归罪 client；内存表已登记，client 重试命中重放闸不重复摄取）。
+  bin 经 `MERIDIAN_BRIDGE_REPLAY_JOURNAL` 启用（缺省仍进程内存态，v0 兼容）。
+  **诚实边界（残余）**：① 落盘失败时意图**已摄取**而登记不可持久化——响应 503 但本进程
+  内存闸已挡重放，跨进程重复摄取的概率限于磁盘故障窗口；② 日志随桥接笔数线性增长
+  （EIP-3009 `nonce` 每笔天然唯一，无重复键可压实；参考实现不设轮转/归档，运维侧按需处理）。
 - EIP-712 domain 由配置显式给出（USDC on Base：name `"USD Coin"` / version
   `"2"` / chainId 8453 / `0x8335…2913`），v1 不做域自动发现（`eip712Domain`
   扩展随上游演进）。
@@ -730,6 +743,11 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
 `to` / `value` 不符 / 时间窗 / 超额）+ `handle` 纯分发单测（exact 路径绑定与
 重放闸）+ 真 socket e2e（真聚合器 + 真网关：标准 exact client → 桥摄取 → 200；
 重放同 payload → 200 且不再摄取；伪造签名 / `to` 不符 / 过期 → 402）。
+**S-33 增量**：`replay.rs` 单测（append/重载往返、坏行跳过计数、缺文件建空）+
+`Eip3009Bridge::open` 重建单测（预置日志 → 闸表命中 / 坏行计数）+ 真 socket e2e
+（facilitator 带 `MERIDIAN_BRIDGE_REPLAY_JOURNAL` 摄取 1 笔 → **销毁重建**（同日志路径）
+→ 同 payload 重放 200 且 `accepted_count` 不变（重启后重放闸仍命中）；新 nonce 正常摄取
+（闸不误挡））。
 
 ---
 

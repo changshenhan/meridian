@@ -14,7 +14,8 @@
 //!     `None` → 402（**404 ≠ 未支付**语义下"不可验证即不放行"）；`Err` → 503
 //!     fail-closed（验证面不可用绝不放行）。
 //!   - `exact`（S-32）：EIP-712 验签 → 桥转投 Meridian 摄取（垫付模型）→ 查网关
-//!     回执放行（TECH_SPEC §6.10）。
+//!     回执放行（TECH_SPEC §6.10）；重放闸 S-33 起可持久化（[`replay`]），日志落盘
+//!     失败 → 503 `E_REPLAY_JOURNAL` fail-closed。
 //!
 //! # 诚实边界（v1）
 //!
@@ -31,6 +32,7 @@ use meridian_sdk::x402::{
 use meridian_sdk::{HttpTransport, Receipt, SdkError};
 
 pub mod eip3009;
+pub mod replay;
 
 pub use eip3009::{Eip3009Bridge, Eip3009Domain};
 
@@ -38,6 +40,8 @@ pub use eip3009::{Eip3009Bridge, Eip3009Domain};
 pub const PAYMENT_HEADER: &str = "X-PAYMENT";
 /// 网关查询失败（fail-closed）的传输层错误码。
 pub const E_GATEWAY_UNAVAILABLE: &str = "E_GATEWAY_UNAVAILABLE";
+/// 重放闸日志落盘失败（S-33 fail-closed）的错误码。
+pub const E_REPLAY_JOURNAL: &str = "E_REPLAY_JOURNAL";
 
 /// facilitator 配置（单一受保护资源）。
 #[derive(Debug, Clone)]
@@ -238,13 +242,21 @@ impl Facilitator {
         match bridge.ingest(&payment, self.binding(), unix_now()) {
             // 摄取成功 → 走同一回执闸（merchant 验证面与 meridian-v1 完全一致）。
             Ok(intent_hash) => self.receipt_gate(intent_hash),
-            // 网关不可达 → 503 fail-closed（与 meridian-v1 同口径）。
             Err(e) => match e.gateway_unavailable_sdk() {
+                // 网关不可达 → 503 fail-closed（与 meridian-v1 同口径）。
                 Some(sdk) => FacilitatorResponse {
                     status: 503,
                     body: gateway_error_body(sdk),
                 },
-                None => self.unauthorized(&e.message()),
+                // 重放闸日志落盘失败（S-33）→ 503 fail-closed：运维故障不归罪 client，
+                // 也不放行（内存表已登记，client 重试命中重放闸不重复摄取）。
+                None => match &e {
+                    eip3009::BridgeError::Journal(_) => FacilitatorResponse {
+                        status: 503,
+                        body: json_error_body(E_REPLAY_JOURNAL, &e.message()),
+                    },
+                    _ => self.unauthorized(&e.message()),
+                },
             },
         }
     }
@@ -308,8 +320,13 @@ impl FacilitatorResponse {
 
 /// 网关传输错误 → JSON 错误体（fail-closed 可观测）。
 fn gateway_error_body(e: &SdkError) -> String {
+    json_error_body(E_GATEWAY_UNAVAILABLE, &e.to_string())
+}
+
+/// 运维侧故障（网关不可达 / 重放闸日志落盘失败）→ 统一形态的 503 错误体。
+fn json_error_body(code: &str, message: &str) -> String {
     serde_json::json!({
-        "error": {"code": E_GATEWAY_UNAVAILABLE, "message": e.to_string()}
+        "error": {"code": code, "message": message}
     })
     .to_string()
 }

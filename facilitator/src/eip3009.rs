@@ -9,7 +9,8 @@
 //! 1. 绑定校验：network / resource / `authorization.to == payTo` / `value ==
 //!    maxAmountRequired` / 时间窗（`validAfter <= now < validBefore`）。
 //! 2. EIP-712 验签（ecrecover，链下密码学）：恢复地址 == `from`，否则拒。
-//! 3. 重放闸：进程内 `(from, eip3009 nonce) -> intent_hash`，同 payload 重放不再摄取。
+//! 3. 重放闸：`(from, eip3009 nonce) -> intent_hash`，同 payload 重放不再摄取。S-33 起
+//!    可持久化（[`Eip3009Bridge::open`]：append-only 日志 + 启动重建，[`crate::replay`]）。
 //! 4. 转投 Meridian 摄取（垫付模型）：facilitator 以自身委托（惰性首用注册）走
 //!    [`SdkClient::pay`]——预算 / 速率 / 撤销 / ZK 证明闸口全部保留，桥不旁路任何
 //!    协议层检查。
@@ -18,17 +19,20 @@
 //!
 //! EIP-3009 的链上执行不在本件（不调 `transferWithAuthorization`）——client 到运营商
 //! 的清算是运营商侧账务（`memo` 指纹 + 原始 payload 留档）；被消费的是运营商自己的
-//! Meridian 预算（垫付），client 信用风险由白标合同承担，不是协议层担保；重放闸进程
-//! 内存态，重启丢失后同一 payload 可能再次摄取（双花的是运营商自身预算，merchant 侧
-//! 按净额结算不受影响）。EIP-712 domain 由配置显式给出，v1 不做域自动发现。
+//! Meridian 预算（垫付），client 信用风险由白标合同承担，不是协议层担保。重放闸：
+//! [`Eip3009Bridge::new`] 仍为进程内存态（v0 兼容）；[`Eip3009Bridge::open`] 启用持久化，
+//! 残余边界（落盘失败窗口 / 日志线性增长）见 [`crate::replay`] 与 TECH_SPEC §6.10。
+//! EIP-712 domain 由配置显式给出，v1 不做域自动发现。
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
+use crate::replay::{JournalState, ReplayJournal};
 use meridian_sdk::x402::{category_from_resource, X402_VERSION};
 use meridian_sdk::{AgentWallet, HttpTransport, PayParams, SdkClient, SdkError};
 
@@ -123,6 +127,9 @@ pub enum BridgeError {
     BadSignature(String),
     /// Meridian 摄取失败：业务拒绝（402）或网关不可达（503 fail-closed）。
     Ingest(SdkError),
+    /// 重放闸日志落盘失败（S-33）→ 503 fail-closed（运维故障不归罪 client；
+    /// 内存表已登记，client 重试命中重放闸不重复摄取）。
+    Journal(String),
 }
 
 impl BridgeError {
@@ -141,6 +148,7 @@ impl BridgeError {
             BridgeError::Binding(m) => format!("binding mismatch: {m}"),
             BridgeError::BadSignature(m) => format!("EIP-3009 signature invalid: {m}"),
             BridgeError::Ingest(e) => format!("meridian ingest failed: {e}"),
+            BridgeError::Journal(m) => format!("replay journal write failed: {m}"),
         }
     }
 }
@@ -193,8 +201,12 @@ pub struct Eip3009Bridge {
     cfg: BridgeConfig,
     /// 惰性首用注册的垫付 client（注册失败下次重试）。
     client: Mutex<Option<BridgeClient>>,
-    /// 重放闸：键 → intent_hash。进程内存态（诚实边界见模块文档）。
+    /// 重放闸：键 → intent_hash（进程内权威；`open` 构造时从日志预载）。
     seen: Mutex<HashMap<ReplayKey, [u8; 32]>>,
+    /// 持久化日志（S-33；`None` = 进程内存态，v0 兼容）。
+    journal: Option<ReplayJournal>,
+    /// 启动重建时跳过的坏行数（可观测，不阻断重启）。
+    skipped_journal_lines: usize,
 }
 
 impl Eip3009Bridge {
@@ -203,7 +215,32 @@ impl Eip3009Bridge {
             cfg,
             client: Mutex::new(None),
             seen: Mutex::new(HashMap::new()),
+            journal: None,
+            skipped_journal_lines: 0,
         }
+    }
+
+    /// 持久化构造（S-33，TECH_SPEC §6.10）：打开（不存在则创建）重放闸日志并重放重建
+    /// 闸表。坏行跳过并计数（[`Self::skipped_journal_lines`]），不阻断重启；日志打开
+    /// 失败（权限 / 磁盘）是启动期配置错误，调用方应立即失败。
+    pub fn open(cfg: BridgeConfig, journal_path: &Path) -> std::io::Result<Self> {
+        let JournalState {
+            entries,
+            skipped,
+            journal,
+        } = ReplayJournal::open(journal_path)?;
+        let mut seen = HashMap::with_capacity(entries.len());
+        for e in &entries {
+            // 后写覆盖先写（与"重放即命中最新 intent_hash"语义一致）。
+            seen.insert((e.from, e.nonce), e.intent_hash);
+        }
+        Ok(Eip3009Bridge {
+            cfg,
+            client: Mutex::new(None),
+            seen: Mutex::new(seen),
+            journal: Some(journal),
+            skipped_journal_lines: skipped,
+        })
     }
 
     pub fn config(&self) -> &BridgeConfig {
@@ -213,6 +250,16 @@ impl Eip3009Bridge {
     /// 重放闸登记数（可观测：重放不再摄取）。
     pub fn seen_len(&self) -> usize {
         self.seen.lock().expect("bridge seen poisoned").len()
+    }
+
+    /// 启动重建时跳过的坏行数（S-33 可观测：崩溃撕裂 / 损坏行）。
+    pub fn skipped_journal_lines(&self) -> usize {
+        self.skipped_journal_lines
+    }
+
+    /// 重放闸是否启用持久化（S-33）。
+    pub fn journal_enabled(&self) -> bool {
+        self.journal.is_some()
     }
 
     /// 完整桥路径：绑定校验 → EIP-712 验签 → 重放闸 → 转投 Meridian 摄取。
@@ -306,12 +353,18 @@ impl Eip3009Bridge {
             bc.client.pay(&params).map_err(BridgeError::Ingest)
         })?;
         // 6. 重放闸登记：仅 accepted 登记（`?` 已上抛传输失败 / 业务拒绝不定局不登记——
-        //    业务拒绝重放会再次摄取并再次被同一闸口拒，不产生净额）。
+        //    业务拒绝重放会再次摄取并再次被同一闸口拒，不产生净额）。先内存（本进程
+        //    重放立即被挡）再落盘（S-33：跨重启去重；落盘失败 → [`BridgeError::Journal`]
+        //    → 调用方 503 fail-closed，见模块文档诚实边界）。
         let ih = receipt.intent_hash;
         self.seen
             .lock()
             .expect("bridge seen poisoned")
             .insert((from, nonce), ih);
+        if let Some(j) = &self.journal {
+            j.append(&from, &nonce, &ih)
+                .map_err(|e| BridgeError::Journal(e.to_string()))?;
+        }
         Ok(ih)
     }
 
@@ -338,7 +391,11 @@ pub fn agent_did(agent_seed: &[u8; 32]) -> [u8; 20] {
     did
 }
 
-/// 注册运营商垫付委托（每次调用新 delegation nonce → 新 delegation_hash，无害幂等）。
+/// 注册运营商垫付委托（同配置幂等——delegation_hash 由种子 + 限额确定性派生）。
+///
+/// 注册后必须 [`SdkClient::sync_nonce`]（S-31，§6.6）：桥重启后客户端从 nonce 0 起，
+/// 与已消耗集冲突（`E_NONCE` 定局拒）——持久化重放闸（S-33）把"重启"变成受支持场景，
+/// nonce 恢复随之接线。首次注册时网关返回 0（无消耗），语义一致。
 fn register_operator(cfg: &BridgeConfig) -> Result<BridgeClient, SdkError> {
     let wallet = AgentWallet::from_seed(cfg.agent_seed);
     let transport = HttpTransport::new(&cfg.gateway_addr, &cfg.gateway_bearer);
@@ -346,6 +403,7 @@ fn register_operator(cfg: &BridgeConfig) -> Result<BridgeClient, SdkError> {
     let owner = SigningKey::from_bytes(&cfg.owner_seed.into())
         .map_err(|e| SdkError::Local(format!("bad operator owner seed: {e}")))?;
     let receipt = client.authorize(&owner, agent_did(&cfg.agent_seed), &cfg.limits)?;
+    client.sync_nonce(&receipt.delegation_hash)?;
     Ok(BridgeClient {
         client,
         delegation_hash: receipt.delegation_hash,
@@ -663,5 +721,61 @@ mod tests {
     fn agent_did_is_seed_deterministic() {
         assert_eq!(agent_did(&[3u8; 32]), agent_did(&[3u8; 32]));
         assert_ne!(agent_did(&[3u8; 32]), agent_did(&[4u8; 32]));
+    }
+
+    #[test]
+    fn open_rebuilds_replay_gate_from_journal_and_counts_bad_lines() {
+        // S-33：预置日志（1 好行 + 1 坏行）→ open 重建闸表（坏行跳过计数，不阻断）。
+        let p = std::env::temp_dir().join(format!(
+            "meridian-fac-bridge-open-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"from":"0x{}","nonce":"0x{}","intentHash":"0x{}"}}
+{{"from":"nothex","nonce":"0x00","intentHash":"0x00"}}"#,
+                hex::encode([0xAB; 20]),
+                hex::encode([0x42; 32]),
+                hex::encode([0x77; 32]),
+            ),
+        )
+        .expect("seed journal");
+
+        // 无参构造：内存态（v0 兼容，无 journal）。
+        let mem = Eip3009Bridge::new(bridge_cfg());
+        assert!(!mem.journal_enabled());
+        assert_eq!(mem.skipped_journal_lines(), 0);
+
+        let b = Eip3009Bridge::open(bridge_cfg(), &p).expect("open");
+        assert!(b.journal_enabled());
+        assert_eq!(b.seen_len(), 1, "坏行跳过，好行入闸表");
+        assert_eq!(b.skipped_journal_lines(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 最小桥配置（open / new 构造用；摄取路径不在此测——e2e 覆盖）。
+    fn bridge_cfg() -> BridgeConfig {
+        BridgeConfig {
+            gateway_addr: "127.0.0.1:1".into(),
+            gateway_bearer: "unused".into(),
+            domain: domain(),
+            agent_seed: [0xAA; 32],
+            owner_seed: [0xBB; 32],
+            limits: meridian_sdk::DelegationLimits {
+                max_per_spend: 100_000,
+                rate_window_secs: 60,
+                rate_max_per_window: 100_000,
+                total_cap: 1_000_000,
+                categories: vec![],
+                not_before: 0,
+                expires_at: u64::MAX,
+            },
+        }
     }
 }
