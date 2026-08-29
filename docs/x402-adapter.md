@@ -1,6 +1,6 @@
 # x402 结算适配层 — 设计稿 v0（S-30 立项）
 
-> 状态：**立项设计稿**（2026-08-29 拍板立项）；S-30a / S-30b 已实现（2026-08-30），S-30c 待排。实现前先升级进 TECH_SPEC（先改 spec 后改码，S-30b = §6.8）。
+> 状态：**立项设计稿**（2026-08-29 拍板立项）；S-30a / S-30b / S-30c 已实现（2026-08-30）。实现前先升级进 TECH_SPEC（先改 spec 后改码，S-30b = §6.8，S-30c = §6.9）。
 > 背景：MASTER_PLAN 计划审读问题 ⑤——x402 竞争窗口缺席。x402（HTTP 402 原生支付，
 > Coinbase 主推）正在成为 agent 按请求付费的事实协议层；Meridian 的正确站位是
 > **x402 的结算后端**（卖水），不是再造一个付费协议。
@@ -83,5 +83,13 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
    （TEMPORARY 管线）不强制——强制点 = ZK 电路断言 4（§5.2）与 Contract 模式链上，
    SDK 测试已固化此边界。测试：sdk 单测 5 + 集成 7（e2e 402→pay→重放全链路真记账 +
    `Aggregator::receipt` 回执可查）。
-3. S-30c：facilitator 参考实现（axum/tokio 允许——merchant 侧不在内核热路径）。
+3. S-30c：facilitator 参考实现（§2.1 server 侧）。**已完成（2026-08-30，TECH_SPEC §6.9）**：
+   `meridian-facilitator` crate——`Facilitator::handle` 纯分发（/healthz 200 / 402 体复用
+   sdk Serialize 类型 / `X-PAYMENT` 解码→scheme/network/resource 绑定校验→网关回执查询），
+   **fail-closed 语义**（回执命中→200 放行 / 404→402 不放行 / 网关不可达→503
+   `E_GATEWAY_UNAVAILABLE`）；std-only 手写 HTTP/1.1（§6.7 gateway 同先例）；bin
+   `meridian-facilitator` 环境变量配置。测试：7 个（handle 纯分发单测 + 三角色真 socket
+   e2e——X402Client(HttpFetch) → facilitator 402 → 真网关 pay 真记账 → 重放 → 回执验证
+   200 / 伪造 intentHash → 402 / 网关宕机 → 503）。**诚实边界**：单资源模型、明文 HTTP
+   （TLS 反代终结）、不产 `X-PAYMENT-RESPONSE`、结算侧不在本件。
 4. EIP-3009 桥视生态牵引再排。

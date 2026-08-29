@@ -42,18 +42,20 @@ pub const PAYMENT_HEADER: &str = "X-PAYMENT";
 // ---------------------------------------------------------------------------
 
 /// 402 响应体（x402 v1：`{x402Version, error?, accepts[], extensions}`）。
-#[derive(Debug, Clone, Deserialize)]
+///
+/// agent 侧消费（Deserialize）、merchant 侧产出（Serialize，S-30c facilitator）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaymentRequired {
     pub x402_version: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
     pub accepts: Vec<PaymentRequirements>,
 }
 
 /// 单条支付要求（camelCase、金额恒字符串——JS BigInt 兼容惯例）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaymentRequirements {
     pub scheme: String,
@@ -62,13 +64,13 @@ pub struct PaymentRequirements {
     pub max_amount_required: String,
     /// 付费资源 URL。
     pub resource: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// 收款方 0x EVM 地址（20B）。
     pub pay_to: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_timeout_seconds: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset: Option<String>,
 }
 
@@ -96,7 +98,7 @@ impl PaymentRequirements {
 // ---------------------------------------------------------------------------
 
 /// merchant 验证载荷：网关 `GET /v1/receipts/{intentHash}`（S-30a）所需的最小集合。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeridianPayload {
     /// 0x 32B hex——merchant 凭它查网关回执。
@@ -106,7 +108,9 @@ pub struct MeridianPayload {
 }
 
 /// `X-PAYMENT` 头的完整 JSON（base64url 编码前）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// agent 侧产出（Serialize）、merchant 侧消费（Deserialize，S-30c facilitator）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaymentPayload {
     pub x402_version: u32,
@@ -446,6 +450,36 @@ pub fn base64url_encode(data: &[u8]) -> String {
     out
 }
 
+/// base64url 解码（宽容 padding——发端无 padding，收端兼容标准编码器带的 `=`）。
+pub fn base64url_decode(s: &str) -> Result<Vec<u8>, SdkError> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for c in s.bytes() {
+        if c == b'=' {
+            break; // padding：余下全按终止处理
+        }
+        let v = val(c).ok_or_else(|| SdkError::Local(format!("bad base64url char {c:#x}")))?;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +502,22 @@ mod tests {
         assert_eq!(base64url_encode(&[0xFB, 0xFF, 0xBF]), "-_-_");
         assert_eq!(base64url_encode(&[0xFB]), "-w");
         assert_eq!(base64url_encode(&[0xFC]), "_A");
+    }
+
+    #[test]
+    fn base64url_decode_roundtrip_and_padding_tolerance() {
+        for plain in ["", "f", "fo", "foo", "foob", "fooba", "foobar"] {
+            let enc = base64url_encode(plain.as_bytes());
+            assert_eq!(base64url_decode(&enc).unwrap(), plain.as_bytes());
+            // 带 padding 的标准编码也能解。
+            let padded = match enc.len() % 4 {
+                2 => format!("{enc}=="),
+                3 => format!("{enc}="),
+                _ => enc.clone(),
+            };
+            assert_eq!(base64url_decode(&padded).unwrap(), plain.as_bytes());
+        }
+        assert!(base64url_decode("a+bc").is_err(), "标准字母表 +/ 不接受");
     }
 
     #[test]
@@ -576,32 +626,6 @@ mod tests {
         assert!(json.contains("\"intentHash\":\"0x"));
         assert!(json.contains("\"seq\":7"));
         assert!(json.contains("\"spendNonce\":3"));
-    }
-
-    /// 测试内自用解码（与 encode 互锁；不导出——merchant 侧用任意标准 base64url 解码器）。
-    fn base64url_decode(s: &str) -> Option<Vec<u8>> {
-        fn val(c: u8) -> Option<u32> {
-            match c {
-                b'A'..=b'Z' => Some((c - b'A') as u32),
-                b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-                b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-                b'-' => Some(62),
-                b'_' => Some(63),
-                _ => None,
-            }
-        }
-        let mut out = Vec::new();
-        let mut buf = 0u32;
-        let mut bits = 0u32;
-        for c in s.bytes() {
-            buf = (buf << 6) | val(c)?;
-            bits += 6;
-            if bits >= 8 {
-                bits -= 8;
-                out.push((buf >> bits) as u8);
-            }
-        }
-        Some(out)
     }
 
     #[test]

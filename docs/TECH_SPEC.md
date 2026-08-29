@@ -613,6 +613,37 @@ reqwest 包装）；base64url 手写实现（RFC 4648 向量锁定，不引新�
 v1 不消费（epoch 结算语义下 merchant 对账走网关查询，facilitator /verify /settle
 是 S-30c 范围）。
 
+### 6.9 x402 适配层 · merchant 参考实现（S-30c，docs/x402-adapter.md §2.1 server 侧）
+
+crate `meridian-facilitator`（`facilitator/`）。x402 缺口清单的 merchant 验证面参考
+实现：**受保护资源服务器**如何接 `meridian-v1` 支付——验证逻辑全部落在"对 Meridian
+网关查回执"，零密码学依赖（S-30a 的查询接口即验证接口）。
+
+**形态决策**：std-only 手写 HTTP/1.1（§6.7 同先例，thread-per-connection、单请求
+close 模式）；axum/tokio 虽允许（merchant 侧不在内核热路径）但不必要——参考实现的
+价值是"最少代码演示集成面"，不是性能。
+
+**分发逻辑（`Facilitator::handle` 纯分发，单测不经 socket）**：
+
+- `GET /healthz` → `200`；其它路径 = 单一受保护资源（v1）。
+- 无 `X-PAYMENT` → `402` + paymentRequirements JSON（`scheme: meridian-v1`，
+  wire 类型复用 `sdk::x402` 的 `PaymentRequired`/`PaymentRequirements` Serialize）。
+- 带 `X-PAYMENT` → base64url 解码（`sdk::x402::base64url_decode`，宽容 padding）→
+  `PaymentPayload` 解析 → 校验 `scheme` / `network` / `resource` 与配置一致 →
+  `HttpTransport::receipt(intent_hash)` 查网关（S-30a）：
+  - `Ok(Some(_))` → `200` 受保护资源内容；
+  - `Ok(None)` → `402`（**404 ≠ 未支付**语义下"不可验证即不放行"——未结算/被拒/
+    过期统一回 402，错误信息区分）；
+  - `Err(_)`（网关传输失败）→ `503` **fail-closed**（验证面不可用绝不放行）。
+
+**诚实边界（v1）**：单资源模型（无路由/鉴权中间件）；明文 HTTP（TLS 反代终结）；
+不产出 `X-PAYMENT-RESPONSE`（对账走网关查询）；结算侧（epoch claim、对账导出）
+不在本件——参考实现演示的是"merchant 怎么接"，不是生产 facilitator。
+
+**三角色 e2e 验收**：X402Client（agent，HttpFetch）→ facilitator `402` → `pay`
+（经真网关 + 真聚合器）→ `X-PAYMENT` 重放 → facilitator 查网关回执 → `200`；
+另验伪造 `intentHash` → `402`。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）

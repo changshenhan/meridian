@@ -38,6 +38,7 @@ pub mod x402;
 
 pub use error::{SdkError, TransportError};
 pub use identity::{owner_did, AgentWallet, DelegationLimits};
+pub use meridian_aggregator::receipt::Receipt;
 pub use pay::{NonceManager, PayParams, PayReceipt, RetryPolicy};
 pub use transport::{DropFirstTransport, InProcessAggregator, ResponseLossTransport, Transport};
 pub use transport_http::HttpTransport;

@@ -840,6 +840,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-facilitator"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "meridian-aggregator",
+ "meridian-core",
+ "meridian-gateway",
+ "meridian-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "meridian-gateway"
 version = "0.1.0"
 dependencies = [
