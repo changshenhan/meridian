@@ -14,7 +14,12 @@
 //!     cargo run --release --manifest-path contracts/rust-smoke/Cargo.toml --bin deploy -- --live
 //!
 //! 目标链通过 RPC 自动识别（chain_id 84532 = Base Sepolia；8453 = Base 主网；1337 = anvil）。
-//! 部署顺序（构造参数依赖）：DSA(无参) → RevocationRegistry(DSA 地址) → BatchSettler(操作者地址)。
+//! 部署顺序（构造参数依赖）：DSA(无参) → RevocationRegistry(DSA 地址) → BatchSettler(操作者+资产)。
+//!
+//! S-28 结算资产：`MERIDIAN_SETTLEMENT_ASSET`（hex 地址）= ERC-20 结算资产（如 USDC）；
+//! 未设置 = 原生 ETH（asset = address(0)，v2 行为）。Base 主网 USDC =
+//! 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913；Base Sepolia =
+//! 0x036CbD53842c5426634e7929541eC2318f3dCF7e。
 //!
 //! 诚实边界：本脚本**不**部署债券、不调用任何业务方法——只部署合同栈并打印后续清单
 //! （注册操作者、质押等留待运营步骤）；`--live` 前请确认私钥安全与目标链正确。
@@ -117,8 +122,22 @@ async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> R
     println!("  ✅ RevocationRegistry → {addr}（tx {}，gas {}）", receipt.transaction_hash, receipt.gas_used);
     deployed.push(("RevocationRegistry", addr));
 
-    let (addr, receipt) = deploy_with_receipt(provider, artifacts[2], &abi_addr(operator_addr), gas_limit).await?;
-    println!("  ✅ BatchSettler       → {addr}（tx {}，gas {}）", receipt.transaction_hash, receipt.gas_used);
+    // S-28：结算资产（MERIDIAN_SETTLEMENT_ASSET，未设 = 原生 ETH）。
+    let asset: Address = match std::env::var("MERIDIAN_SETTLEMENT_ASSET") {
+        Ok(s) if !s.is_empty() => s.parse().context("MERIDIAN_SETTLEMENT_ASSET 非法地址")?,
+        _ => Address::ZERO,
+    };
+
+    let mut settler_args = abi_addr(operator_addr);
+    settler_args.extend_from_slice(&abi_addr(asset));
+    let (addr, receipt) =
+        deploy_with_receipt(provider, artifacts[2], &settler_args, gas_limit).await?;
+    println!(
+        "  ✅ BatchSettler       → {addr}（asset: {}，tx {}，gas {}）",
+        if asset == Address::ZERO { "native ETH".into() } else { format!("{asset}") },
+        receipt.transaction_hash,
+        receipt.gas_used
+    );
     deployed.push(("BatchSettler", addr));
 
     // 事后冒烟：只读调用验证 ABI 对上（不触发任何状态变更）。

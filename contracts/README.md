@@ -1,8 +1,11 @@
-# contracts —— 链上结算层（S-06 最小可跑 → S-11 生产化）
+# contracts —— 链上结算层（S-06 最小可跑 → S-11 生产化 → S-28 资产参数化）
 
 Phase 0 的链上部分：合约在 Anvil 上跑通"注册 → 撤销 → commit → settle → claim →
 challenge"全链路。**S-06 为占位，S-11 生产化完成**：`BatchSettler` v2 完整挑战流
 （fraud proof + 债券罚没 + epoch voided 回滚 + 延迟 claim），撤销根随 commit 锚定上链。
+**S-28 资产参数化**：`BatchSettler(operator, asset)` —— `asset = address(0)` 原生 ETH
+（v2 行为逐字节保留），`asset = USDC/ERC-20` 时 settle `transferFrom` 拉款 / claim 付
+token / void 退款退 token，债券恒为原生 ETH（TECH_SPEC §7）。
 
 ## 目录结构
 
@@ -11,7 +14,8 @@ src/
   DSA.sol              委托注册（Contract 模式 + 撤销锚点来源）
   RevocationRegistry.sol  撤销注册表（仅 owner 可撤销）
   BatchSettler.sol     乐观批量结算 v2（operator 守卫 / commit 锚定撤销根 / settle 存
-                       net[]+结算资金 / 延迟 claim / challenge 完整验证 + 罚没）
+                       net[]+结算资金 / 延迟 claim / challenge 完整验证 + 罚没；
+                       S-28 asset 参数化：原生 ETH / ERC-20）
   IntentHelper.sol     intent_hash 规范编码镜像（与 meridian-core dsa.rs 逐字节一致）
   Merkle.sol           sha256 包含验证器（EMPTY_LEAF + next_power_of_two 树深）
 test/
@@ -20,6 +24,8 @@ test/
   DSA.t.sol              7 个用例
   RevocationRegistry.t.sol 3 个用例
   BatchSettler.t.sol     31 个用例（挑战正反/去重/跨收款人/窗口/罚没账/void 后 claim）
+  MockUSDC.sol           S-28 测试替身（最小 ERC-20，6 decimals + 黑名单，失败返回 false）
+  BatchSettlerUsdc.t.sol 10 个用例（token 模式 settle 拉款/ETH 禁入/claim/双资产退款/黑名单）
   IntentHelper.t.sol     5 个用例（golden vector 对 Rust 计算值）
   Merkle.t.sol           7 个用例（已知向量对 Rust merkle_root）
 rust-smoke/            alloy Anvil 端到端（S-11d：聚合器 + BatchSettler v2 全链路，三条场景）
@@ -56,7 +62,7 @@ S-11 新增两处交叉实现：
 ```bash
 cd contracts
 forge build
-forge test          # 53 用例全绿
+forge test          # 63 用例全绿（31 ETH + 10 USDC + 22 其余）
 cd rust-smoke && cargo run   # anvil 部署 + 全链路（需先 forge build 产出 out/）
 ```
 
@@ -113,6 +119,12 @@ MASTER_PLAN S-10d），CI 降级为可选二道网。
 - **S-11 结算资产 = 原生 ETH**（用户决策 2026-08-17）：bond = `msg.value`；settle 携带
   `msg.value ≥ Σnet` 作结算资金源；claim 付原生 ETH。USDC/ERC-20 推迟 Phase 2——
   `NetInstruction { recipient, amount }` 形状不变，资产置换不动净额结构。
+- **S-28 资产参数化**（2026-08-29，§7 缝兑现）：不做第二个结算合约——单一 `asset`
+  构造参数（`address(0)` = 原生 ETH，v2 行为逐字节保留），欺诈证明机制不分叉（两份
+  fraud-proof 实现是安全负债）。债券与结算资产分离：bond 恒原生 ETH（惩罚质押），
+  token 模式 settle `transferFrom` 拉款 + 强制 `msg.value == 0`（`EthValueInTokenMode`）。
+  token 失败语义：返回 false → `TokenTransferFailed` 包装；revert（真实 USDC 黑名单）→
+  原样冒泡，两态状态均回滚。
 - **延迟 claim**（用户决策）：settle 记 net 列表+根；挑战窗口过后收款人逐条 `claim()`；
   挑战成功 → epoch voided → claims 拒绝。挑战与 claim 严格时间分离 → 挑战成功时无任何
   claim 已付，`settlementFunded` 退款干净。

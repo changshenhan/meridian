@@ -72,10 +72,12 @@ async fn run_smoke() -> Result<()> {
         .await
         .context("anvil_setBalance(owner)")?;
 
-    // 2. 部署三合约（BatchSettler v2 构造参数 = operator 地址）。
+    // 2. 部署三合约（BatchSettler 构造参数 = operator + asset；S-11d 走原生 ETH = address(0)）。
     let dsa_addr = deploy(&provider, "DSA.sol/DSA.json", &[]).await?;
     let reg_addr = deploy(&provider, "RevocationRegistry.sol/RevocationRegistry.json", &abi_addr(dsa_addr)).await?;
-    let settler_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &abi_addr(deployer_addr)).await?;
+    let mut settler_args = abi_addr(deployer_addr);
+    settler_args.extend_from_slice(&abi_addr(Address::ZERO));
+    let settler_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &settler_args).await?;
     let dsa_c = IDSA::new(dsa_addr, &provider);
     let reg_c = IRevocationRegistry::new(reg_addr, &owner_provider);
     let settler = IBatchSettler::new(settler_addr, &provider);

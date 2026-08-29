@@ -27,7 +27,7 @@
 
 | 术语 | 定义 |
 |---|---|
-| `Amount` | `u64`，账本/电路侧金额单位；链上结算按 S-11 用户决策用**原生 ETH**（wei，Solidity `uint256` 承接）。USDC 基础单位（1e-6 USD）推迟 Phase 2（§7 缝） |
+| `Amount` | `u64`，账本/电路侧金额单位；链上结算按 S-11 用户决策用**原生 ETH**（wei，Solidity `uint256` 承接）。USDC（基础单位 1e-6 USD，`uint256` 承接）经 **S-28 资产参数化**路径支持（§7）：`BatchSettler.asset` 构造参数，`address(0)` = 原生 ETH |
 | `Did` | 固定 20 字节（兼容 EVM 地址形态；`did:agent:<hex>` / `did:pkh:eip155:1:<hex>`） |
 | `Delegation` | 主人签发、授予 agent 的委托消费凭证 |
 | `SpendIntent` | agent 单笔消费意图 |
@@ -234,8 +234,10 @@ pub fn check_budget(
 | `ZkCredential` ★ | 本 spec §5 电路 + 聚合器 | 聚合器账本 | 微额、高频、海量 |
 
 两种模式最终都由 `BatchSettler` 净额结算。**S-11 起用原生 ETH**（bond = `msg.value`，
-claim 付原生 ETH；`BatchSettler` v2，见 §7）。USDC/ERC-20 结算推迟 Phase 2（§7 缝：
-接口已按 `recipient + amount` 指令形状设计，资产置换不动净额结构）。
+claim 付原生 ETH；`BatchSettler` v2，见 §7）。**S-28 资产参数化**（§7）：
+`BatchSettler(operator, asset)`——`asset = address(0)` 即 v2 原生 ETH 行为（逐字节保留）；
+`asset = USDC/ERC-20` 时结算资金/claim/退款走 token，**债券仍原生 ETH**（惩罚质押与结算
+资产分离，不引入 token 质押的重入面）——`recipient + amount` 净额指令结构不变。
 
 ---
 
@@ -429,7 +431,9 @@ pub trait Ingest {
 1. `commit`：运营者质押债券（`msg.value`）+ 锚定承诺根与撤销根，一次性；
 2. `settle`：运营者提交 `net[]` + `nettingRoot`（链式 keccak 校验），**同笔携带 ≥ Σnet
    的结算资金**（`settlementFunded` 存入；挑战成功时全额退运营者，多付部分留在合同视作
-   捐赠）；
+   捐赠）。**资产差异（S-28）**：原生 ETH 模式资金 = `msg.value`；ERC-20 模式 = settle
+   时 `transferFrom` 从运营者拉款（需事先 approve），且强制 `msg.value == 0`（防 ETH
+   误入卡死）；
 3. 挑战窗口（6h）：任何人可提交欺诈证明（§6.5）；挑战成功 → epoch `voided`；
 4. `claim`：窗口过后收款人**逐条**领取原生 ETH。挑战与 claim 严格时间分离 → 挑战成功时
    无任何 claim 已付，退款干净。
@@ -512,7 +516,8 @@ contract RevocationRegistry {
     error NotOwner(); error NotRegistered();
 }
 
-// BatchSettler.sol —— 乐观批量结算（S-11 v2 生产化：operator 守卫 + 延迟 claim + 完整挑战流）
+// BatchSettler.sol —— 乐观批量结算（S-11 v2 生产化：operator 守卫 + 延迟 claim + 完整挑战流；
+//                      S-28 资产参数化：asset = address(0) 原生 ETH / ERC-20（如 USDC））
 contract BatchSettler {
     struct NetInstruction { address recipient; uint256 amount; }
     struct IntentProof {
@@ -530,14 +535,18 @@ contract BatchSettler {
     event Claimed(uint256 indexed epochId, address indexed recipient, uint256 amount);
 
     address public immutable operator;                 // 唯一运营者（onlyOperator 守卫）
+    address public immutable asset;                    // S-28：address(0) = 原生 ETH（v2 行为）；
+                                                       //        否则 = ERC-20 结算资产（如 USDC）
     uint256 public constant CHALLENGE_WINDOW = 6 hours;
     uint256 public constant MAX_INTENTS_PER_CHALLENGE = 32;
+
+    constructor(address operator_, address asset_);    // bond 恒为原生 ETH（两模式相同）
 
     function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot)
         external payable onlyOperator;                // 质押债券（msg.value）+ 锚定撤销根，一次性
     function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot)
         external payable onlyOperator;                // keccak(net) 校验 + 存 net[] + msg.value ≥ Σnet
-    function claim(uint256 epochId, uint256 netIndex) external;  // 窗口后逐条领原生 ETH；voided 拒
+    function claim(uint256 epochId, uint256 netIndex) external;  // 窗口后逐条领取结算资产（ETH/token）；voided 拒
     function challenge(uint256 epochId, FraudProof calldata fp) external; // 窗口内完整验证欺诈证明
 
     error EpochAlreadyCommitted(uint256); error EpochAlreadySettled(uint256);
@@ -546,6 +555,7 @@ contract BatchSettler {
     error AlreadyClaimed(uint256,uint256); error NetIndexOutOfBounds(uint256,uint256);
     error TooManyIntents(); error DuplicateIntent(); error BadInclusionProof(); error NotFraud();
     error InsufficientSettlementFunding(); error BadFraudKind(); error NotOperator();
+    error TokenTransferFailed(); error EthValueInTokenMode();   // S-28 资产参数化
 }
 ```
 
@@ -556,8 +566,13 @@ contract BatchSettler {
 `sha256` 预编译，双向验收）。owner 签名强制低位 s（`s > n/2` → `revert HighS`）。
 
 - 部署底座：Base（主网 Phase 2 起）；测试：Anvil 本地链 + Base Sepolia。
-- **S-11 结算资产 = 原生 ETH**（bond = `msg.value`；claim 付原生 ETH）；USDC/ERC-20 结算
-  推迟 Phase 2——`NetInstruction { recipient, amount }` 指令形状不变，资产置换不动净额结构。
+- **S-11 结算资产 = 原生 ETH**（bond = `msg.value`；claim 付原生 ETH）；**S-28 资产参数化
+  落地 ERC-20 结算**——`BatchSettler(operator, asset)`：`asset = address(0)` 逐字节保留 v2
+  行为，`asset = USDC` 时 settle `transferFrom` 拉款 / claim 付 token / void 退款退 token
+  （bond 仍原生 ETH），强制 token 模式 `msg.value == 0`（`EthValueInTokenMode`）；
+  `NetInstruction { recipient, amount }` 指令形状不变，资产置换不动净额结构。欺诈证明机制
+  单一实现（不因资产模式分叉）。Base 主网 USDC = `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`，
+  Base Sepolia USDC = `0x036CbD53842c5426634e7929541eC2318f3dCF7e`（部署时核对，勿硬编码进合约）。
 - S-11 生产化：BatchSettler 完整 fraud-proof（漏单/低付，sound+有界）+ 债券罚没 +
   epoch voided 回滚 + 延迟 claim；撤销事件 1 epoch 内进入聚合器撤销根（sha256 sparse root，
   随 commit 上链）；真实 sha256 Merkle 已替换占位（`IntentHelper.sol`/`Merkle.sol` 交叉实现）。

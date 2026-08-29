@@ -72,7 +72,9 @@ async fn run_m1() -> Result<()> {
     let dsa_addr = deploy(&provider, "DSA.sol/DSA.json", &[]).await?;
     // RevocationRegistry 部署保持合同栈完整（本 demo 不触发撤销路径，S-11d 场景2 已覆盖）。
     let _reg_addr = deploy(&provider, "RevocationRegistry.sol/RevocationRegistry.json", &abi_addr(dsa_addr)).await?;
-    let settler_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &abi_addr(deployer_addr)).await?;
+    let mut settler_args = abi_addr(deployer_addr);
+    settler_args.extend_from_slice(&abi_addr(Address::ZERO));
+    let settler_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &settler_args).await?;
     let dsa_c = IDSA::new(dsa_addr, &provider);
     let settler = IBatchSettler::new(settler_addr, &provider);
 

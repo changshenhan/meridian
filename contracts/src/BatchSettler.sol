@@ -16,7 +16,18 @@ import {Merkle} from "./Merkle.sol";
 ///        settlementFunded（= Σnet）全额退运营者。
 ///      · challenge 完整验证欺诈证明（漏单 kind=1 / 低付 kind=2，sha256 包含证明）→
 ///        债券罚没给挑战者、退款给运营者、整 epoch voided（后续 claim 拒绝）。
-///      · USDC/ERC-20 是 Phase 2 缝（TECH_SPEC §7 已写 USDC；S-11 按用户决策用原生 ETH）。
+///      · S-28 资产参数化：`asset` 构造参数，`address(0)` = 原生 ETH（v2 行为逐字节保留），
+///        `asset = USDC/ERC-20` 时结算资金（settle `transferFrom`）/ claim / void 退款走 token，
+///        债券恒为原生 ETH（惩罚质押与结算资产分离）。token 模式强制 `msg.value == 0`。
+///        欺诈证明机制单一实现，不因资产模式分叉（TECH_SPEC §7）。
+
+/// S-28：最小 ERC-20 接口（结算资产路径；仅依赖 transfer/transferFrom 的返回值检查，
+///       与 USDC 的非标准 `transferAndCall` 等扩展无关）。
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
 contract BatchSettler {
     struct NetInstruction {
         address recipient;
@@ -91,6 +102,9 @@ contract BatchSettler {
     error InsufficientSettlementFunding();
     error BadFraudKind();
     error NotOperator();
+    // S-28 资产参数化。
+    error TokenTransferFailed();
+    error EthValueInTokenMode();
 
     /// 挑战窗口：settle 后 6 小时内可挑战（TECH_SPEC §6.5）。
     uint256 public constant CHALLENGE_WINDOW = 6 hours;
@@ -100,11 +114,15 @@ contract BatchSettler {
 
     /// 唯一结算运营者：commit/settle 的唯一合法调用者（S-11 防 griefing）。
     address public immutable operator;
+    /// S-28 结算资产：`address(0)` = 原生 ETH（v2 行为）；否则为 ERC-20（如 USDC）。
+    /// 债券（commit 的 `msg.value`）恒为原生 ETH，与结算资产无关。
+    address public immutable asset;
 
     mapping(uint256 => Epoch) public epochs;
 
-    constructor(address operator_) {
+    constructor(address operator_, address asset_) {
         operator = operator_;
+        asset = asset_;
     }
 
     modifier onlyOperator() {
@@ -141,7 +159,16 @@ contract BatchSettler {
         if (ep.settled) revert EpochAlreadySettled(epochId);
         if (nettingRoot != keccak256(abi.encode(net))) revert WrongNettingRoot();
         uint256 total = _sumNet(net);
-        if (msg.value < total) revert InsufficientSettlementFunding();
+        // S-28 结算资金来源：ETH 模式 = msg.value；token 模式 = 从运营者 transferFrom 拉款
+        //（需事先 approve），且禁止 ETH 随单进入（防卡死）。失败整笔回滚，无中间态。
+        if (asset == address(0)) {
+            if (msg.value < total) revert InsufficientSettlementFunding();
+        } else {
+            if (msg.value != 0) revert EthValueInTokenMode();
+            if (!IERC20(asset).transferFrom(msg.sender, address(this), total)) {
+                revert TokenTransferFailed();
+            }
+        }
 
         ep.settled = true;
         ep.nettingRoot = nettingRoot;
@@ -158,14 +185,20 @@ contract BatchSettler {
         Epoch storage ep = epochs[epochId];
         if (!ep.settled) revert EpochUnknown(epochId);
         if (ep.voided) revert EpochVoided(epochId);
-        if (block.timestamp <= uint256(ep.settledAt) + CHALLENGE_WINDOW) revert ChallengeWindowOpen();
+        if (block.timestamp <= uint256(ep.settledAt) + CHALLENGE_WINDOW) {
+            revert ChallengeWindowOpen();
+        }
         if (netIndex >= ep.net.length) revert NetIndexOutOfBounds(epochId, netIndex);
         if (ep.claimed[netIndex]) revert AlreadyClaimed(epochId, netIndex);
 
         ep.claimed[netIndex] = true;
         NetInstruction memory ni = ep.net[netIndex];
-        (bool ok, ) = payable(ni.recipient).call{value: ni.amount}("");
-        require(ok, "claim transfer failed");
+        if (asset == address(0)) {
+            (bool ok,) = payable(ni.recipient).call{value: ni.amount}("");
+            require(ok, "claim transfer failed");
+        } else {
+            if (!IERC20(asset).transfer(ni.recipient, ni.amount)) revert TokenTransferFailed();
+        }
         emit Claimed(epochId, ni.recipient, ni.amount);
     }
 
@@ -175,7 +208,9 @@ contract BatchSettler {
         Epoch storage ep = epochs[epochId];
         if (!ep.settled) revert EpochUnknown(epochId);
         if (ep.challenged || ep.voided) revert EpochAlreadyChallenged(epochId);
-        if (block.timestamp > uint256(ep.settledAt) + CHALLENGE_WINDOW) revert ChallengeWindowClosed();
+        if (block.timestamp > uint256(ep.settledAt) + CHALLENGE_WINDOW) {
+            revert ChallengeWindowClosed();
+        }
         if (fp.intents.length == 0 || fp.intents.length > MAX_INTENTS_PER_CHALLENGE) {
             revert TooManyIntents();
         }
@@ -186,7 +221,7 @@ contract BatchSettler {
             bytes32 ih = _intentHash(fp.intents[0]);
             _verifyInclusion(ep, fp.intents[0], ih);
             address recipient = address(fp.intents[0].recipient);
-            (bool found, ) = _indexOfRecipient(ep, recipient);
+            (bool found,) = _indexOfRecipient(ep, recipient);
             if (found) revert NotFraud();
         } else if (fp.kind == 2) {
             // 低付：同一收款人的已提交意图子集，uint256 和 > net[target].amount。
@@ -221,11 +256,16 @@ contract BatchSettler {
         uint256 refund = ep.settlementFunded;
         ep.bondedAmount = 0;
         ep.settlementFunded = 0;
-        (bool okBond, ) = payable(msg.sender).call{value: bond}("");
+        (bool okBond,) = payable(msg.sender).call{value: bond}("");
         require(okBond, "bond transfer failed");
         if (refund > 0) {
-            (bool okRefund, ) = payable(operator).call{value: refund}("");
-            require(okRefund, "refund transfer failed");
+            // S-28：settlementFunded 退款按结算资产原路退回（ETH 或 token）。
+            if (asset == address(0)) {
+                (bool okRefund,) = payable(operator).call{value: refund}("");
+                require(okRefund, "refund transfer failed");
+            } else {
+                if (!IERC20(asset).transfer(operator, refund)) revert TokenTransferFailed();
+            }
         }
         emit ChallengeSucceeded(epochId, msg.sender, fp.kind);
     }

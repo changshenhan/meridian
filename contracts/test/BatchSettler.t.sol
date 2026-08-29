@@ -18,8 +18,8 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
     bytes32 internal constant REVOCATION_ROOT = keccak256("revocation-root");
 
     function setUp() public {
-        // operator = 测试合约自身（可直呼 commit/settle）。
-        bs = new BatchSettler(address(this));
+        // operator = 测试合约自身（可直呼 commit/settle）。asset = address(0) → 原生 ETH（v2 行为）。
+        bs = new BatchSettler(address(this), address(0));
     }
 
     /// 测试合约作为 operator 需能接收 void 时的结算资金退款。
@@ -68,7 +68,9 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
     }
 
     function _sum(BatchSettler.NetInstruction[] memory net) internal pure returns (uint256 s) {
-        for (uint256 i = 0; i < net.length; i++) s += net[i].amount;
+        for (uint256 i = 0; i < net.length; i++) {
+            s += net[i].amount;
+        }
     }
 
     /// 解构 `epochs()` 10 元组为命名变量。
@@ -88,8 +90,18 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
             bool voided
         )
     {
-        (commitmentRoot, revocationRoot, bondedAmount, settlementFunded, settledAt, nettingRoot,
-            committed, settled, challenged, voided) = bs.epochs(epochId);
+        (
+            commitmentRoot,
+            revocationRoot,
+            bondedAmount,
+            settlementFunded,
+            settledAt,
+            nettingRoot,
+            committed,
+            settled,
+            challenged,
+            voided
+        ) = bs.epochs(epochId);
     }
 
     // ------------------------------------------------------------------ commit / operator
@@ -107,8 +119,12 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         emit BatchSettler.Commit(EPOCH, root, REVOCATION_ROOT, BOND);
         bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
 
-        (bytes32 commitmentRoot, bytes32 revocationRoot, uint256 bondedAmount, , , ,
-            bool committed, , , ) = _epochView(EPOCH);
+        (
+            bytes32 commitmentRoot,
+            bytes32 revocationRoot,
+            uint256 bondedAmount,,,,
+            bool committed,,,
+        ) = _epochView(EPOCH);
         assertEq(commitmentRoot, root);
         assertEq(revocationRoot, REVOCATION_ROOT);
         assertEq(bondedAmount, BOND);
@@ -140,8 +156,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         emit BatchSettler.Settled(EPOCH, nettingRoot, 2);
         _settleWith(n);
 
-        (, , , , , , bool committed, bool settled, bool challenged, bool voided) =
-            _epochView(EPOCH);
+        (,,,,,, bool committed, bool settled, bool challenged, bool voided) = _epochView(EPOCH);
         assertTrue(settled);
     }
 
@@ -246,8 +261,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
 
         assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond to challenger");
         assertEq(address(this).balance, operatorBefore, "no settlement fund to refund (net=0)");
-        (, , , , , , bool committed, bool settled, bool challenged, bool voided) =
-            _epochView(EPOCH);
+        (,,,,,, bool committed, bool settled, bool challenged, bool voided) = _epochView(EPOCH);
         assertTrue(settled);
         assertTrue(challenged);
         assertTrue(voided);
@@ -332,8 +346,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
 
         vm.prank(CHALLENGER);
         bs.challenge(EPOCH, fp);
-        (, , , , , , bool committed, bool settled, bool challenged, bool voided) =
-            _epochView(EPOCH);
+        (,,,,,, bool committed, bool settled, bool challenged, bool voided) = _epochView(EPOCH);
         assertTrue(settled);
         assertTrue(challenged);
         assertTrue(voided);
@@ -364,8 +377,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
 
         vm.prank(CHALLENGER);
         bs.challenge(EPOCH, fp);
-        (, , , , , , bool committed, bool settled, bool challenged, bool voided) =
-            _epochView(EPOCH);
+        (,,,,,, bool committed, bool settled, bool challenged, bool voided) = _epochView(EPOCH);
         assertTrue(settled);
         assertTrue(challenged);
         assertTrue(voided);
