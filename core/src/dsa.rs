@@ -204,8 +204,10 @@ pub fn zk_intent_hash(
     sha256(&preimage)
 }
 
-/// 撤销稀疏 Merkle 树索引：`delegation_hash[0..4]` LE 转 u32。
+/// 撤销稀疏 Merkle 树索引（**电路侧原型派生**）：`delegation_hash[0..4]` LE 转 u32。
 /// 与电路 `revocation_index` / gen-witness 建树用同一派生（S-09）。
+/// 聚合器侧 `RevocationSet` 自 S-34 起改用全 256-bit 索引（TECH_SPEC §4.6）——本函数
+/// 仅为电路派生保留（交叉实现契约，depth ≤ 32 时是 256-bit 索引的低 32 位）。
 pub fn revocation_index(delegation_hash: [u8; 32]) -> u32 {
     u32::from_le_bytes([
         delegation_hash[0],

@@ -84,6 +84,10 @@ fi
 
 if want perf; then
     step "6/10 性能门禁 (release, --fail-over 15 抓灾难性回归)"
+    # 混合架构坑（2026-08-30 实测，i9-14900HX 8P+16E）：后台/headless 会话跑本脚本会被
+    # Windows 11 调度到 E-core（EcoQoS）——整数型指标假回归 -60~70%（SHA-NI 硬件加速类
+    # 不受影响，易误判成"代码回归"）。clocks/亲和性/内存均正常，唯有钉 P-core 线程
+    # （0-15）后回到基线 ±10%。规避：从前台交互 shell 跑，或把进程树亲和性钉 0-15。
     run "perf gate" cargo run --release -p meridian-bench --bin gate -- --fail-over 15
 else
     skip "perf"

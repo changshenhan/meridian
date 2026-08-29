@@ -51,8 +51,11 @@
 
 ## 4. 已知自报问题（供审计交叉验证）
 
-- 原型级撤销树碰撞属性（两委托同 32-bit 前缀共享撤销叶子）——TECH_SPEC §5.3 已记，
-  真实树在 Phase 2。
+- 撤销树碰撞属性——**聚合器侧已收口（S-34，2026-08-30）**：链上锚定根（`RevocationSet::
+  sparse_root`）改全 256-bit 索引（TECH_SPEC §4.6），相异 delegation_hash 必相异叶。
+  **电路侧仍为原型级 32-bit 前缀索引**（Pedersen 树，TECH_SPEC §5.3）——收口需 Noir 电路
+  改动 + 重 prove（真 ZK 集成 Phase 2）；当前生产摄取路径 `FormatVerifier`（TEMPORARY）
+  从不读 `pi.revocation_root`，碰撞不进入现行验证面。
 - 超付不可证（需完备性）——设计上接受，出界记录见 TECH_SPEC §6.5。
 - challenge 无押金（v1 反垃圾靠 gas 成本）——已知垃圾挑战向量，评估报告应给意见。
 

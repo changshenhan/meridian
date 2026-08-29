@@ -213,18 +213,29 @@ pub fn check_budget(
 - **电路侧**：撤销非成员证明——`delegation_hash` 对应叶子 = `EMPTY`（非成员），即未撤销。
   树深 32，索引 = `revocation_index(dh)` = `delegation_hash[0..4]` LE，叶子 = EMPTY(0)
   （Pedersen sparse merkle，§5.2 断言 8）。
-- **聚合器侧（S-11 新增）**：`RevocationSet`（`aggregator/src/revocation.rs`）收集被撤销委托
-  的 `delegation_hash`，`sparse_root()` 压实成 32B 根（**sha256** sparse merkle，索引 =
-  `revocation_index(dh)`，叶子 = dh，空子树根表 `empty_roots[k]=sha256(empty_roots[k-1]‖
-  empty_roots[k-1])`，O(32·|revoked|)；空根 golden `10ffc30c…304d` Python 交叉 + 朴素全树
-  交叉验证）。撤销事件流：链上 revoke → 运营者调 `Aggregator::revoke(dh)`（WAL 追加
+- **聚合器侧（S-11 新增，S-34 收口碰撞）**：`RevocationSet`（`aggregator/src/revocation.rs`）
+  收集被撤销委托的 `delegation_hash`，`sparse_root()` 压实成 32B 根（**sha256** sparse merkle，
+  叶子 = dh，空子树根表 `empty_roots[k]=sha256(empty_roots[k-1]‖empty_roots[k-1])`）。
+  **树深 256，索引 = `dh` 全 32 字节的 LE u256**（位 k = `(dh[k/8] >> (k%8)) & 1`；第 d 层
+  节点索引 = 索引右移 d）——depth ≤ 32 时与电路派生 `revocation_index(dh)`（低 32 位）逐位
+  一致，是它的纯扩位推广，非换派生。**S-11 原型版用 32-bit 前缀索引**（`delegation_hash[0..4]`
+  LE）：两委托同前缀共享叶子、后写覆盖先写，锚定根只承诺其一（audit-scope §4 自报项）。
+  S-34（2026-08-30）改为全 256-bit 索引：`delegation_hash` 整体即索引，**相异 dh 必相异叶**，
+  碰撞面收口（`delegation_hash` 本就是 ecrecover 域内的 256-bit 抗碰摘要）。代价：`sparse_root`
+  从 O(32·|revoked|) 变 O(256·|revoked|)——只在密封（每 epoch 一次）调用，撤销又是稀有事件，
+  热路径（摄取/submit 闸口）不受影响（闸口是集合精确查找，与树无关）。空根 golden
+  `9a596033…4b910`（depth 256）Python 交叉 + 朴素全树交叉验证 + **前缀碰撞回归
+  （同 `dh[0..4]` 异 `dh` 双撤销：根必须反映两叶，S-34 固化）**。撤销事件流：链上 revoke → 运营者调 `Aggregator::revoke(dh)`（WAL 追加
   `Revoke` 记录后入集，崩溃可重放重建）→ `submit()` 在注册表查找后立即查集，已撤销委托
   新意图一律 `E_REVOKED` 拒（最廉价闸口，不耗 nonce/窗口槽）→ 撤销根随**下个密封 epoch**
   的 `ChainPublisher::commit` 上链（S-11 验收：1 epoch 内进入撤销根）。
 - 撤销即时性：聚合器拉取注册表延迟 ≤ 1 个 epoch；对"已撤销仍消费"的窗口期，用债券惩罚运营者（§6.5）。
-- **诚实缝（非活跃错配，S-11 记录在案）**：聚合器撤销根是 **sha256** 树，电路根是
-  **Pedersen** 树——内核用 `FormatVerifier` 从不读 `pi.revocation_root`，真正的 `E_REVOKED`
-  闸口在 `submit()`；真对齐（聚合器算 Pedersen 树）推迟到真 ZK 集成（revocation.rs + 本行）。
+- **诚实缝（非活跃错配，S-11 记录在案；S-34 收窄）**：聚合器撤销根是 **sha256 + 256-bit 索引**
+  树，电路根是 **Pedersen + 32-bit 索引** 树——索引派生与哈希函数均不一致，内核用
+  `FormatVerifier` 从不读 `pi.revocation_root`，真正的 `E_REVOKED` 闸口在 `submit()`。
+  S-34 已把聚合器侧的**碰撞属性**收口（256-bit 索引，见上）；两侧真对齐（聚合器算
+  Pedersen 树 + 电路改用全宽索引）仍是 Noir 电路改动，推迟到真 ZK 集成（revocation.rs +
+  本行）。
 
 ### 4.7 两种模式映射（实现同一接口）
 
@@ -314,7 +325,8 @@ expires_at / revocation_root / now）为准（接口已设计成"返回即登记
 - **撤销树**：内联 `compute_merkle_root`（`std::merkle` 已移出 Noir 1.0 stdlib，merkle_insert
   官方模式 + `std::hash::pedersen_hash`），深度 32，叶子=EMPTY(0)，index =
   `delegation_hash[0..4]` LE。原型级碰撞属性（两 delegation 同 32-bit 前缀共享叶子→撤销共享）
-  ——真实树 S-11 对接 RevocationRegistry 时再设计。
+  ——**电路侧保留此派生**（S-09 锁定工具链不动）；聚合器侧链上锚定根已在 S-34 收口为
+  256-bit 索引（§4.6），电路侧收口（全宽索引 + 重 prove）随真 ZK 集成 Phase 2。
 - **EVM 验证器（Phase 4 复用）**：`bb write_solidity_verifier -t evm-no-zk -k vk -o UltraVerifier.sol`
   编译 Solidity 验证器（CI 产物 `circuits/artifacts/UltraVerifier.sol`）。**Flavor 一致性
   约束**：bb 6.0.0-nightly 的 `CircuitWriteSolidityVerifier` 硬编码 `UltraKeccakFlavor::
