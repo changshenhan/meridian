@@ -124,6 +124,13 @@ fn compare_table(
     // （S-14b 核对时修正：此前只查负 delta，b7_wall_ms 变慢永远不触发 → 该指标的门禁
     // 形同虚设。B12 同向：RSS 涨 >3% 即红，TECH_SPEC §8.2）。
     const LOWER_IS_BETTER: &[&str] = &["agg_kernel_b7_wall_ms", "agg_kernel_rss_mib"];
+    // 观测-only 指标（照常记录/打印，不参与回归判定）：PoC ② 原型 ingest 基准
+    // （S-08a，"原型留作历史证据"）。共享 CI runner 上可**稳定**假报回归——CI 首跑
+    // 实证：同 job 内 record 与 compare 隔数分钟，复测两轮 -16.67% / -16.48% 全过
+    // 复测确认门槛，而生产内核同热路径指标 agg_kernel_ingest_ops 同 job 仅 -0.28%
+    // 且本地参考机该原型指标从不越线。B5 吞吐验收走 agg_sim / poc_aggregator，
+    // 生产热路径回归由 agg_kernel_ingest_ops / b7 / B8 / B11 覆盖。
+    const GATE_EXEMPT: &[&str] = &["aggregator_ingest_ops"];
     let mut regressions: Vec<String> = Vec::new();
     for (name, base) in &baseline.metrics {
         let cur = metrics.get(name).copied().unwrap_or(0.0);
@@ -133,6 +140,9 @@ fn compare_table(
             0.0
         };
         println!("{:<28} {:>14.1} {:>14.1} {:>9.2}%", name, base, cur, delta);
+        if GATE_EXEMPT.contains(&name.as_str()) {
+            continue;
+        }
         let threshold = metric_thresholds
             .iter()
             .find(|(n, _)| *n == name.as_str())
