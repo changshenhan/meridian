@@ -956,14 +956,18 @@ contract BatchSettler {
 - **1% 精准基线**（人工，受控参考机）：`gate -- --record` 更新 baseline 后
   `gate -- --fail-over 1`。同机多次 run 噪声 ±6%（§8.2），低于 15% 门禁，不误拒。
 - **短突发测量抗噪（S-35b，2026-08-30）**：`agg_kernel_ingest_ops` 的测量窗是 32×200=
-  6400 笔 ≈ 0.2 s 短突发，单次采样对共享 runner 的调度/邻居噪声极敏感——CI 实证两次：
+  6400 笔 ≈ 0.2 s 短突发，单次采样对共享 runner 的调度/邻居噪声极敏感——CI 实证三次：
   gate 原型指标 `aggregator_ingest_ops` 在 CI 首跑同 job 内 record vs compare 两轮
   -16.67%/-16.48%（当时以 GATE_EXEMPT 豁免）；S-35 推送后同签名落在生产指标
   `agg_kernel_ingest_ops`（-16.37%/-17.08% 两轮"确认"，重跑即绿——CI 的 baseline 是
   同一 run 里同一份代码 `--record` 现录的，同码两跑差 17% 只能是 runner 噪声而非代码
-  回归）。收口：该指标改为**同一 fixture 复测 5 轮取中位**（S-14b 对 `intent_verify_ops`
-  的 9 轮中位同法），把 0.2 s 突发噪声中位化；`--record` 与 compare 走同一测量函数，
-  口径不变。
+  回归）；S-35b 第一版收口（同一 fixture 复测 5 轮取中位，S-14b 的 9 轮中位同法）只
+  治住了**突发内**噪声，同 job 仍复现 -19.88%/-19.75%（baseline 本身跨 run 也在
+  26.9k~30.9k 摆 13%——噪声是 record/compare **阶段级**漂移，复测轮数治不了）。
+  最终收口：**阈值必须高于噪声地板**。CI（`ci.yml`）传 `--ci` 给 gate：该指标阈值放宽
+  到 25%（噪声地板 ~±20% 之上，仍抓灾难性回归）；本地参考机（P-core 钉定，run-to-run
+  实测 ±6%）不传 `--ci`，15%/1% 精度口径不变。5 轮中位保留（治突发内噪声，与阶段级
+  漂移正交）。
 - baseline.json 入库；`scripts/verify.sh` 必须通过全量套件。
 - **S-11d 链上端到端（verify.sh 9/9）**：`rust-smoke`（`contracts/rust-smoke`，独立
   workspace）在一条 anvil 会话内跑三场景——① 快乐路径：注册→submit→密封结算→

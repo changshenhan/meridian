@@ -36,10 +36,13 @@ jobs:
       # 受控参考平台上手动执行：
       #   cargo run --release -p meridian-bench --bin gate -- --record
       #   cargo run --release -p meridian-bench --bin gate -- --fail-over 1
+      # S-35b：--ci 追加共享 runner 噪声地板阈值（agg_kernel_ingest_ops 25%）——
+      # 6400 笔 ≈ 0.2s 短突发指标的 record/compare 阶段级漂移实测 -16~20%，15% 低于
+      # 噪声地板等于抛硬币（TECH_SPEC §8.3）。本地参考机不传 --ci，精度口径不变。
       - name: perf gate (release)
         run: |
           cargo run --release -p meridian-bench --bin gate -- --record
-          cargo run --release -p meridian-bench --bin gate -- --fail-over 15
+          cargo run --release -p meridian-bench --bin gate -- --ci --fail-over 15
 
       # S-10 聚合器内核硬断言回归（确定性，机器无关）：B8 热路径零分配 + B11 确定性
       # （同 seed 两跑 lattice 输出哈希一致）。全量 B5/B6/B7/B10 验收在参考机跑

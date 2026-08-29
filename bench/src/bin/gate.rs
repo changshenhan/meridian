@@ -173,8 +173,25 @@ fn compare_table(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let record = args.iter().any(|a| a == "--record");
-    // 每指标阈值始终生效（RSS 3%）；显式 --fail-over 只作用于无覆盖的指标（timing 类）。
-    let metric_thresholds: &[(&str, f64)] = METRIC_THRESHOLDS;
+    // --ci（ci.yml 专用）：追加共享 runner 的噪声地板阈值。0.2 s 短突发 ingest 指标
+    // （32×200 = 6400 笔）的 record/compare 阶段级漂移实测 -16~20%（S-35/S-35b 两次
+    // CI 实证；豁免的原型指标 CI 首跑同签名 -16.67%/-16.48%），15% 阈值低于噪声地板
+    // → CI 上放宽到 25%（仍抓灾难性回归）。本地参考机（P-core 钉定，run-to-run ±6%）
+    // 不传 --ci，精度口径不变（TECH_SPEC §8.3）。
+    const METRIC_THRESHOLDS_CI: &[(&str, f64)] = &[("agg_kernel_ingest_ops", 25.0)];
+    let ci = args.iter().any(|a| a == "--ci");
+    let metric_thresholds: Vec<(&str, f64)> = if ci {
+        METRIC_THRESHOLDS
+            .iter()
+            .chain(METRIC_THRESHOLDS_CI.iter())
+            .copied()
+            .collect()
+    } else {
+        METRIC_THRESHOLDS.to_vec()
+    };
+    // 每指标阈值始终生效（RSS 3%；--ci 另加 CI 噪声地板项）；显式 --fail-over 只作用于
+    // 无覆盖的指标（timing 类）。
+    let metric_thresholds: &[(&str, f64)] = &metric_thresholds;
     let fail_over = match args.iter().position(|a| a == "--fail-over") {
         Some(pos) => args
             .get(pos + 1)
