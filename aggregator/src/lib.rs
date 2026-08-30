@@ -19,6 +19,7 @@ pub mod hist;
 pub mod ingest;
 pub mod lattice;
 pub mod merkle;
+pub mod noir_pedersen;
 pub mod proof;
 pub mod receipt;
 pub mod revocation;

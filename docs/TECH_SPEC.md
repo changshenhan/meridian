@@ -216,31 +216,59 @@ pub fn check_budget(
   序**。电路内索引不落单个 Field（BN254 域仅 ~254 bit，容不下 256-bit 索引；
   `Field::to_le_bits::<256>` 直接不可满足，S-36 实测），位由字节现场派生（`compute_merkle_root`
   直收 `[u8;32]` 索引字节，位 k = `(dh[k/8] >> (k%8)) & 1`），无截断、无 mod-p 碰撞可乘。
-- **聚合器侧（S-11 新增，S-34 收口碰撞）**：`RevocationSet`（`aggregator/src/revocation.rs`）
-  收集被撤销委托的 `delegation_hash`，`sparse_root()` 压实成 32B 根（**sha256** sparse merkle，
-  叶子 = dh，空子树根表 `empty_roots[k]=sha256(empty_roots[k-1]‖empty_roots[k-1])`）。
+- **聚合器侧（S-11 新增，S-34 收口碰撞，S-41 哈希对齐电路）**：`RevocationSet`（`aggregator/src/revocation.rs`）
+  收集被撤销委托的 `delegation_hash`，`sparse_root()` 压实成 32B 根——**S-41 起与电路是同一棵
+  树**：哈希 = Noir `std::hash::pedersen_hash`（非对称 2-field 哈希，`[左, 右]` 序有义）；叶值 =
+  Field——空叶 = 0，撤销叶 = `encode_field(dh)`（低 31 字节 LE 截断 → Field，与 gen-witness 的
+  撤销叶同一编码）；空子树根表 `empty_roots[0] = 0`、`empty_roots[k] = pedersen_hash([E,E])` 逐层
+  叠（与 gen-witness `compute_empty_roots` 同一迭代）。
   **树深 256，索引 = `dh` 全 32 字节的 LE u256**（位 k = `(dh[k/8] >> (k%8)) & 1`；第 d 层
-  节点索引 = 索引右移 d）——**S-36 起与电路侧同一派生、逐位全等**（不再是"低 32 位扩位"
-  关系，见上）。**S-11 原型版两侧均用 32-bit 前缀索引**（`delegation_hash[0..4]`
+  节点索引 = 索引右移 d）——**S-34/S-36 起与电路侧同一派生、逐位全等**（不再是"低 32 位扩位"
+  关系，见上）。根的 32B 外形 = Field 的**大端**编码（bb 公共输入序列化口径，§6.13），随下个
+  密封 epoch 的 `ChainPublisher::commit` 上链。
+  **S-11 原型版两侧均用 32-bit 前缀索引**（`delegation_hash[0..4]`
   LE）：两委托同前缀共享叶子、后写覆盖先写，锚定根只承诺其一（audit-scope §4 自报项）。
   S-34（2026-08-30）聚合器侧、S-36（2026-08-30）电路侧先后改为全 256-bit 索引：
   `delegation_hash` 整体即索引，**相异 dh 必相异叶**，
   碰撞面收口（`delegation_hash` 本就是 ecrecover 域内的 256-bit 抗碰摘要）。代价：`sparse_root`
-  从 O(32·|revoked|) 变 O(256·|revoked|)——只在密封（每 epoch 一次）调用，撤销又是稀有事件，
-  热路径（摄取/submit 闸口）不受影响（闸口是集合精确查找，与树无关）。空根 golden
-  `9a596033…4b910`（depth 256）Python 交叉 + 朴素全树交叉验证 + **前缀碰撞回归
-  （同 `dh[0..4]` 异 `dh` 双撤销：根必须反映两叶，S-34 固化）**。撤销事件流：链上 revoke → 运营者调 `Aggregator::revoke(dh)`（WAL 追加
+  从 O(32·|revoked|) 次 sha256 变 O(256·|revoked|) 次固定基 Grumpkin MSM（每层 ~50µs 量级，
+  比 SHA-NI 加速的 sha256 慢约 3 个数量级）——只在密封（每 epoch 一次）调用，撤销又是稀有事件，
+  热路径（摄取/submit 闸口）不受影响（闸口是集合精确查找，与树无关）；perf gate 9 指标不含
+  sparse_root，§8.2 基线口径不动。
+- **S-41 哈希对齐的 Rust 复现路径（`aggregator/src/noir_pedersen.rs`，零新依赖）**：Noir
+  `pedersen_hash([l, r])`（分隔符 0，N=2）= bb 的 Pedersen：取 MSM `l·G0 + r·G1 + 2·G_len` 的
+  **x 坐标**（第三项是 length 标量 = 输入个数 N，生成器来自独立域 `"pedersen_hash_length"`）。
+  其中 G0/G1 取自 bb 预计算表 `DEFAULT_DOMAIN_SEPARATOR[0..2]`、G_len 取自
+  `"pedersen_hash_length"[0]`——**bb 6.0.0-nightly.20260724 把这两组生成器硬编码在
+  `crypto/generators/generator_data.hpp` + `ecc/groups/precomputed_generators_grumpkin_impl.hpp`**
+  （8 + 1 个常量点）。本场景 N=2 恰好完全落在预计算范围内，**无需复现运行时
+  `derive_generators`**（S-05 教训：不做跨语言曲线推导）。Rust 侧内嵌这 3 个 bb 常量点 +
+  手写 BN254-Fr（Grumpkin 基域）Montgomery 算术与 Jacobian 点运算（零新依赖、无 C 依赖），
+  固定基 4-bit 窗口表 `OnceLock` 预计算。**三层验证锚**：
+  ① Noir stdlib 自带 golden（`noir_stdlib/src/hash/mod.nr::assert_pedersen`，bb 对齐产物）：
+  `pedersen_hash_with_separator([1],1)`、`pedersen_hash_with_separator([1,2],2)` 锁 Rust 实现；
+  ② bb 的 9 个预计算点全部过 Grumpkin 曲线方程自检（y² = x³ + b，b = p − 17）锁域算术；
+  ③ **全树交叉（最强锚）**：gen-witness fixture（撤销集 {`0x01…32`, `0x02…32`}）的
+  `revocation_root`——Rust `RevocationSet` 算出的根必须与 Noir `nargo execute` 输出相等
+  （gen-witness `revocation_empty_roots_match_aggregator_golden` 锁空子树表 + 聚合器
+  fixture golden 锁全树，双向）。撤销事件流：链上 revoke → 运营者调 `Aggregator::revoke(dh)`（WAL 追加
   `Revoke` 记录后入集，崩溃可重放重建）→ `submit()` 在注册表查找后立即查集，已撤销委托
   新意图一律 `E_REVOKED` 拒（最廉价闸口，不耗 nonce/窗口槽）→ 撤销根随**下个密封 epoch**
   的 `ChainPublisher::commit` 上链（S-11 验收：1 epoch 内进入撤销根）。
 - 撤销即时性：聚合器拉取注册表延迟 ≤ 1 个 epoch；对"已撤销仍消费"的窗口期，用债券惩罚运营者（§6.5）。
-- **诚实缝（非活跃错配，S-11 记录在案；S-34 收窄碰撞、S-36 收窄索引）**：聚合器撤销根是
-  **sha256** 树（叶 = dh 32B，空叶 = `sha256("")`），电路根是 **Pedersen** 树（叶 = EMPTY(0)
-  Field，已撤销叶 = `encode_field(dh)`）——**索引派生已全等**（256-bit，见上），残余错配是
-  **哈希函数 + 叶值/空叶规范**，两侧根数值不可比。内核用 `FormatVerifier` 从不读
-  `pi.revocation_root`，真正的 `E_REVOKED` 闸口在 `submit()`。完全对齐（两侧同哈希 + 同叶
-  规范，根数值可比）需定夺改哪侧（聚合器算 Pedersen 树，或电路改 sha256——后者要在电路内
-  再付一路 sha256），随真 ZK 集成方向定夺后收口（revocation.rs + 本行）。
+- **诚实缝状态（S-41 定夺并收口）**：S-11 记录的错配是哈希函数 + 叶值/空叶规范（索引派生
+  已在 S-34/S-36 全等）。定夺：**改聚合器侧，电路不动**——电路改哈希不可行（sha256 需在
+  电路内再付 256 层，约束爆炸；poseidon/poseidon2 换型同样要在电路内付 256 次置换且需
+  复现其 Rust 实现，约束预算与 prove 时长双输），而聚合器侧对齐只需要复现哈希本身，且
+  bb 的预计算生成器恰好覆盖本场景（见上，无需跨语言曲线推导）。S-41 后三要素（哈希函数 +
+  叶值/空叶规范 + 索引派生）两侧全等，聚合器 `sparse_root()` 与电路 `revocation_root`
+  公共输入（pub Field）**数值可比**（同一 Field 的大端 32B 外形）——bb 模式下
+  `pi.revocation_root` 可以来自聚合器账本树（§6.13 诚实边界 3 收口）。残余边界：
+  ① 电路内撤销叶 = `encode_field(dh)` 只编码低 31 字节（byte 31 不参与叶值）——叶值非单射，
+  但叶**位置**（全 256-bit 索引）单射，两 dh 仅 byte 31 相异时占同值异位两叶，无碰撞可乘；
+  ② 聚合器尚不产出非成员路径（prover 侧消费聚合器树出 witness 属下一步候选②「真 prover」
+  范围）；③ 根随 epoch 上链与证明生成之间的一致性（SDK 对哪个根出证明、锚定根换代时
+  在途证明如何处理）待真 ZK 全集成时定夺。
 
 ### 4.7 两种模式映射（实现同一接口）
 
@@ -937,10 +965,11 @@ pi 与信封不一致拒。e2e 由 `MERIDIAN_BB_E2E=1` 门控：verify.sh 第 9 
    p99 ~5-8ms 仍在 §5.5 的 10ms 预算线内；100μs/笔 摊薄目标需递归聚合（§5.4 Phase 2，S-18
    实证 BB 原生批验证对本 flavor 不可用）。in-process 封装（`bb_rs`/stdlib 绑定）收益上界
    ~15%，留作后续项。
-3. **撤销根哈希错配（§4.6 残余诚实缝）本件不动**：BbVerifier 把 `pi.revocation_root` 绑进
-   证明验证，但聚合器账本撤销树（sha256）与电路撤销树（Pedersen）根数值不可比——bb 模式下
-   `revocation_root` 公共输入必须来自与电路同源的树（gen-witness 管线），不可直接喂聚合器
-   账本树根。错配收口随真 ZK 全集成定夺（下一步候选②）。
+3. **撤销根哈希错配（§4.6 残余诚实缝）S-41 已收口**：聚合器账本撤销树自 S-41 起与电路同
+   哈希同叶规范（`aggregator/src/noir_pedersen.rs` 复现 Noir `pedersen_hash`，三层验证锚见
+   §4.6），`sparse_root()` 与电路 `revocation_root` 公共输入数值可比。本件（S-40）当时该缝
+   仍在：bb 模式下 `revocation_root` 公共输入只能来自 gen-witness 管线，不可直接喂聚合器
+   账本树根。残余：聚合器尚不产出非成员路径，prover 侧消费聚合器树属下一步候选②。
 4. **每笔验证 = 一次临时目录写盘 + 一次 bb 进程**：吞吐受文件系统与进程 spawn 支配，bb 后端
    不进 perf gate（吞吐基线口径不变）。
 
@@ -1033,8 +1062,9 @@ contract BatchSettler {
   单一实现（不因资产模式分叉）。Base 主网 USDC = `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`，
   Base Sepolia USDC = `0x036CbD53842c5426634e7929541eC2318f3dCF7e`（部署时核对，勿硬编码进合约）。
 - S-11 生产化：BatchSettler 完整 fraud-proof（漏单/低付，sound+有界）+ 债券罚没 +
-  epoch voided 回滚 + 延迟 claim；撤销事件 1 epoch 内进入聚合器撤销根（sha256 sparse root，
-  随 commit 上链）；真实 sha256 Merkle 已替换占位（`IntentHelper.sol`/`Merkle.sol` 交叉实现）。
+  epoch voided 回滚 + 延迟 claim；撤销事件 1 epoch 内进入聚合器撤销根（Pedersen sparse root，
+  S-41 起与电路同源，见 §4.6，随 commit 上链）；真实 sha256 Merkle 已替换占位
+  （`IntentHelper.sol`/`Merkle.sol` 交叉实现）。
 
 ---
 

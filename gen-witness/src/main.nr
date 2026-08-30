@@ -564,6 +564,56 @@ mod tests {
     }
 
     #[test]
+    fn revocation_empty_roots_match_aggregator_golden() {
+        // S-41 反向锁定（TECH_SPEC §4.6 验证锚③）：聚合器 `aggregator/src/noir_pedersen.rs`
+        // 复现的 Noir pedersen_hash 算出的空子树根表与本电路 `compute_empty_roots` 必须
+        // 逐层同值——以下常量 = 聚合器侧 Rust golden（hex 见 revocation.rs 单测，第三实现
+        // Python 交叉）。双向：聚合器单测锁 hex ↔ 本测试锁同值十进制。
+        let empty_roots = unsafe { compute_empty_roots() };
+        assert(
+            empty_roots[1]
+                == 17954372136461894568820199868962143715279932924957662285438325406238856880109,
+        );
+        assert(
+            empty_roots[2]
+                == 15315010434373228768515045847926951401477884091230007539886053341418284848464,
+        );
+        assert(
+            empty_roots[8]
+                == 5810866061421176229185100919314262997457801135114610274353230460838429180503,
+        );
+        assert(
+            empty_roots[16]
+                == 11033938207523021649122316027295742559227608161317650429835019071130941169536,
+        );
+        assert(
+            empty_roots[256]
+                == 11748306663608198149817056492228663363734754727859538139122908701354431492554,
+        );
+        // 全树交叉（最强锚）：撤销集 {0x01…32, 0x02…32}（与聚合器
+        // `gen_witness_fixture_root_matches_noir` 同一 fixture）的整树根——聚合器
+        // RevocationSet 算出的根必须是同一个 Field。
+        let ra = revoked_a();
+        let rb = revoked_b();
+        let revoked_idx: [[u8; 32]; MAX_REVOKED] = [ra, rb];
+        let revoked_leaf: [Field; MAX_REVOKED] = [encode_field(ra), encode_field(rb)];
+        let root = unsafe {
+            subtree_root(
+                REVOCATION_DEPTH as u64,
+                [0; 32],
+                revoked_idx,
+                [[0; 32]; MAX_REVOKED],
+                revoked_leaf,
+                MAX_REVOKED,
+                empty_roots,
+            )
+        };
+        assert(
+            root == 4155254769118169116647862288831891899637773286975008049501227812260722607649,
+        );
+    }
+
+    #[test]
     fn revocation_index_bit_is_full_le_u256() {
         // 锁定全宽位派生（S-36）：位 k = (dh[k/8] >> (k%8)) & 1——LE 字节序、字节内 LSB 在前，
         // 与聚合器 RevocationSet 位序契约（TECH_SPEC §4.6）一致。

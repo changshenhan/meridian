@@ -19,7 +19,9 @@
 
 - `meridian-core::dsa::delegation_hash`（Rust sha2）↔ Solidity `sha256` 预编译：
   字节级一致（`"DSAv1\0"` 前缀 + agent + owner canonical 编码，ABI 区间 `[26:46]`）。
-- 聚合器 `RevocationSet::sparse_root`（sha256 sparse merkle）↔ 链上 `commit` 锚定根。
+- 聚合器 `RevocationSet::sparse_root`（Pedersen sparse merkle，S-41 起与电路同哈希同叶规范，
+  Rust 复现见 `aggregator/src/noir_pedersen.rs`）↔ 链上 `commit` 锚定根 ↔ 电路
+  `revocation_root` 公共输入。
 - 欺诈证明重算路径：链上 `IntentProof` → `intent_hash` → 叶子 → 根 vs 聚合器
   `merkle::commitment_root`。
 
@@ -61,9 +63,11 @@
 - 撤销树碰撞属性——**两侧均已收口**：聚合器侧 S-34（2026-08-30，`RevocationSet::sparse_root`
   全 256-bit 索引，TECH_SPEC §4.6）；电路侧 S-36（2026-08-30，Noir 电路撤销树同步全宽化，
   depth 256，索引 = delegation_hash 全 32B LE，TECH_SPEC §5.3）。相异 delegation_hash 在两侧
-  均派生相异叶。**残余诚实缝 = 哈希函数/叶值规范错配**（聚合器 sha256 树 vs 电路 Pedersen 树，
-  根数值不可比，TECH_SPEC §4.6）——当前生产摄取路径 `FormatVerifier`（TEMPORARY）从不读
-  `pi.revocation_root`，真正的 `E_REVOKED` 闸口在 `submit()`，错配不进入现行验证面。
+  均派生相异叶。**哈希函数/叶值规范错配也已收口（S-41，2026-08-30）**：聚合器侧改为与电路
+  同一棵 Pedersen 树（`aggregator/src/noir_pedersen.rs`，bb 预计算生成器硬编码 + 三层验证锚，
+  TECH_SPEC §4.6），根数值可比。残余：聚合器尚不产出非成员路径（prover 侧消费，下一步
+  候选②）；当前生产摄取路径 `FormatVerifier`（TEMPORARY）从不读 `pi.revocation_root`，
+  真正的 `E_REVOKED` 闸口在 `submit()`。
 - 超付不可证（需完备性）——设计上接受，出界记录见 TECH_SPEC §6.5。
 - ~~challenge 无押金~~——**S-38 已收口（2026-08-30）**：`challenge` 变 `payable`，押金
   `CHALLENGE_BOND = 0.1 ether`（原生 ETH 常量）；押金入场后任何实质验证失败不再 revert，
