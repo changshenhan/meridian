@@ -16,8 +16,10 @@
 # 诚实边界：
 #   - gate 阈值 15%（--fail-over 15）抓灾难性回归，对齐原 CI 注释口径；1% 精准基线
 #     （TECH_SPEC §8.3）留在受控参考机手动执行（--record / --fail-over 1）。
-#   - forge（solidity job）与 nargo/bb（noir/ZK job）需要 Linux 工具链。本机未装时
-#     打印 [SKIP] 并继续——Rust workspace（核心交付物）不因缺失外围工具而被挡。
+#   - forge（solidity job）需要 Linux 工具链，本机未装时打印 [SKIP] 并继续。
+#   - ZK（noir job）自 S-37 起有 WSL2 兜底（默认发行版 MeridianUbuntu）：Windows 侧
+#     找不到 nargo/bb 时自动借 wsl.exe 跑同一对脚本，ZK 门禁真正进入本地 pre-push；
+#     Windows 与 WSL 皆无工具链时才 [SKIP]。
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -118,13 +120,47 @@ else
     skip "forge 未找到 → solidity 门禁跳过"
 fi
 
+# S-37：第 9 步 ZK 门禁三层探测。① Windows 原生 nargo/bb（历史路径，实际不可得——
+# nargo 1.0.0-beta.26 无法在 Windows 构建）；② WSL2 兜底（默认发行版 MeridianUbuntu、
+# root 用户，工具在 /root/.nargo/bin 与 /root/.bb，MERIDIAN_WSL_DISTRO 可覆盖）；
+# ③ 皆无才 SKIP。ZK 门禁由此真正进入本地 pre-push（电路回归不再只靠 CI 兜底）。
+# 配套：跑前把 gen-witness/Prover.toml 备份到 target/，跑后还原——nargo
+# `--overwrite-return` 会追加/改写 return 键（不进版本库），pre-push 不再污染工作树，
+# 开发者手工改动也原样保留（见 TECH_SPEC §8.3）。
+zk_wsl_ready() { # zk_wsl_ready <distro>  -> 0 = WSL 兜底可用
+    command -v wsl.exe >/dev/null 2>&1 || return 1
+    case "$ROOT" in [A-Za-z]:/*) ;; *) return 1 ;; esac
+    wsl.exe -d "$1" -u root -e bash -lc \
+        'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; command -v nargo >/dev/null 2>&1 && command -v bb >/dev/null 2>&1' \
+        >/dev/null 2>&1
+}
+
+if [ -f "$ROOT/gen-witness/Prover.toml" ]; then
+    cp "$ROOT/gen-witness/Prover.toml" "$ROOT/target/Prover.toml.pregate"
+fi
+
 if { command -v nargo >/dev/null 2>&1 || [ -x "$HOME/.nargo/bin/nargo" ]; } \
    && { command -v bb >/dev/null 2>&1 || [ -x "$HOME/.bb/bb" ]; }; then
-    step "9/10 ZK (smoke_zk + formal_zk)"
+    step "9/10 ZK (smoke_zk + formal_zk, Windows 原生)"
     run "zk smoke" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/smoke_zk.sh'
     run "zk formal" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/formal_zk.sh'
 else
-    skip "nargo/bb 未找到 → ZK 门禁跳过（需 Linux；可借 neuralzoo Linux 服务器或 WSL）"
+    WSL_DISTRO="${MERIDIAN_WSL_DISTRO:-MeridianUbuntu}"
+    if zk_wsl_ready "$WSL_DISTRO"; then
+        step "9/10 ZK (smoke_zk + formal_zk, WSL2 兜底 S-37: $WSL_DISTRO)"
+        WSL_ROOT="/mnt/$(printf '%s' "${ROOT:0:1}" | tr 'A-Z' 'a-z')${ROOT:2}"
+        run "zk smoke" wsl.exe -d "$WSL_DISTRO" -u root -e bash -lc \
+            "export PATH=\"\$HOME/.nargo/bin:\$HOME/.bb:\$PATH\"; cd '$WSL_ROOT' && bash scripts/smoke_zk.sh"
+        run "zk formal" wsl.exe -d "$WSL_DISTRO" -u root -e bash -lc \
+            "export PATH=\"\$HOME/.nargo/bin:\$HOME/.bb:\$PATH\"; cd '$WSL_ROOT' && bash scripts/formal_zk.sh"
+    else
+        skip "nargo/bb 未找到（Windows 与 WSL 发行版 $WSL_DISTRO 皆无）→ ZK 门禁跳过（MERIDIAN_WSL_DISTRO 可覆盖发行版）"
+    fi
+fi
+
+if [ -f "$ROOT/target/Prover.toml.pregate" ] && ! cmp -s "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"; then
+    cp "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"
+    printf '    \033[1;33m[CLEAN]\033[0m gen-witness/Prover.toml 已还原（nargo --overwrite-return 改写，return 键不进版本库）\n'
 fi
 
 # S-11d + S-14：Anvil 端到端（聚合器 + BatchSettler v2 全链路 + M1 里程碑 demo）。依赖 forge

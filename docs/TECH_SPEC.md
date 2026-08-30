@@ -981,6 +981,19 @@ contract BatchSettler {
   实测 ±6%）不传 `--ci`，15%/1% 精度口径不变。5 轮中位保留（治突发内噪声，与阶段级
   漂移正交）。
 - baseline.json 入库；`scripts/verify.sh` 必须通过全量套件。
+- **ZK 门禁本地化（S-37，2026-08-30）**：`verify.sh` 第 9 步（smoke_zk + formal_zk）从
+  「Windows 侧找不到 nargo/bb 即 `[SKIP]`」（nargo 1.0.0-beta.26 无法在 Windows 构建，
+  `termion` 仅 unix，见 §5.3）改为**三层探测**：① Windows 原生（保留，实际不可得）；
+  ② **WSL2 兜底**——`wsl.exe` 可用且发行版内有 nargo/bb 时，借 `/mnt/<盘>` 路径在 WSL
+  内跑同一对脚本（发行版默认 `MeridianUbuntu`，root（工具装在 `/root/.nargo/bin`、
+  `/root/.bb`），可用 `MERIDIAN_WSL_DISTRO` 环境变量覆盖）；③ 两者皆无才 `[SKIP]`。
+  S-36 起本机 WSL2 已具备工具链（§5.1），**ZK 门禁由此真正进入本地 pre-push**——电路
+  回归不再只靠 CI 第二道网兜底。边界诚实口径：WSL 兜底跑的是与 CI 相同的脚本与锁定
+  版本，但宿主是本机（32 核），§5.4 的计时基线在本地参考机跑出（与 CI 2 核数值差异
+  见 §5.5 表）；`nargo fetch` 需网络（WSL 内可达 crates.io/ GitHub tag）。配套收口：
+  门禁跑前把 `gen-witness/Prover.toml` 备份到 `target/`、跑后还原（`nargo execute
+  --overwrite-return` 会追加/改写 `return` 键，该键不进版本库）——pre-push 不再污染
+  工作树，且开发者对 Prover.toml 的手工改动在门禁后原样保留。
 - **S-11d 链上端到端（verify.sh 9/9）**：`rust-smoke`（`contracts/rust-smoke`，独立
   workspace）在一条 anvil 会话内跑三场景——① 快乐路径：注册→submit→密封结算→
   `commit`（债券+撤销根）→`settle`（资金足）→过窗 `claim` 收款人收精确净额；② 撤销：
@@ -991,7 +1004,8 @@ contract BatchSettler {
 - 热路径零分配用分配器钩子断言（`dhat` 或自写 alloc hook），不靠估计。
 - **GitHub CI**（`.github/workflows/ci.yml`）：**可选第二道网**，2026-08-17 起被账户
   计费阻断（私有 Actions included 额度耗尽）而挂起。solidity（forge）与 ZK（nargo/bb）
-  job 需 Linux 工具链，本机未装时 `verify.sh` 打印 `[SKIP]`；可借 Linux 服务器或 WSL 补上。
+  job 需 Linux 工具链：ZK 一侧已由 S-37 的 WSL2 兜底进本地 pre-push（见上），forge/anvil
+  本机未装时 `verify.sh` 仍打印 `[SKIP]`（不阻塞 Rust 主门禁）。
 
 ### 8.4 输出 schema（JSON）
 
