@@ -56,11 +56,17 @@ MERIDIAN_WAL_DIR=demos/.wal target/release/meridian-mcp
 ## 框架接入（S-13b 演示闭环）
 
 `demos/` 下三个框架脚本跑**同一闭环**：`authorize`（owner secp256k1 签 delegation）
-→ `pay`（agent Ed25519 签 intent，付 vendor DID）→ `balance`（确认额度滚动）→
-`verify_receipt`（确认 accepted:true + seq）→ **脚本内置 mock vendor** 凭回执授予
-API 积分 + 返回模拟数据。每个 demo 内置自检：本地重算的 `delegation_hash` /
-`intent_hash` 与服务器回执逐字节对得上（Python coincurve/ed25519 与 Node @noble
-跨语言镜像 `core/src/dsa.rs` 规范布局）。
+→ `revocation_witness`（S-52 第 6 工具，撤销非成员事实面：root 64 hex + path
+256×32B 扁平 hex 形状自检）→ `pay`（agent Ed25519 签 intent，付 vendor DID）→
+`balance`（确认额度滚动）→ `verify_receipt`（确认 accepted:true + seq）→
+**脚本内置 mock vendor** 凭回执授予 API 积分 + 返回模拟数据。每个 demo 内置自检：
+本地重算的 `delegation_hash` / `intent_hash` 与服务器回执逐字节对得上（Python
+coincurve/ed25519 与 Node @noble 跨语言镜像 `core/src/dsa.rs` 规范布局）。
+
+诚实边界（S-53）：脚本演示的是 witness **事实面**——`pay` 的 optional `proof`
+直通不在脚本演示范围（真电路证明需要 nargo/bb 工具链，Python/JS 侧不可得，硬造即
+假演示），该路径由 `mcp-server/tests/mcp_noir_e2e.rs` 门控 e2e 实证
+（`MERIDIAN_MCP_NOIR_E2E=1`，TECH_SPEC §6.16）。
 
 ```bash
 cargo build -p meridian-mcp --release

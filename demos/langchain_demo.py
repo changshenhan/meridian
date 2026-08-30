@@ -1,11 +1,11 @@
-"""S-13b 演示①：LangChain 经 MCP 接入 Meridian DSA（闭环：authorize→pay→balance→verify_receipt→vendor）。
+"""S-13b 演示①：LangChain 经 MCP 接入 Meridian DSA（闭环：authorize→revocation_witness→pay→balance→verify_receipt→vendor）。
 
 用法（在仓库根）：
     cargo build -p meridian-mcp --release
     demos/.venv/Scripts/python.exe demos/langchain_demo.py
 
 `MultiServerMCPClient` 以 stdio 拉起 `target/release/meridian-mcp`（内嵌真实聚合器 +
-WAL），把 5 个工具暴露给 LangChain。本脚本用 LangChain 的 `get_tools()` 拿工具、
+WAL），把 6 个工具暴露给 LangChain。本脚本用 LangChain 的 `get_tools()` 拿工具、
 `ainvoke` 依次调用，闭环序列与 common 里完全一致（含逐字节自检）。
 """
 
@@ -38,7 +38,14 @@ async def main() -> None:
     client = MultiServerMCPClient(config)
     async with client.session("meridian") as session:
         tools = {t.name: t for t in await load_mcp_tools(session)}
-        expected = {"authorize", "pay", "balance", "attest", "verify_receipt"}
+        expected = {
+            "authorize",
+            "pay",
+            "balance",
+            "attest",
+            "verify_receipt",
+            "revocation_witness",
+        }
         assert expected <= set(tools), f"MCP 工具不全: {sorted(set(tools) - expected)} 缺?"
 
         async def call_tool(name: str, args: dict) -> tuple[bool, dict]:

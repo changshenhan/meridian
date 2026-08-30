@@ -171,7 +171,7 @@ class MockVendor:
 # ---- 统一闭环序列（3 个框架脚本同一序列） ------------------------------------
 
 async def run_closed_loop(call_tool, log=print) -> None:
-    """authorize → pay → balance → verify_receipt → mock vendor 授予积分。
+    """authorize → revocation_witness → pay → balance → verify_receipt → vendor 授予积分。
 
     `call_tool(name, args) -> (ok: bool, body: dict)`：框架 MCP 工具调用包装。
     每步带**内置自检**：本地重算的 delegation_hash / intent_hash 必须与服务器
@@ -203,9 +203,24 @@ async def run_closed_loop(call_tool, log=print) -> None:
     assert auth["delegation_hash"] == dh.hex(), (
         f"delegation_hash 漂移: local={dh.hex()} server={auth['delegation_hash']}"
     )
-    log(f"[1/5] authorize OK  dh={dh.hex()[:16]}…  total_cap={auth['total_cap']}")
+    log(f"[1/6] authorize OK  dh={dh.hex()[:16]}…  total_cap={auth['total_cap']}")
 
-    # 2. pay：agent 签 intent，付 vendor DID
+    # 2. revocation_witness：撤销非成员事实面（S-52 第 6 工具，TECH_SPEC §6.16）——
+    # 客户端构建真电路证明所需的唯一服务器侧事实。本演示用占位证明（缺省 format
+    # 后端）不消费 witness，此步验证的是工具连通与载荷形状（root 32B + path
+    # 256×32B 扁平）；真证明路径需 nargo/bb 工具链，由 Rust 门控 e2e 实证（§6.16）。
+    ok, wit = await call_tool("revocation_witness", {"delegation_hash": dh.hex()})
+    assert ok, f"revocation_witness 失败: {wit.get('error')}"
+    assert wit["delegation_hash"] == dh.hex(), (
+        f"witness 回执 dh 漂移: {wit['delegation_hash']}"
+    )
+    assert len(wit["root"]) == 64, f"root 形状漂移: {len(wit['root'])} hex 字符"
+    assert len(wit["path"]) == 16384, f"path 形状漂移: {len(wit['path'])} hex 字符"
+    int(wit["root"], 16)
+    int(wit["path"], 16)  # 均 hex 可解码
+    log(f"[2/6] revocation_witness OK  root={wit['root'][:16]}…  path=256×32B")
+
+    # 3. pay：agent 签 intent，付 vendor DID
     amount, spend_nonce = 142, 1
     ih = intent_hash(delegation_hash=dh, amount=amount, spend_nonce=spend_nonce)
     pay_args = {
@@ -225,15 +240,15 @@ async def run_closed_loop(call_tool, log=print) -> None:
     assert pay["intent_hash"] == ih.hex(), (
         f"intent_hash 漂移: local={ih.hex()} server={pay['intent_hash']}"
     )
-    log(f"[2/5] pay OK      seq={pay['seq']}  intent_hash={ih.hex()[:16]}…  amount={amount}")
+    log(f"[3/6] pay OK      seq={pay['seq']}  intent_hash={ih.hex()[:16]}…  amount={amount}")
 
-    # 3. balance：额度滚动
+    # 4. balance：额度滚动
     ok, bal = await call_tool("balance", {"delegation_hash": dh.hex()})
     assert ok, f"balance 失败: {bal.get('error')}"
     assert bal["total_spent"] == amount, f"balance 漂移: total_spent={bal['total_spent']}"
-    log(f"[3/5] balance OK  spent={bal['total_spent']}  remaining={bal['remaining']}")
+    log(f"[4/6] balance OK  spent={bal['total_spent']}  remaining={bal['remaining']}")
 
-    # 4. verify_receipt：聚合器只读确认（vendor 校验侧）
+    # 5. verify_receipt：聚合器只读确认（vendor 校验侧）
     ok, vr = await call_tool(
         "verify_receipt",
         {
@@ -244,10 +259,10 @@ async def run_closed_loop(call_tool, log=print) -> None:
     )
     assert ok, f"verify_receipt 失败: {vr.get('error')}"
     assert vr["accepted"] is True, "verify_receipt 应 accepted=true"
-    log(f"[4/5] verify_receipt OK  accepted={vr['accepted']}  seq={vr['seq']}")
+    log(f"[5/6] verify_receipt OK  accepted={vr['accepted']}  seq={vr['seq']}")
 
-    # 5. mock vendor：凭确认回执授予积分 + 返回模拟数据
+    # 6. mock vendor：凭确认回执授予积分 + 返回模拟数据
     data = MockVendor().grant(vr, amount)
-    log(f"[5/5] vendor granted credits={data['credits_granted']}  rows={len(data['data'])}")
+    log(f"[6/6] vendor granted credits={data['credits_granted']}  rows={len(data['data'])}")
 
     log("闭环完成：agent 用 DSA 自动购买数据/API 额度 ✔")

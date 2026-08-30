@@ -1,4 +1,4 @@
-"""S-13b 演示②：AutoGen 经 MCP 接入 Meridian DSA（闭环：authorize→pay→balance→verify_receipt→vendor）。
+"""S-13b 演示②：AutoGen 经 MCP 接入 Meridian DSA（闭环：authorize→revocation_witness→pay→balance→verify_receipt→vendor）。
 
 用法（在仓库根）：
     cargo build -p meridian-mcp --release
@@ -7,7 +7,7 @@
 `autogen_ext.tools.mcp.mcp_server_tools` 把 MCP 工具注册为 AutoGen `Tool`（run_json 驱动，
 0.7.x 接口）。**关键坑**：不显式传 `session` 时，每个 tool 每次调用都新建一个 MCP 会话
 （→ 新子进程 → 新聚合器），authorize 与 pay 会落到不同内核。必须用 `mcp` 的 `stdio_client`
-+ `ClientSession` 建一个共享会话传给 factory，5 个工具才同进程。
++ `ClientSession` 建一个共享会话传给 factory，6 个工具才同进程。
 """
 
 import asyncio
@@ -64,7 +64,14 @@ async def main() -> None:
             await session.initialize()
             tools = await mcp_server_tools(params, session=session)
             by_name = {t.name: t for t in tools}
-            expected = {"authorize", "pay", "balance", "attest", "verify_receipt"}
+            expected = {
+                "authorize",
+                "pay",
+                "balance",
+                "attest",
+                "verify_receipt",
+                "revocation_witness",
+            }
             assert expected <= set(by_name), (
                 f"MCP 工具不全: {sorted(expected - set(by_name))} 缺?"
             )

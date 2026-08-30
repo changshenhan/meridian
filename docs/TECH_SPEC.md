@@ -1304,6 +1304,14 @@ true`）。bb 模式下占位证明 / 派生错位 / 篡改任一公共输入 = 
 MCP 面单笔载荷 ~20KB（吞吐口径不适用于 MCP 面）；WAL 不落证明（`RecordKind::Intent`
 固定 116B payload，§10），直通不影响 WAL 格式与恢复语义。
 
+**框架 demo 面（S-53，候选⑨收口）**：`demos/` 三框架脚本（LangChain / AutoGen /
+ElizaOS，S-13b 同一闭环）在 `authorize` 之后加入 `meridian.revocation_witness` 步——
+回执形状自检（`root` 64 hex + `path` 256×32B 扁平 = 16384 hex 字符 + 回执
+`delegation_hash` 与本地重算逐字节一致），三个框架逐字节同口径。诚实边界：`pay` 的
+optional `proof` 直通**不在框架脚本演示范围**——真电路证明需要 nargo/bb 工具链（§5.3），
+Python/JS 脚本侧不可得，硬造即假演示；该路径由本节门控 e2e `mcp_noir_e2e` 实证，
+框架脚本演示的是 witness 事实面（真证明的前置事实来源）。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）

@@ -6,9 +6,10 @@
 // 两条接入面：
 //   1. character.json —— 官方 @elizaos/plugin-mcp 的集成配置面（settings.mcp.servers.
 //      meridian，stdio 拉起 meridian-mcp）。本脚本启动时按本机绝对路径自动生成，
-//      配置给真实 Eliza 运行时即可把 5 个工具暴露给 agent 的 LLM。
+//      配置给真实 Eliza 运行时即可把 6 个工具暴露给 agent 的 LLM。
 //   2. eliza_client.mjs —— 用与 plugin 相同的 @modelcontextprotocol/sdk 栈直连跑同一
-//      闭环（authorize→pay→balance→verify_receipt→vendor），完整 LLM 驱动可选（需模型 key）。
+//      闭环（authorize→revocation_witness→pay→balance→verify_receipt→vendor），
+//      完整 LLM 驱动可选（需模型 key）。
 //
 // 密码学：@noble/curves ed25519（RFC8032 确定性裸签，与 ed25519-dalek 逐字节一致）、
 // secp256k1（默认低 s，与 k256 normalize_s 一致）；哈希逐字节镜像 core/src/dsa.rs。
@@ -156,9 +157,24 @@ async function runClosedLoop(callTool, log) {
   if (auth.delegation_hash !== hex(dh)) {
     throw new Error(`delegation_hash 漂移: local=${hex(dh)} server=${auth.delegation_hash}`);
   }
-  log(`[1/5] authorize OK  dh=${hex(dh).slice(0, 16)}…  total_cap=${auth.total_cap}`);
+  log(`[1/6] authorize OK  dh=${hex(dh).slice(0, 16)}…  total_cap=${auth.total_cap}`);
 
-  // 2. pay
+  // 2. revocation_witness：撤销非成员事实面（S-52 第 6 工具，TECH_SPEC §6.16）——
+  // 客户端构建真电路证明所需的唯一服务器侧事实。本演示用占位证明（缺省 format
+  // 后端）不消费 witness，此步验证工具连通与载荷形状（root 32B + path 256×32B
+  // 扁平）；真证明路径需 nargo/bb 工具链，由 Rust 门控 e2e 实证（§6.16）。
+  const { ok: witOk, body: wit } = await callTool("revocation_witness", {
+    delegation_hash: hex(dh),
+  });
+  if (!witOk) throw new Error(`revocation_witness 失败: ${wit.error}`);
+  if (wit.delegation_hash !== hex(dh)) {
+    throw new Error(`witness 回执 dh 漂移: ${wit.delegation_hash}`);
+  }
+  if (wit.root.length !== 64) throw new Error(`root 形状漂移: ${wit.root.length} hex 字符`);
+  if (wit.path.length !== 16384) throw new Error(`path 形状漂移: ${wit.path.length} hex 字符`);
+  log(`[2/6] revocation_witness OK  root=${wit.root.slice(0, 16)}…  path=256×32B`);
+
+  // 3. pay
   const amount = 142, spendNonce = 1;
   const ih = intentHash({
     agent: AGENT_DID, delegationHash: dh, recipient: VENDOR_DID,
@@ -173,25 +189,25 @@ async function runClosedLoop(callTool, log) {
   if (pay.intent_hash !== hex(ih)) {
     throw new Error(`intent_hash 漂移: local=${hex(ih)} server=${pay.intent_hash}`);
   }
-  log(`[2/5] pay OK      seq=${pay.seq}  intent_hash=${hex(ih).slice(0, 16)}…  amount=${amount}`);
+  log(`[3/6] pay OK      seq=${pay.seq}  intent_hash=${hex(ih).slice(0, 16)}…  amount=${amount}`);
 
-  // 3. balance
+  // 4. balance
   const { ok: balOk, body: bal } = await callTool("balance", { delegation_hash: hex(dh) });
   if (!balOk) throw new Error(`balance 失败: ${bal.error}`);
   if (bal.total_spent !== amount) throw new Error(`balance 漂移: total_spent=${bal.total_spent}`);
-  log(`[3/5] balance OK  spent=${bal.total_spent}  remaining=${bal.remaining}`);
+  log(`[4/6] balance OK  spent=${bal.total_spent}  remaining=${bal.remaining}`);
 
-  // 4. verify_receipt
+  // 5. verify_receipt
   const { ok: vrOk, body: vr } = await callTool("verify_receipt", {
     delegation_hash: hex(dh), spend_nonce: spendNonce, intent_hash: hex(ih),
   });
   if (!vrOk) throw new Error(`verify_receipt 失败: ${vr.error}`);
   if (vr.accepted !== true) throw new Error("verify_receipt 应 accepted=true");
-  log(`[4/5] verify_receipt OK  accepted=${vr.accepted}  seq=${vr.seq}`);
+  log(`[5/6] verify_receipt OK  accepted=${vr.accepted}  seq=${vr.seq}`);
 
-  // 5. mock vendor 授予积分
+  // 6. mock vendor 授予积分
   const data = mockVendorGrant(vr, amount);
-  log(`[5/5] vendor granted credits=${data.credits_granted}  rows=${data.data.length}`);
+  log(`[6/6] vendor granted credits=${data.credits_granted}  rows=${data.data.length}`);
 
   log("闭环完成：agent 用 DSA 自动购买数据/API 额度 ✔");
 }
