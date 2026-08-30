@@ -157,6 +157,9 @@ fn bb_verify_e2e_real_proof_positive_and_negative() {
         }
     };
     let verifier = BbVerifier::from_parts(vk, backend, root.join("target/bb-verify"));
+    // 装配面配对声明（S-48，§6.13）：真后端必须声明依赖撤销根公共输入，
+    // 聚合器据此构造期强制绑定闸（§6.2）同步装配。
+    assert!(verifier.requires_revocation_root_binding());
 
     // 正向：真证明 + 第三实现重建的公共输入 → bb 密码学接受，公共输入原样返回。
     let good = SpendProof {

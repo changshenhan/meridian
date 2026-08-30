@@ -579,6 +579,19 @@ impl Aggregator {
         delegations_expected: Option<usize>,
         intents_expected: usize,
     ) -> Self {
+        // 装配面配对闸（S-48，TECH_SPEC §6.13 / §6.2）：真电路验证后端对公共输入
+        // `revocation_root` 有语义依赖，必须与撤销根绑定闸同步装配——此前只是文档
+        // 口径（S-40 自己的 bin 接线就漏配了一次：gateway bb 模式仍用缺省配置），
+        // 此处升级为构造保证：配对缺失构造即 panic（fail-fast，bin 启动即退，
+        // 不落运行时半可用态——与 §6.13 后端探测「构造期报错」同一口径）。
+        if verifier.requires_revocation_root_binding() && !cfg.enforce_revocation_root {
+            panic!(
+                "aggregator 装配错误：验证后端声明依赖撤销根公共输入 \
+                 （SpendVerifier::requires_revocation_root_binding = true，TECH_SPEC \
+                 §6.13），但 IngestConfig::enforce_revocation_root = false——撤销根绑定闸 \
+                 关闭时证明可自选根，装饰性 ZK 复活（§6.2）。同步置位后重新构造。"
+            );
+        }
         let now = now_fn();
         let epoch_capacity = cfg.epoch_capacity;
         let state = match delegations_expected {
@@ -1106,11 +1119,82 @@ mod tests {
         owner_signing_key_from_bytes, sign_delegation, sign_intent, AgentSigningKey, RateLimit,
         SpendIntent,
     };
-    use meridian_core::zk::SpendProof;
+    use meridian_core::zk::{SpendProof, SpendPublicInputs};
     use std::collections::HashSet;
 
+    use crate::bb::{BbBackend, BbVerifier};
     use crate::proof::FormatVerifier;
     use proptest::prelude::*;
+
+    /// 装配面配对闸（S-48）测试替身：可声明「依赖撤销根公共输入」。
+    struct RequiresBinding(bool);
+
+    impl SpendVerifier for RequiresBinding {
+        fn verify(&self, _proof: &SpendProof) -> Result<SpendPublicInputs, Error> {
+            Ok(test_public_inputs())
+        }
+        fn requires_revocation_root_binding(&self) -> bool {
+            self.0
+        }
+    }
+
+    fn test_public_inputs() -> SpendPublicInputs {
+        SpendPublicInputs {
+            agent_commit: [0u8; 32],
+            delegation_hash: [0u8; 32],
+            recipient: [0u8; 20],
+            amount: 0,
+            category: [0u8; 32],
+            spend_nonce: 1,
+            expires_at: 0,
+            revocation_root: [0u8; 32],
+            now: 0,
+        }
+    }
+
+    #[test]
+    fn real_backend_without_binding_gate_panics_at_construction() {
+        let c = Arc::new(AtomicU64::new(1_700_000_000));
+        let now_fn: Box<dyn Fn() -> u64 + Send + Sync> = {
+            let c = Arc::clone(&c);
+            Box::new(move || c.load(Ordering::Relaxed))
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let wal = Wal::open(&tmp_path("pairing-guard"), 100_000).unwrap();
+            Aggregator::with_clock(test_cfg(), Box::new(RequiresBinding(true)), wal, now_fn);
+        }));
+        assert!(
+            result.is_err(),
+            "真验证后端 + 闸关闭必须构造即 panic（§6.13 配对闸）"
+        );
+        let _ = std::fs::remove_file(tmp_path("pairing-guard"));
+    }
+
+    #[test]
+    fn real_backend_with_binding_gate_constructs() {
+        let c = Arc::new(AtomicU64::new(1_700_000_000));
+        let now_fn: Box<dyn Fn() -> u64 + Send + Sync> = {
+            let c = Arc::clone(&c);
+            Box::new(move || c.load(Ordering::Relaxed))
+        };
+        let mut cfg = test_cfg();
+        cfg.enforce_revocation_root = true;
+        let wal = Wal::open(&tmp_path("pairing-ok"), 100_000).unwrap();
+        let agg = Aggregator::with_clock(cfg, Box::new(RequiresBinding(true)), wal, now_fn);
+        assert_eq!(agg.accepted_count(), 0);
+        let _ = std::fs::remove_file(tmp_path("pairing-ok"));
+    }
+
+    #[test]
+    fn bb_verifier_declares_revocation_root_binding() {
+        // BbVerifier 覆写声明（真构造器 from_parts 不探测工具链，测试机无 bb 也可构造）。
+        let v = BbVerifier::from_parts(
+            vec![0u8; 4],
+            BbBackend::Native { bin: "bb".into() },
+            std::path::PathBuf::from("target/bb-verify-test"),
+        );
+        assert!(v.requires_revocation_root_binding());
+    }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();

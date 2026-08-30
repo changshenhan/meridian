@@ -208,6 +208,12 @@ impl BbVerifier {
 }
 
 impl SpendVerifier for BbVerifier {
+    fn requires_revocation_root_binding(&self) -> bool {
+        // 真电路验证：公共输入 `revocation_root` 有密码学语义（S-48 装配面配对闸，
+        // TECH_SPEC §6.13）——聚合器构造期据此强制撤销根绑定闸同步装配（§6.2）。
+        true
+    }
+
     fn verify(&self, proof: &SpendProof) -> Result<SpendPublicInputs, Error> {
         if proof.proof.is_empty() {
             return Err(Error::EProof);

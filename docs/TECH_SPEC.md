@@ -486,7 +486,11 @@ pub trait Ingest {
   witness 的根无语义，默认装配行为逐字节不变——与 §6.13 `MERIDIAN_VERIFY_BACKEND`
   缺省 `format`、§6.14 缺省 `PlaceholderProver` 同一口径：生产默认不动，真后端显式
   开启）；装配真验证后端（§6.13 `BbVerifier`）时必须同步置 `true`（bb 模式 + 绑定闸
-  = 全链真 ZK 的完整形态）。撤销集只增 → 集合 ≤ 撤销事件数 + 1，闸成本 = 一次哈希集
+  = 全链真 ZK 的完整形态）。**S-48 起该配对升级为构造保证**：`SpendVerifier::
+  requires_revocation_root_binding()`（缺省 `false`，`BbVerifier` 覆写 `true`）声明
+  后端对 `revocation_root` 的语义依赖，`Aggregator` 全构造汇合点（`build`）构造期检查
+  配对——真验证后端 + 闸关闭 = 构造即 panic（fail-fast，bin 启动即退，不落运行时半可用
+  态；此前仅文档口径，S-40 的 bin 接线已实际漏配一次，见 §6.13 接线）。撤销集只增 → 集合 ≤ 撤销事件数 + 1，闸成本 = 一次哈希集
   查找（热路径零分配）；根的计算只在 `revoke` 事件与集合未命中时发生（与 §6.3 每
   epoch 密封已付的 `sparse_root()` 同成本级，不新增热路径代价）。诚实边界：集合进程内
   不持久化（重启后 = {空根, 当前根}），见 §4.6 残余③。**S-45 起 SDK 侧对 `E_REV_ROOT`
@@ -1035,7 +1039,13 @@ Windows 路径经 `/mnt/<盘>/` 转换后进 WSL 调 bb）→ ③ 皆无 → **�
 
 **接线**：`meridian-gateway` 环境变量 `MERIDIAN_VERIFY_BACKEND=format|bb`（**缺省 format**，
 生产默认口径本件不动）+ `MERIDIAN_BB_VK`（vk 文件路径，bb 模式必填、无缺省）。bench / perf
-gate 口径不变（FormatVerifier，§8.2 吞吐基线不回填）。
+gate 口径不变（FormatVerifier，§8.2 吞吐基线不回填）。**装配配对闸（S-48）**：bb 模式下
+证明公共输入 `revocation_root` 有密码学语义，网关 bin 同步置
+`IngestConfig::enforce_revocation_root = true`（§6.2 绑定闸，S-40 本件当时漏配——bin 接线
+仍是 `IngestConfig::default()`，绑定闸关闭，装饰性 ZK 在装配面复活）；该配对同步升级为
+构造保证（`SpendVerifier::requires_revocation_root_binding` 缺省 `false` / `BbVerifier`
+覆写 `true`，`Aggregator` 构造期检查，漏配即 panic 启动即退）——未来任何真验证后端
+装配点（monitor / mcp-server / 新 bin）不再可能静默漏配。
 
 **验收测试**：单测（序列化 golden：121 字段/3872B/字段序/revocation_root 大端整数口径；
 fail-closed 错误码）+ e2e（`aggregator/tests/bb_verify_e2e.rs`）：从 `circuits/Prover.toml`

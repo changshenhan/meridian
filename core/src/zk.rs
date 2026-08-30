@@ -74,6 +74,16 @@ pub trait SpendProver {
 /// 证明验证器（聚合器侧；返回公共输入，登记以此为准）。
 pub trait SpendVerifier {
     fn verify(&self, proof: &SpendProof) -> Result<SpendPublicInputs, Error>;
+
+    /// 装配面配对声明（S-48，TECH_SPEC §6.13）：真电路验证后端必须覆写为 `true`——
+    /// 它验证的证明公共输入 `revocation_root` 有密码学语义，摄取管线必须同步开启
+    /// 撤销根绑定闸（`IngestConfig::enforce_revocation_root`，§6.2），否则证明可自选
+    /// 根（空根 / 伪造根）绕开撤销锚定，装饰性 ZK 在装配面复活。占位/格式后端缺省
+    /// `false`：占位 witness 的根无语义，绑定闸开启反而会把占位口径拒成 `E_REV_ROOT`。
+    /// `Aggregator` 构造期按此配对检查，缺配即 panic（fail-fast，bin 启动即退）。
+    fn requires_revocation_root_binding(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
