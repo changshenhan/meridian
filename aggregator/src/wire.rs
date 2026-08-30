@@ -185,10 +185,9 @@ impl RevocationWitnessResponse {
                 raw.len()
             ));
         }
-        let path = raw
-            .chunks_exact(32)
-            .map(|c| <[u8; 32]>::try_from(c).expect("chunks_exact(32)"))
-            .collect();
+        let (chunks, rest) = raw.as_chunks::<32>();
+        debug_assert!(rest.is_empty()); // 上面的长度闸保证无余数
+        let path = chunks.to_vec();
         Ok(meridian_core::zk::RevocationWitness {
             root: hex_to_bytes32(&self.root)?,
             path,
