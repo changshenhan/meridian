@@ -66,6 +66,7 @@ sol! {
         function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot) external payable;
         function claim(uint256 epochId, uint256 netIndex) external;
         function challenge(uint256 epochId, FraudProof calldata fp) external payable;
+        function challengeBond() external view returns (uint256);
     }
 }
 
@@ -79,7 +80,8 @@ pub const OWNER_KEY_BYTES: [u8; 32] = [7u8; 32];
 pub const ONE_ETH: u128 = 1_000_000_000_000_000_000;
 /// commit 债券（msg.value）。
 pub const BOND: u128 = ONE_ETH;
-/// S-38 挑战押金（与 BatchSettler.CHALLENGE_BOND 一致，challenge 随笔 msg.value）。
+/// S-38/S-50 挑战押金：S-50 起为 BatchSettler 部署期构造参数（immutable）——本冒烟
+/// 部署按此值传入构造器，部署后回读 `challengeBond()` 交叉核对（单一事实源在链上）。
 pub const CHALLENGE_BOND: u128 = ONE_ETH / 10;
 /// 与 BatchSettler 的 `CHALLENGE_WINDOW`（6h）一致。
 pub const CHALLENGE_WINDOW_SECS: u64 = 6 * 3600;
@@ -184,5 +186,12 @@ pub async fn deploy(provider: &impl Provider, artifact_rel: &str, constructor_ar
 pub fn abi_addr(a: Address) -> Vec<u8> {
     let mut out = vec![0u8; 32];
     out[12..].copy_from_slice(a.as_slice());
+    out
+}
+
+/// abi.encode(uint256)（S-50 挑战押金构造参数，32 字节右对齐）。
+pub fn abi_u256(v: u128) -> Vec<u8> {
+    let mut out = vec![0u8; 32];
+    out[16..].copy_from_slice(&v.to_be_bytes());
     out
 }

@@ -16,11 +16,9 @@ import {Merkle} from "./Merkle.sol";
 ///        settlementFunded（= Σnet）全额退运营者。
 ///      · challenge 完整验证欺诈证明（漏单 kind=1 / 低付 kind=2，sha256 包含证明）→
 ///        债券罚没给挑战者、退款给运营者、整 epoch voided（后续 claim 拒绝）。
-///      · S-38 挑战押金（TECH_SPEC §6.5）：challenge 变 payable，随笔押金 CHALLENGE_BOND
-///        （原生 ETH，与 asset 无关）。押金入场前 4 类 revert（未结算 / 已挑战 / 窗口外 /
-///        金额不等，零押金风险）；入场后任何实质验证失败不再 revert —— 发 ChallengeRejected
-///        事件、押金全额销毁（address(0)，任何一方不可取回）、epoch 状态一字不动（仍可再
-///        挑战）。押金从不停留为合约状态（成功退回 / 失败销毁，本笔交易内结清），不扩大资金面。
+///      · S-38/S-50 挑战押金（TECH_SPEC §6.5）：challenge 变 payable，随笔押金 challengeBond
+///        （原生 ETH，与 asset 无关；S-50 起为部署期构造参数 immutable，`== 0` 构造即
+///        revert，不做运行时 setter）。押金入场前 4 类 revert（未结算 / 已挑战 / 窗口外 /
 ///      · S-28 资产参数化：`asset` 构造参数，`address(0)` = 原生 ETH（v2 行为逐字节保留），
 ///        `asset = USDC/ERC-20` 时结算资金（settle `transferFrom`）/ claim / void 退款走 token，
 ///        债券恒为原生 ETH（惩罚质押与结算资产分离）。token 模式强制 `msg.value == 0`。
@@ -115,8 +113,10 @@ contract BatchSettler {
     error NetIndexOutOfBounds(uint256 epochId, uint256 netIndex);
     error InsufficientSettlementFunding();
     error NotOperator();
-    // S-38：挑战押金金额不等（msg.value != CHALLENGE_BOND，押金入场前 revert）。
+    // S-38：挑战押金金额不等（msg.value != challengeBond，押金入场前 revert）。
     error WrongChallengeBond();
+    // S-50：押金金额为 0 的部署（等于静默回退到 S-38 之前的垃圾挑战面），构造期挡下。
+    error ZeroChallengeBond();
     // S-28 资产参数化。
     error TokenTransferFailed();
     error EthValueInTokenMode();
@@ -126,9 +126,11 @@ contract BatchSettler {
     /// 单次挑战最多携带的意图数（gas 上界：epoch_capacity=100k → 树深 17，每意图 ~19 次
     /// sha256 预编译；32 意图 ≈ 500-600k gas，块内可行）。
     uint256 public constant MAX_INTENTS_PER_CHALLENGE = 32;
-    /// S-38 挑战押金（原生 ETH，与 asset 无关）：垃圾挑战的押金成本（此前只靠 gas，见
-    /// TECH_SPEC §6.5）。固定常量；金额动态化随 Phase 2 多运营者一起定。
-    uint256 public constant CHALLENGE_BOND = 0.1 ether;
+    /// S-50 挑战押金（原生 ETH，与 asset 无关）：垃圾挑战的押金成本（此前只靠 gas，见
+    /// TECH_SPEC §6.5）。部署期构造参数（immutable），逐部署按 gas 价格/债券规模定夺；
+    /// 不做运行时 setter——改运行时金额需引入 admin 信任面（抬价 = 审查欺诈证明、降零 =
+    /// 复活垃圾挑战），比金额过时严重得多。`== 0` 构造即 revert（`ZeroChallengeBond`）。
+    uint256 public immutable challengeBond;
 
     /// 唯一结算运营者：commit/settle 的唯一合法调用者（S-11 防 griefing）。
     address public immutable operator;
@@ -138,9 +140,11 @@ contract BatchSettler {
 
     mapping(uint256 => Epoch) public epochs;
 
-    constructor(address operator_, address asset_) {
+    constructor(address operator_, address asset_, uint256 challengeBond_) {
         operator = operator_;
         asset = asset_;
+        if (challengeBond_ == 0) revert ZeroChallengeBond();
+        challengeBond = challengeBond_;
     }
 
     modifier onlyOperator() {
@@ -221,9 +225,9 @@ contract BatchSettler {
     }
 
     /// 挑战（S-38 押金制，TECH_SPEC §6.5）：窗口内任何人可对 commit≠settle 发起欺诈证明，
-    /// 随笔押金 CHALLENGE_BOND（原生 ETH，token 模式下债券/押金仍为 ETH）。
+    /// 随笔押金 challengeBond（原生 ETH，token 模式下债券/押金仍为 ETH）。
     /// 押金入场前 revert（无押金风险）：epoch 未结算 / 已成功挑战或 voided / 窗口关闭 /
-    /// msg.value != CHALLENGE_BOND。押金入场后"驳回即没收"：任何实质验证失败不再 revert，
+    /// msg.value != challengeBond。押金入场后"驳回即没收"：任何实质验证失败不再 revert，
     /// 发 ChallengeRejected + 押金全额销毁（address(0)）、epoch 状态一字不动（仍可再挑战）。
     /// 验证通过 → 押金退回 + 运营者债券罚没给挑战者、settlementFunded 退运营者、整 epoch voided。
     function challenge(uint256 epochId, FraudProof calldata fp) external payable {
@@ -233,13 +237,13 @@ contract BatchSettler {
         if (block.timestamp > uint256(ep.settledAt) + CHALLENGE_WINDOW) {
             revert ChallengeWindowClosed();
         }
-        if (msg.value != CHALLENGE_BOND) revert WrongChallengeBond();
+        if (msg.value != challengeBond) revert WrongChallengeBond();
 
         RejectReason reason = _verifyFraud(ep, fp);
         if (reason != RejectReason.None) {
             // CEI：事件（状态）先行，再外部调用。销毁目标 address(0) 无代码，无重入面。
             emit ChallengeRejected(epochId, msg.sender, uint8(reason));
-            (bool okBurn,) = payable(address(0)).call{value: CHALLENGE_BOND}("");
+            (bool okBurn,) = payable(address(0)).call{value: challengeBond}("");
             require(okBurn, "bond burn failed");
             return;
         }
@@ -251,7 +255,7 @@ contract BatchSettler {
         uint256 refund = ep.settlementFunded;
         ep.bondedAmount = 0;
         ep.settlementFunded = 0;
-        (bool okPayout,) = payable(msg.sender).call{value: CHALLENGE_BOND + bond}("");
+        (bool okPayout,) = payable(msg.sender).call{value: challengeBond + bond}("");
         require(okPayout, "bond transfer failed");
         if (refund > 0) {
             // S-28：settlementFunded 退款按结算资产原路退回（ETH 或 token）。

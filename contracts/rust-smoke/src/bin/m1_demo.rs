@@ -74,6 +74,8 @@ async fn run_m1() -> Result<()> {
     let _reg_addr = deploy(&provider, "RevocationRegistry.sol/RevocationRegistry.json", &abi_addr(dsa_addr)).await?;
     let mut settler_args = abi_addr(deployer_addr);
     settler_args.extend_from_slice(&abi_addr(Address::ZERO));
+    // S-50：挑战押金为部署期构造参数（本 demo 沿用参考值 0.1 ether）。
+    settler_args.extend_from_slice(&abi_u256(CHALLENGE_BOND));
     let settler_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &settler_args).await?;
     let dsa_c = IDSA::new(dsa_addr, &provider);
     let settler = IBatchSettler::new(settler_addr, &provider);

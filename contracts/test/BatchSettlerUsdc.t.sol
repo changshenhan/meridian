@@ -13,9 +13,11 @@ import {MockUSDC} from "./MockUSDC.sol";
 contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     BatchSettler internal bs;
     MockUSDC internal usdc;
-    /// S-38：挑战押金缓存（setUp 读一次）—— 不能内联进 `{value: ...}` 表达式（外部
+    /// S-38/S-50：挑战押金缓存（setUp 读一次）—— 不能内联进 `{value: ...}` 表达式（外部
     /// getter 会吃掉 vm.prank / vm.expectRevert 的下一次调用预期，见 BatchSettler.t.sol）。
+    /// S-50：押金为部署期构造参数，本套件沿用 S-38 参考值。
     uint256 internal challengeBond;
+    uint256 internal constant CHALLENGE_BOND = 0.1 ether;
     uint256 internal constant EPOCH = 1;
     uint256 internal constant BOND = 1 ether;
     address internal constant CHALLENGER = address(0xC0FFEE);
@@ -25,11 +27,11 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     function setUp() public {
         usdc = new MockUSDC();
         // operator = 测试合约自身；asset = MockUSDC。
-        bs = new BatchSettler(address(this), address(usdc));
+        bs = new BatchSettler(address(this), address(usdc), CHALLENGE_BOND);
         usdc.mint(address(this), MINT);
         // S-38：挑战押金恒为原生 ETH，挑战者预注资。
         vm.deal(CHALLENGER, 10 ether);
-        challengeBond = bs.CHALLENGE_BOND();
+        challengeBond = bs.challengeBond();
     }
 
     // ------------------------------------------------------------------ helpers
@@ -127,7 +129,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     function test_settle_insufficient_balance_reverts() public {
         // 余额不足（approve 够但 mint 余额 < net 和）→ transferFrom 失败。
         MockUSDC poor = new MockUSDC();
-        BatchSettler bsPoor = new BatchSettler(address(this), address(poor));
+        BatchSettler bsPoor = new BatchSettler(address(this), address(poor), CHALLENGE_BOND);
         poor.mint(address(this), 50e6);
         bsPoor.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
         BatchSettler.NetInstruction[] memory n = _net(); // Σ = 300e6 > 50e6
@@ -255,7 +257,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
 
     /// asset=address(0) 走原生 ETH —— v2 行为的部署形态（完整回归在 BatchSettler.t.sol）。
     function test_eth_mode_deploy_still_settles_native() public {
-        BatchSettler bsEth = new BatchSettler(address(this), address(0));
+        BatchSettler bsEth = new BatchSettler(address(this), address(0), CHALLENGE_BOND);
         bsEth.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
         BatchSettler.NetInstruction[] memory n = new BatchSettler.NetInstruction[](1);
         n[0] = BatchSettler.NetInstruction({recipient: address(0xA1), amount: 1 ether});

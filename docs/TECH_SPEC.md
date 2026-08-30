@@ -304,7 +304,8 @@ pub fn check_budget(
 
 两种模式最终都由 `BatchSettler` 净额结算。**S-11 起用原生 ETH**（bond = `msg.value`，
 claim 付原生 ETH；`BatchSettler` v2，见 §7）。**S-28 资产参数化**（§7）：
-`BatchSettler(operator, asset)`——`asset = address(0)` 即 v2 原生 ETH 行为（逐字节保留）；
+`BatchSettler(operator, asset, challengeBond)`——`asset = address(0)` 即 v2 原生 ETH 行为
+（逐字节保留）；`challengeBond` 为挑战押金（S-50 部署期参数化，>0 闸）；
 `asset = USDC/ERC-20` 时结算资金/claim/退款走 token，**债券仍原生 ETH**（惩罚质押与结算
 资产分离，不引入 token 质押的重入面）——`recipient + amount` 净额指令结构不变。
 
@@ -564,22 +565,34 @@ pub trait Ingest {
   预编译，~500-600k gas）。
 - **挑战押金（S-38，收口 audit-scope §4「challenge 无押金」）**：v1 反垃圾原本只靠 gas
   （无效挑战整笔回滚、挑战者零损失）——垃圾挑战向量在 gas 便宜的链上不成立。S-38 起
-  `challenge` 变 `payable`，押金 `CHALLENGE_BOND = 0.1 ether`（合约常量，原生 ETH，与
-  `asset` 无关、与运营者债券同币种；金额可配置化随 Phase 2 多运营者一起定）：
+  `challenge` 变 `payable`，押金为**部署期构造参数**（S-50，原生 ETH，与 `asset` 无关、
+  与运营者债券同币种）：
+  - **押金金额参数化（S-50，收口 S-38 残余自报「固定常量未动态化」）**：
+    `BatchSettler(operator, asset, challengeBond)`，`uint256 public immutable challengeBond`
+    （`anvil` 本地参考值 `0.1 ether`）。设计决策（记录在案）：**只做部署期参数化，不做
+    运行时 setter**——改运行时金额必须引入 admin/governor 信任面，而该角色天然可双向作恶：
+    抬价 → 审查欺诈证明（挑战成本 → ∞，等于拆掉 §6.5 乐观安全模型）、降零 → 复活 S-38
+    收口的垃圾挑战向量。二者都比"金额过时"严重得多，v1 单运营者阶段不值得为此开 admin 面
+    （本合约目前唯一权限角色 `operator` 也是 immutable，同口径）。金额随 gas 价格/债券规模
+    的运行时自适应挂 Phase 2 多运营者（那时本就有治理结构可挂靠）。**部署期 fail-fast 闸**：
+    `challengeBond_ == 0` 构造即 revert（`ZeroChallengeBond`）——零押金部署等于静默回退到
+    S-38 之前的垃圾挑战面，构造期挡下比事后靠人眼发现可靠。
+  - 其余押金语义与 S-38 逐字不变（金额来源换成 `challengeBond` 读取，四处使用点无一处
+    引入新状态）：
   1. **押金入场前 revert（零成本守卫，无押金风险）**：epoch 未结算（`EpochUnknown`）、
      已被成功挑战或 voided（`EpochAlreadyChallenged`）、窗口关闭（`ChallengeWindowClosed`）、
-     `msg.value != CHALLENGE_BOND`（`WrongChallengeBond`）。这四类是"状态/参数不合法"，
+     `msg.value != challengeBond`（`WrongChallengeBond`）。这四类是"状态/参数不合法"，
      证明根本没被审理，不构成垃圾挑战向量。
   2. **押金入场后"驳回即没收"**：押金随交易进入合约，欺诈证明的任何实质验证失败（非欺诈
      `NotFraud`、包含证明不成立、同笔重复计入、跨收款人子集、kind 形状非法、意图数越界、
      目标行越界）**不再 revert**——返回 `ChallengeRejected(epochId, challenger, reason)`
      事件，押金全额转入 `address(0)` 销毁，epoch 状态**一字不动**（不置 `challenged`/不
      `voided`/运营者债券与结算资金原封），该 epoch 仍可被再次挑战。垃圾挑战者每次尝试
-     实付 0.1 ETH，gas 之外有了真押金。
+     实付一笔押金（`challengeBond`，部署期定），gas 之外有了真押金。
   3. **没收款销毁（不判给任何一方）**：押金没收款转 `address(0)`，运营者/挑战者/其他方均
      不可取回——不给运营者制造"被挑战有赏"的激励，也不给任何路径新增可窃取资金池。
      （对照：运营者债券没收款**判给挑战者**，那是欺诈成立的赔偿，两者性质不同。）
-  4. **押金从不停留为合约状态**：成功路径挑战者拿回 `CHALLENGE_BOND + 运营者债券`（一笔
+  4. **押金从不停留为合约状态**：成功路径挑战者拿回 `challengeBond + 运营者债券`（一笔
      call），失败路径押金销毁，均在本笔交易内结清——合约不新增任何跨交易的挑战方余额记账，
      不扩大 §6.4 的资金面。
   5. **CEI 顺序**：拒绝路径 = 事件（状态）→ 销毁转账；成功路径 = 先置 `challenged`/`voided`
@@ -1248,11 +1261,14 @@ contract BatchSettler {
     address public immutable operator;                 // 唯一运营者（onlyOperator 守卫）
     address public immutable asset;                    // S-28：address(0) = 原生 ETH（v2 行为）；
                                                        //        否则 = ERC-20 结算资产（如 USDC）
+    uint256 public immutable challengeBond;            // S-50：挑战押金（部署期参数，>0 闸）；
+                                                       //        恒原生 ETH（与 asset 无关）
     uint256 public constant CHALLENGE_WINDOW = 6 hours;
     uint256 public constant MAX_INTENTS_PER_CHALLENGE = 32;
-    uint256 public constant CHALLENGE_BOND = 0.1 ether; // S-38 挑战押金（原生 ETH，与 asset 无关）
 
-    constructor(address operator_, address asset_);    // bond 恒为原生 ETH（两模式相同）
+    constructor(address operator_, address asset_, uint256 challengeBond_);
+                                                       // bond/押金恒原生 ETH（两模式相同）；
+                                                       // challengeBond_ == 0 构造即 revert
 
     function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot)
         external payable onlyOperator;                // 质押债券（msg.value）+ 锚定撤销根，一次性
@@ -1268,7 +1284,8 @@ contract BatchSettler {
     error WrongNettingRoot(); error ChallengeWindowClosed(); error ChallengeWindowOpen();
     error AlreadyClaimed(uint256,uint256); error NetIndexOutOfBounds(uint256,uint256);
     error InsufficientSettlementFunding(); error NotOperator();
-    error WrongChallengeBond();                        // S-38：msg.value != CHALLENGE_BOND
+    error WrongChallengeBond();                        // S-38：msg.value != challengeBond
+    error ZeroChallengeBond();                         // S-50：challengeBond_ == 0 构造即 revert
     // S-38 移除（押金入场后不再 revert，改为 ChallengeRejected 的 reason 码）：
     // TooManyIntents / DuplicateIntent / BadInclusionProof / NotFraud / BadFraudKind
     error TokenTransferFailed(); error EthValueInTokenMode();   // S-28 资产参数化
@@ -1283,7 +1300,8 @@ contract BatchSettler {
 
 - 部署底座：Base（主网 Phase 2 起）；测试：Anvil 本地链 + Base Sepolia。
 - **S-11 结算资产 = 原生 ETH**（bond = `msg.value`；claim 付原生 ETH）；**S-28 资产参数化
-  落地 ERC-20 结算**——`BatchSettler(operator, asset)`：`asset = address(0)` 逐字节保留 v2
+  落地 ERC-20 结算**——`BatchSettler(operator, asset, challengeBond)`（S-50 押金随构造
+  参数化）：`asset = address(0)` 逐字节保留 v2
   行为，`asset = USDC` 时 settle `transferFrom` 拉款 / claim 付 token / void 退款退 token
   （bond 仍原生 ETH），强制 token 模式 `msg.value == 0`（`EthValueInTokenMode`）；
   `NetInstruction { recipient, amount }` 指令形状不变，资产置换不动净额结构。欺诈证明机制

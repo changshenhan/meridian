@@ -72,11 +72,13 @@ async fn run_smoke() -> Result<()> {
         .await
         .context("anvil_setBalance(owner)")?;
 
-    // 2. 部署三合约（BatchSettler 构造参数 = operator + asset；S-11d 走原生 ETH = address(0)）。
+    // 2. 部署三合约（BatchSettler 构造参数 = operator + asset + challengeBond（S-50 部署期
+    //    押金参数）；S-11d 走原生 ETH = address(0)）。
     let dsa_addr = deploy(&provider, "DSA.sol/DSA.json", &[]).await?;
     let reg_addr = deploy(&provider, "RevocationRegistry.sol/RevocationRegistry.json", &abi_addr(dsa_addr)).await?;
     let mut settler_args = abi_addr(deployer_addr);
     settler_args.extend_from_slice(&abi_addr(Address::ZERO));
+    settler_args.extend_from_slice(&abi_u256(CHALLENGE_BOND));
     let settler_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &settler_args).await?;
     let dsa_c = IDSA::new(dsa_addr, &provider);
     let reg_c = IRevocationRegistry::new(reg_addr, &owner_provider);
@@ -235,10 +237,17 @@ async fn run_smoke() -> Result<()> {
     };
 
     let challenger_before = provider.get_balance(challenger.address()).await?;
-    // S-38：challenge 变 payable，随笔押金 CHALLENGE_BOND（成功路径原额退回）。
+    // S-50：押金金额单一事实源在链上 —— 部署参数与本地常量交叉核对后按回读值随笔押入。
+    let bond_on_chain = settler.challengeBond().call().await?;
+    assert_eq!(
+        bond_on_chain,
+        U256::from(CHALLENGE_BOND),
+        "challengeBond() 必须与部署参数一致"
+    );
+    // S-38：challenge 变 payable，随笔押金 challengeBond（成功路径原额退回）。
     let ch_rec = settler_ch
         .challenge(U256::from(1), fp)
-        .value(U256::from(CHALLENGE_BOND))
+        .value(bond_on_chain)
         .send().await.context("challenge send")?
         .get_receipt().await.context("challenge receipt")?;
     assert!(ch_rec.status(), "challenge 必须成功（不漏单则驳回没收押金）");

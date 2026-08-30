@@ -12,10 +12,13 @@ import {ChallengeTestHelper} from "./ChallengeTestHelper.sol";
 /// [5]nettingRoot [6]committed [7]settled [8]challenged [9]voided。
 contract BatchSettlerTest is Test, ChallengeTestHelper {
     BatchSettler internal bs;
-    /// S-38：挑战押金缓存（setUp 读一次）。注意不能写在 `{value: bs.CHALLENGE_BOND()}`
-    /// 里 —— value 表达式里的外部 getter 调用会吃掉 vm.prank / vm.expectRevert 的
-    /// "下一次调用"预期，导致 msg.sender 漂移 / 预期落空。
+    /// S-50：挑战押金（部署期构造参数，immutable）。本套件沿用 S-38 的参考值；非缺省值
+    /// 的端到端证明见 `test_challenge_bond_is_a_deployment_parameter`。缓存进状态变量
+    /// （setUp 读一次）——不能写在 `{value: bs.challengeBond()}` 里，value 表达式里的
+    /// 外部 getter 调用会吃掉 vm.prank / vm.expectRevert 的"下一次调用"预期，导致
+    /// msg.sender 漂移 / 预期落空。
     uint256 internal challengeBond;
+    uint256 internal constant CHALLENGE_BOND = 0.1 ether;
     uint256 internal constant EPOCH = 1;
     uint256 internal constant BOND = 1 ether;
     address internal constant CHALLENGER = address(0xC0FFEE);
@@ -23,10 +26,10 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
 
     function setUp() public {
         // operator = 测试合约自身（可直呼 commit/settle）。asset = address(0) → 原生 ETH（v2 行为）。
-        bs = new BatchSettler(address(this), address(0));
-        // S-38：挑战者要实际押入 CHALLENGE_BOND，显式预注资（不依赖 foundry 默认余额）。
+        bs = new BatchSettler(address(this), address(0), CHALLENGE_BOND);
+        // S-38：挑战者要实际押入挑战押金，显式预注资（不依赖 foundry 默认余额）。
         vm.deal(CHALLENGER, 10 ether);
-        challengeBond = bs.CHALLENGE_BOND();
+        challengeBond = bs.challengeBond();
     }
 
     /// 测试合约作为 operator 需能接收 void 时的结算资金退款。
@@ -137,6 +140,86 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         assertTrue(settled);
         assertFalse(challenged, "rejected challenge must not mark epoch challenged");
         assertFalse(voided, "rejected challenge must not void epoch");
+    }
+
+    // ------------------------------------------------------------------ S-50 押金参数化
+
+    /// S-50：押金为部署期构造参数。零押金部署等于静默回退到 S-38 之前的垃圾挑战面 →
+    /// 构造期 fail-fast（`ZeroChallengeBond`）。
+    function test_constructor_rejects_zero_challenge_bond() public {
+        vm.expectRevert(BatchSettler.ZeroChallengeBond.selector);
+        new BatchSettler(address(this), address(0), 0);
+    }
+
+    /// S-50：非缺省押金端到端 —— 参数不是摆设，金额真进了入场闸与成功路径赔付
+    /// （押金原额退回 + 运营者债券罚没一笔给挑战者），且 epoch voided 后 claim 拒绝。
+    function test_challenge_bond_is_a_deployment_parameter() public {
+        uint256 customBond = 0.37 ether;
+        BatchSettler custom = new BatchSettler(address(this), address(0), customBond);
+        assertEq(custom.challengeBond(), customBond);
+
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        custom.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+        custom.settle{value: 0}(EPOCH, _emptyNet(), keccak256(abi.encode(_emptyNet())));
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](1);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        BatchSettler.FraudProof memory fp =
+            BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
+
+        uint256 challengerBefore = CHALLENGER.balance;
+        vm.prank(CHALLENGER);
+        custom.challenge{value: customBond}(EPOCH, fp);
+        // 押金原额退回（净增 0），净增 = 运营者债券罚没。
+        assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond payout uses custom");
+        (, , uint256 bondedAmount, uint256 settlementFunded, , , , , , bool voided) =
+            _epochViewOn(custom, EPOCH);
+        assertEq(bondedAmount, 0);
+        assertEq(settlementFunded, 0);
+        assertTrue(voided);
+
+        // 缺省押金的 call 在参数化部署上必拒（入场前 revert，无押金风险）。用新 epoch ——
+        // EPOCH 已 voided，挑战闸会先撞 EpochAlreadyChallenged 而轮不到金额检查。
+        custom.commit{value: BOND}(2, root, REVOCATION_ROOT);
+        custom.settle{value: 0}(2, _emptyNet(), keccak256(abi.encode(_emptyNet())));
+        vm.expectRevert(BatchSettler.WrongChallengeBond.selector);
+        custom.challenge{value: CHALLENGE_BOND}(2, fp);
+    }
+
+    /// `_epochView` 的任意部署版本（S-50 参数化用例对第二个 settler 断言 epoch 状态）。
+    function _epochViewOn(BatchSettler target, uint256 epochId)
+        internal
+        view
+        returns (
+            bytes32 commitmentRoot,
+            bytes32 revocationRoot,
+            uint256 bondedAmount,
+            uint256 settlementFunded,
+            uint64 settledAt,
+            bytes32 nettingRoot,
+            bool committed,
+            bool settled,
+            bool challenged,
+            bool voided
+        )
+    {
+        (
+            commitmentRoot,
+            revocationRoot,
+            bondedAmount,
+            settlementFunded,
+            settledAt,
+            nettingRoot,
+            committed,
+            settled,
+            challenged,
+            voided
+        ) = target.epochs(epochId);
     }
 
     // ------------------------------------------------------------------ commit / operator
