@@ -11,6 +11,8 @@
 //!   超限请求**未进内核**——无 seq、无记账，SDK 可安全退避重试。
 //! - 租户表热更（S-54）：`POST /v1/admin/tenants` 整表替换（撤销/接入/轮换同一操作面），
 //!   `RwLock` 读多写少；admin_key 独立于租户表，未配置 = 端点不存在。
+//! - 运营者撤销面（S-57）：`POST /v1/admin/revocations` 把 `Aggregator::revoke`（§4.6
+//!   撤销事件流的运营者入口）补进网络操作面——此前只有进程内调用，运营者无从触发。
 //! - 部署拓扑（S-56）：TLS 由反代终结（§6.7 部署拓扑节 / ops.md §7）——网关恒明文 +
 //!   回环绑定，反代是信任边界但**不是认证边界**（代理注入头不是信任锚，测试钉死）。
 
@@ -37,6 +39,10 @@ pub const E_NOT_FOUND: &str = "E_NOT_FOUND";
 /// 目标（S-42 fail-closed，成员证明不由本接口给出）。复用 §11 主表内核码字符串（wire
 /// 层响应码，语义同主表「委托已撤销」），不进内核枚举实例化。
 pub const E_REVOKED: &str = "E_REVOKED";
+/// 撤销面（S-57 `/v1/admin/revocations`）目标委托未注册——复用 §11 主表内核码字符串作
+/// wire 响应码（语义同主表「委托未注册」，对齐链上 `DSA.revoke` 未注册 reverts），
+/// 不进内核枚举实例化。
+pub const E_DELEG_UNKNOWN: &str = "E_DELEG_UNKNOWN";
 
 /// 网关配置（JSON 文件形态，§6.7）。
 ///
@@ -191,6 +197,21 @@ pub struct AdminReloadResponse {
     pub tenants: usize,
 }
 
+/// 撤销端点请求体（S-57）：单个 delegation_hash（0x 前缀宽容，hex 64）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AdminRevocationRequest {
+    pub delegation_hash: String,
+}
+
+/// 撤销端点响应（S-57）：撤销后当刻撤销承诺摘要。
+/// `revocation_root` = 撤销后当刻树根（64hex，与 `/v1/revocation-witness` 根同源）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AdminRevocationResponse {
+    pub newly_revoked: bool,
+    pub revocation_root: String,
+    pub revoked_len: usize,
+}
+
 impl Gateway {
     pub fn new(agg: Arc<Aggregator>, cfg: &Config) -> Self {
         Gateway {
@@ -233,6 +254,7 @@ impl Gateway {
         match (method, path) {
             ("GET", "/healthz") => self.handle_healthz(),
             ("POST", "/v1/admin/tenants") => self.handle_admin_tenants(bearer, body),
+            ("POST", "/v1/admin/revocations") => self.handle_admin_revoke(bearer, body),
             ("POST", "/v1/authorize") => {
                 self.handle_authorized(bearer, body, Self::handle_authorize)
             }
@@ -309,6 +331,59 @@ impl Gateway {
         Response::json(
             200,
             serde_json::to_string(&resp).expect("AdminReloadResponse serializes"),
+        )
+    }
+
+    /// S-57 运营者撤销面（§6.7 管理面）：`POST /v1/admin/revocations` →
+    /// `Aggregator::revoke`（§4.6 撤销事件流的网络入口）。门面同 `/v1/admin/tenants`
+    /// （admin_key；未配置 = 端点不存在；管理请求不走租户限流）。
+    ///
+    /// 语义三路（§6.7）：未注册 dh → 400 `E_DELEG_UNKNOWN`（对齐链上 `DSA.revoke` 未注册
+    /// reverts——错 dh 请求期暴露，不静默污染撤销树/扰动在途 witness）；已撤销幂等重放
+    /// → 200 `newly_revoked: false`（不重复落 WAL 撤销记录）；新撤销 → 200
+    /// `newly_revoked: true` + 撤销后当刻根。
+    fn handle_admin_revoke(&self, bearer: Option<&str>, body: &[u8]) -> Response {
+        let Some(admin) = self.admin_key.as_deref() else {
+            return Response::error(404, E_MALFORMED, "unknown route");
+        };
+        if bearer != Some(admin) {
+            return Response::error(401, E_AUTH, "missing or unknown admin key");
+        }
+        if body.len() > self.max_body {
+            return Response::error(413, E_MALFORMED, "request body too large");
+        }
+        let req: AdminRevocationRequest = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return Response::error(400, E_MALFORMED, format!("bad JSON: {e}")),
+        };
+        let dh_hex = req
+            .delegation_hash
+            .strip_prefix("0x")
+            .unwrap_or(&req.delegation_hash);
+        let dh = match meridian_aggregator::wire::hex_to_bytes32(dh_hex) {
+            Ok(dh) => dh,
+            Err(e) => {
+                return Response::error(400, E_MALFORMED, format!("bad delegation_hash: {e}"))
+            }
+        };
+        if self.agg.registered(&dh).is_none() {
+            return Response::error(400, E_DELEG_UNKNOWN, "delegation not registered");
+        }
+        // 幂等：已撤销直接回 false，不再落一条重复 WAL 撤销记录（撤销集入叶天然去重，
+        // 并发窗口内至多多一条幂等记录，`revoke` 返回值定夺响应——无撕裂）。
+        let newly = if self.agg.is_revoked(&dh) {
+            false
+        } else {
+            self.agg.revoke(dh)
+        };
+        let resp = AdminRevocationResponse {
+            newly_revoked: newly,
+            revocation_root: hex::encode(self.agg.revocation_root()),
+            revoked_len: self.agg.revoked_len(),
+        };
+        Response::json(
+            200,
+            serde_json::to_string(&resp).expect("AdminRevocationResponse serializes"),
         )
     }
 

@@ -656,6 +656,268 @@ fn admin_reload_over_real_socket() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b+. S-57 运营者撤销面（POST /v1/admin/revocations，§6.7 管理面）——
+//      §4.6 撤销事件流「运营者调 Aggregator::revoke」的网络入口。
+// ---------------------------------------------------------------------------
+
+use meridian_core::dsa::{
+    delegation_hash, sign_delegation, AgentPubKey, AgentSigningKey, Delegation, RateLimit,
+};
+
+/// 注册一个委托进聚合器（测试直注，绕过 authorize 线格式），返回 delegation_hash。
+fn register_delegation(agg: &Aggregator, agent: [u8; 20]) -> [u8; 32] {
+    let d = Delegation {
+        agent,
+        owner: [2u8; 20],
+        nonce: 7,
+        max_per_spend: 1_000,
+        rate: RateLimit {
+            window_secs: 60,
+            max_per_window: 1_000_000,
+        },
+        total_cap: 1_000_000,
+        categories: vec![],
+        not_before: 0,
+        expires_at: u64::MAX,
+        version: 1,
+    };
+    let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
+    let agent_pub: AgentPubKey = AgentSigningKey::from_bytes(&[5u8; 32]).verifying_key();
+    agg.register(sd, agent_pub);
+    delegation_hash(&d)
+}
+
+fn revoke_body(dh: &[u8; 32]) -> Vec<u8> {
+    format!(r#"{{"delegation_hash":"{}"}}"#, hex::encode(dh)).into_bytes()
+}
+
+/// S-57 主链：撤销 → 200 newly_revoked + 当刻根（空根换非空根）→ 幂等重放
+/// newly_revoked=false 且根不变 → witness 端点 404 E_REVOKED。0x 前缀宽容。
+#[test]
+fn admin_revoke_revokes_advances_root_and_is_idempotent() {
+    let (_p, agg) = aggregator("admin-revoke-main");
+    let gw = Gateway::with_tenants(Arc::clone(&agg), tenants_one("k1", "t1", 1_000), 64 * 1024)
+        .with_admin_key(Some("adm".into()));
+    let dh = register_delegation(&agg, [4u8; 20]);
+    let empty_root = agg.revocation_root();
+
+    // 新撤销：newly_revoked=true，根 = 撤销后当刻树根（≠ 空根），revoked_len=1。
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/revocations",
+        Some("adm"),
+        &revoke_body(&dh),
+    );
+    assert_eq!(r.status, 200, "body: {}", r.body);
+    let resp: meridian_gateway::AdminRevocationResponse =
+        serde_json::from_str(&r.body).expect("revoke dto");
+    assert!(resp.newly_revoked);
+    assert_eq!(resp.revoked_len, 1);
+    assert_eq!(resp.revocation_root, hex::encode(agg.revocation_root()));
+    assert_ne!(
+        resp.revocation_root,
+        hex::encode(empty_root),
+        "撤销换根（空根 → 非空根）"
+    );
+    assert!(agg.is_revoked(&dh));
+
+    // 交叉确认：同 dh witness 查询 → 404 E_REVOKED（走租户闸，与撤销根同源）。
+    let r = gw.handle(
+        "GET",
+        &format!("/v1/revocation-witness/{}", hex::encode(dh)),
+        Some("k1"),
+        b"",
+    );
+    assert_eq!(r.status, 404);
+    assert!(r.body.contains(meridian_gateway::E_REVOKED));
+
+    // 幂等重放（0x 前缀宽容）：newly_revoked=false，根与 revoked_len 不变。
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/revocations",
+        Some("adm"),
+        &format!(r#"{{"delegation_hash":"0x{}"}}"#, hex::encode(dh)).into_bytes(),
+    );
+    assert_eq!(r.status, 200, "body: {}", r.body);
+    let resp2: meridian_gateway::AdminRevocationResponse =
+        serde_json::from_str(&r.body).expect("revoke dto");
+    assert!(!resp2.newly_revoked);
+    assert_eq!(resp2.revoked_len, 1, "重复撤销不增计数");
+    assert_eq!(resp2.revocation_root, resp.revocation_root, "幂等不换根");
+}
+
+/// S-57 语义边界：未注册 dh → 400 E_DELEG_UNKNOWN（对齐链上 DSA.revoke 未注册 reverts，
+/// 错 dh 不许污染撤销树/扰动在途 witness）；坏 hex / 坏 JSON / 缺字段 → 400 E_MALFORMED。
+#[test]
+fn admin_revoke_rejects_unregistered_and_malformed() {
+    let (_p, agg) = aggregator("admin-revoke-neg");
+    let gw = Gateway::with_tenants(Arc::clone(&agg), tenants_one("k1", "t1", 1_000), 64 * 1024)
+        .with_admin_key(Some("adm".into()));
+
+    // 未注册（但格式合法）→ 400 E_DELEG_UNKNOWN；撤销集未被动（revoked_len=0）。
+    let unknown = [9u8; 32];
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/revocations",
+        Some("adm"),
+        &revoke_body(&unknown),
+    );
+    assert_eq!(r.status, 400, "body: {}", r.body);
+    assert!(r.body.contains(meridian_gateway::E_DELEG_UNKNOWN));
+    assert_eq!(agg.revoked_len(), 0);
+    assert_eq!(
+        agg.revocation_root(),
+        meridian_aggregator::revocation::RevocationSet::new().sparse_root(),
+        "被拒撤销不换根（仍是空撤销集根）"
+    );
+
+    // 坏 hex / 错长度 → 400 E_MALFORMED。
+    for bad in ["zz", &hex::encode([1u8; 31])] {
+        let r = gw.handle(
+            "POST",
+            "/v1/admin/revocations",
+            Some("adm"),
+            &format!(r#"{{"delegation_hash":"{bad}"}}"#).into_bytes(),
+        );
+        assert_eq!(r.status, 400, "bad hash {bad:?}");
+        assert!(r.body.contains(E_MALFORMED));
+    }
+    // 坏 JSON / 缺字段 → 400 E_MALFORMED。
+    for body in [b"{not json".as_slice(), b"{}".as_slice()] {
+        let r = gw.handle("POST", "/v1/admin/revocations", Some("adm"), body);
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains(E_MALFORMED));
+    }
+    // body 超限 → 413（max_body=64）。
+    let (_p2, agg2) = aggregator("admin-revoke-cap");
+    let gw2 = Gateway::with_tenants(
+        Arc::clone(&agg2),
+        TenantTable::from_conf(&Default::default()),
+        64,
+    )
+    .with_admin_key(Some("adm".into()));
+    let big = format!(r#"{{"delegation_hash":"{}"}}"#, "x".repeat(70)).into_bytes();
+    assert_eq!(
+        gw2.handle("POST", "/v1/admin/revocations", Some("adm"), &big)
+            .status,
+        413
+    );
+}
+
+/// S-57 门面隔离：admin_key 未配置 = 端点不存在（404 同未路由路径）；租户 key 不能当
+/// admin key（401）；缺 key 401；**管理请求不走租户限流**（租户桶打空后撤销仍可达）。
+#[test]
+fn admin_revoke_face_isolation_and_no_tenant_rate_limit() {
+    // 未配置 admin_key：端点不存在，不泄露管理面。
+    let (_p, agg) = aggregator("admin-revoke-off");
+    let gw = Gateway::with_tenants(agg, tenants_one("k1", "t1", 1_000), 64 * 1024);
+    assert_eq!(
+        gw.handle("POST", "/v1/admin/revocations", Some("k1"), b"{}")
+            .status,
+        404
+    );
+    assert_eq!(
+        gw.handle("POST", "/v1/admin/revocations", Some("k1"), b"{}")
+            .body,
+        gw.handle("POST", "/nope", None, b"").body
+    );
+
+    // 配置了 admin_key：租户 key ≠ admin key（两面构造隔离）；缺 key 401。
+    let (_p2, gw2) = admin_gateway("admin-revoke-face", "adm", 2);
+    let r = gw2.handle(
+        "POST",
+        "/v1/admin/revocations",
+        Some("k1"),
+        &revoke_body(&[9u8; 32]),
+    );
+    assert_eq!(r.status, 401);
+    assert!(r.body.contains(E_AUTH));
+    assert_eq!(
+        gw2.handle("POST", "/v1/admin/revocations", None, b"{}")
+            .status,
+        401
+    );
+
+    // 租户桶打空（rpm=2：第三发 429），管理请求仍可达（不走租户限流）。
+    for _ in 0..2 {
+        assert_eq!(
+            gw2.handle("POST", "/v1/intents", Some("k1"), b"not-json")
+                .status,
+            400
+        );
+    }
+    assert_eq!(
+        gw2.handle("POST", "/v1/intents", Some("k1"), b"not-json")
+            .status,
+        429
+    );
+    let r = gw2.handle(
+        "POST",
+        "/v1/admin/revocations",
+        Some("adm"),
+        &revoke_body(&[9u8; 32]),
+    );
+    assert_eq!(r.status, 400, "管理面不受租户限流，打到业务校验（未注册）");
+    assert!(r.body.contains(meridian_gateway::E_DELEG_UNKNOWN));
+}
+
+/// S-57 真 socket e2e：authorize（SDK 全链路）→ 管理端点撤销 → 同委托 pay 业务拒绝
+/// `E_REVOKED`（撤销即时生效于本进程）→ witness 404。
+#[test]
+fn e2e_admin_revoke_blocks_paying_over_http() {
+    // 带 admin key 的网关（spawn_gateway 不带管理面，这里展开同款脚手架）。
+    let (_wal, agg) = aggregator("e2e-admin-revoke");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let gw = Arc::new(
+        Gateway::with_tenants(
+            Arc::clone(&agg),
+            tenants_one("e2e-key", "e2e-tenant", u64::MAX),
+            64 * 1024,
+        )
+        .with_admin_key(Some("adm".into())),
+    );
+    std::thread::spawn(move || {
+        let _ = serve(gw, listener, 256, Duration::from_secs(5));
+    });
+
+    let transport = HttpTransport::new(&addr, "e2e-key");
+    let (wallet, owner) = wallet_and_owner();
+    let mut client = SdkClient::new(wallet, Box::new(transport));
+    client.set_retry(RetryPolicy {
+        max_attempts: 1,
+        base_backoff_ms: 0,
+        max_backoff_ms: 0,
+    });
+    let rec = client.authorize(&owner, [1u8; 20], &limits(1_000)).unwrap();
+    let dh = rec.delegation_hash;
+
+    // 撤销前 witness 可得（非成员陈述，走 SDK 同步入口入库缓存）。
+    assert!(client.sync_revocation_witness(&dh).unwrap().is_some());
+
+    // 管理端点撤销 → 200 newly_revoked=true。
+    let (status, body) = raw_post(
+        &addr,
+        "/v1/admin/revocations",
+        Some("adm"),
+        &revoke_body(&dh),
+    );
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains(r#""newly_revoked":true"#), "body: {body}");
+
+    // 撤销后 pay → 业务拒绝 E_REVOKED（定局，不是传输错误）。
+    let err = client.pay(&pay_params(dh, 100)).unwrap_err();
+    assert!(
+        matches!(err, SdkError::Meridian(_)),
+        "撤销是新意图的业务拒绝，非传输错误: {err:?}"
+    );
+    assert_eq!(err.code(), "E_REVOKED", "err: {err:?}");
+
+    // witness → 404 E_REVOKED → SDK Ok(None)。
+    assert!(client.sync_revocation_witness(&dh).unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
 // 1c. S-56 反代面：TLS 反代部署口径（TECH_SPEC §6.7 部署拓扑节 / ops.md §7）的测试锚
 //     —— 反代可注入的头部不是信任锚、chunked 请求恒拒。钉的是文档口径里的
 //     「已实测语义」，不是某个具体反代的配置。

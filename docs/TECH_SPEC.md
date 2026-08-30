@@ -251,7 +251,8 @@ pub fn check_budget(
   ③ **全树交叉（最强锚）**：gen-witness fixture（撤销集 {`0x01…32`, `0x02…32`}）的
   `revocation_root`——Rust `RevocationSet` 算出的根必须与 Noir `nargo execute` 输出相等
   （gen-witness `revocation_empty_roots_match_aggregator_golden` 锁空子树表 + 聚合器
-  fixture golden 锁全树，双向）。撤销事件流：链上 revoke → 运营者调 `Aggregator::revoke(dh)`（WAL 追加
+  fixture golden 锁全树，双向）。撤销事件流：链上 revoke → 运营者调 `Aggregator::revoke(dh)`
+  （网络化部署经网关管理端点 `POST /v1/admin/revocations`，S-57，§6.7 撤销面）（WAL 追加
   `Revoke` 记录后入集，崩溃可重放重建）→ `submit()` 在注册表查找后立即查集，已撤销委托
   新意图一律 `E_REVOKED` 拒（最廉价闸口，不耗 nonce/窗口槽）→ 撤销根随**下个密封 epoch**
   的 `ChainPublisher::commit` 上链（S-11 验收：1 epoch 内进入撤销根）。
@@ -669,6 +670,7 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
 | GET | `/v1/nonce/{delegation_hash}` | 只读下一 nonce 查询（S-31，SDK 跨重启恢复） | `Aggregator::next_nonce` |
 | GET | `/v1/revocation-witness/{delegation_hash}` | 只读撤销非成员 witness 查询（S-45，§6.14 SDK 半边） | `Aggregator::revocation_witness` |
 | POST | `/v1/admin/tenants` | 租户表整表热更（撤销/接入/轮换，S-54，admin_key 独立认证） | `Gateway::reload_tenants` |
+| POST | `/v1/admin/revocations` | 运营者撤销委托（S-57，§4.6 撤销事件流网络入口，admin_key 同门面） | `Aggregator::revoke` |
 | GET | `/healthz` | 网关存活（含内核 `accepted_count` 快照） | — |
 
 **请求/响应（wire，JSON）**：
@@ -789,12 +791,43 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
   TLS 终结点之后，见部署口径）；空表替换允许（显式「撤销全部租户」，admin key 独立
   存在故仍可再推恢复）。
 
+**运营者撤销面（S-57，`POST /v1/admin/revocations`，管理面）**：
+
+- 缺口本体：§4.6 撤销事件流「链上 revoke → 运营者调 `Aggregator::revoke(dh)`」此前
+  只有进程内入口——网络化部署里运营者（远程操作方）对网关内嵌聚合器**无从触发撤销**，
+  安全关键操作悬空。本端点补齐操作面；内核语义零改动（`Aggregator::revoke`：WAL 追加
+  + 撤销集入叶 + 撤销根推进随 S-49 同批落盘）。
+- 门面同 `/v1/admin/tenants`：`Authorization: Bearer <admin_key>`；未配置 admin key =
+  端点不存在（404 unknown route，不泄露存在性）；不符 / 缺失 → `401 E_AUTH`；管理
+  请求不走租户限流。body > `max_body_bytes` → `413`。
+- body：`{"delegation_hash": "<64hex>"}`（0x 前缀宽容，同只读查询口径）。**单 dh**——
+  批量撤销 v1 不做（撤销低频高危，逐笔确认根推进；诚实边界记录在案）。
+- 语义（三路）：
+
+  - 未注册 dh → `400 E_DELEG_UNKNOWN`（复用 §11 主表内核码字符串作 wire 响应码，
+    同 `E_REVOKED` 口径）——对齐链上 `DSA.revoke` 未注册 reverts 的语义：手滑 dh 是
+    配置错误，请求期暴露比静默污染撤销树好；撤销会**换根并扰动全部在途 witness**
+    （可用性扰动），不该被一个错 dh 触发。fail-closed 方向 = 拒绝。
+  - 已撤销（幂等重放）→ `200 {"newly_revoked": false, "revocation_root": "<64hex>",
+    "revoked_len": <n>}`——**不重复落 WAL 撤销记录**（端点侧先查 `is_revoked` 再调
+    `revoke`；并发窗口内两请求同 dh 至多多一条幂等撤销记录，撤销集入叶天然去重，
+    `revoke()` 返回值定夺响应，无撕裂）；根不变。
+  - 新撤销 → `revoke(dh)` → `200 {"newly_revoked": true, "revocation_root": "<64hex>",
+    "revoked_len": <n>}`。`revocation_root` = 撤销后当刻树根（撤销集非空立即换根）；
+    **链上承诺随下个密封 epoch**（§4.6）。运营者交叉确认：同 dh 再查
+    `/v1/revocation-witness/{dh}` → `404 E_REVOKED`，其余委托 witness 根 = 响应根。
+- **语义边界（诚实）**：撤销即时生效于**本进程**（该委托新意图 `E_REVOKED` 拒）；
+  **多副本部署（S-39 副本组）无跨副本复制——逐副本各自调本端点**，漏调副本继续接受
+  已撤销委托直至 `replicas_converged` 告警（ops.md 运营撤销流程按逐副本口径）。
+  链上 `RevocationRegistry` 的 revoke 与本端点是两级独立动作（链上撤销不自动进聚合器，
+  v1 无链上监听器——运营者负责传播，§4.6 债券罚没兜底「已撤销仍消费」窗口）。
+
 **HTTP 状态映射**：
 
 | 状态 | 场景 | SDK 视角 |
 |---|---|---|
 | 200 | 内核 Receipt（accepted 或 E_* 业务拒绝） | 定局 |
-| 400 | JSON 不合法 / 字段缺失 / hex 非法（`E_MALFORMED`） | 定局（重发同请求无害，但不自动重试） |
+| 400 | JSON 不合法 / 字段缺失 / hex 非法（`E_MALFORMED`）；撤销目标未注册（`E_DELEG_UNKNOWN`，S-57，复用 §11 主表码） | 定局（重发同请求无害，但不自动重试） |
 | 404 | 只读查询未命中（`E_NOT_FOUND`：回执不存在；`E_REVOKED`：witness 查询目标已撤销） | 定局（重发同查询无害，结果不变） |
 | 401 | Bearer 缺失/未知（`E_AUTH`） | 配置错误，不重试 |
 | 413 | 请求体 > 64 KiB | 不重试（信封远小于此） |
@@ -831,9 +864,9 @@ S-15 部署清单项）；无指标端点（monitor `server.rs` 独立刮取）�
   - **代理层不得对 `POST /v1/intents` 透明重试**——网关 200 即定局（业务拒绝也在
     200 里，§6.7 状态映射），代理重试只放大限流打点与 re-ack 幂等记账（不重账但
     打点膨胀）；429/5xx 的重试语义归 SDK `RetryPolicy` 退避；
-  - `/healthz` 可直通（无认证的回环事实面）；`/v1/admin/tenants` **必须在反代层加
-    ACL**（源 IP 白名单或独立 listener）——admin key 明文只出现在回环跳内，TLS
-    终结后它仍是唯一凭据，ACL 是纵深防御而非替代。
+  - `/healthz` 可直通（无认证的回环事实面）；`/v1/admin/*`（S-54 租户表 + S-57 撤销面）
+    **必须在反代层加 ACL**（源 IP 白名单或独立 listener）——admin key 明文只出现在
+    回环跳内，TLS 终结后它仍是唯一凭据，ACL 是纵深防御而非替代。
 - monitor（9100）恒回环绑定，**不进公共反代**（Prometheus 刮取走内网或独立反代）。
 
 **诚实边界（部署面，S-56）**：无 mTLS（v1 信任域内单跳不做双向认证）；网关不校验

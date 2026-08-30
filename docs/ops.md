@@ -157,8 +157,9 @@ server {
         # 不要 proxy_request_buffering off / chunked 改写——网关拒 chunked 请求
     }
 
-    # 管理面 ACL（纵深防御，非认证替代）
-    location /v1/admin/tenants {
+    # 管理面 ACL（纵深防御，非认证替代）——覆盖全部 /v1/admin/* 路径
+    # （S-54 /v1/admin/tenants + S-57 /v1/admin/revocations）
+    location /v1/admin/ {
         allow 10.0.0.0/8;
         deny all;
         proxy_pass http://127.0.0.1:9400;
@@ -173,7 +174,8 @@ server {
 2. 反代证书/域名就绪；网关经**域名**冒烟：`GET /healthz` 200。
 3. 反代 body 上限 ≥ 网关 `max_body_bytes`；读超时 > 网关 `read_timeout_ms`。
 4. `POST /v1/intents` 关闭代理层透明重试（nginx 无此行为；其它代理需确认）。
-5. `/v1/admin/tenants` 反代层 ACL 生效：公网侧打该路径应 403/404，内网跳板可通。
+5. `/v1/admin/*`（S-54 租户表 + S-57 撤销面）反代层 ACL 生效：公网侧打该路径应
+   403/404，内网跳板可通。
 6. monitor 只回环，Prometheus 从内网刮取 `127.0.0.1:9100/metrics`（或独立内网反代）。
 7. 用真实租户 key 走一次完整 `authorize → pay`（quickstart 链路）确认 TLS 链路不破坏
    线格式（bearer 头原样到达网关）。
@@ -186,9 +188,43 @@ server {
 | `POST /v1/intents` 偶发 5xx/504，网关侧无对应错误码 | 代理读超时 < 网关处理时长（bb 模式真证明验证），先断连接 |
 | 请求被 400 `E_MALFORMED`、消息含 chunked | 反代把请求改写成 chunked（网关不支持） |
 | 429 频度远超单租户配额 | 代理层对非幂等 POST 做了重试放大打点，或多 SDK 共用同 key |
-| 公网可打 `/v1/admin/tenants` | 反代 ACL 缺失——admin key 是唯一凭据时纵深为 0 |
+| 公网可打 `/v1/admin/*`（租户表 / 撤销面） | 反代 ACL 缺失——admin key 是唯一凭据时纵深为 0 |
 | SDK 报连接断开但网关无错 | 反代 `Connection` 头改写与网关 keep-alive 判定冲突（nginx 需 `proxy_set_header Connection ""`） |
 
 **诚实边界**：本节示例未经参考机实跑验证（本机无 nginx/Caddy）——逐条对照的是网关
 已实测语义（body 上限 / 读超时 / chunked 拒绝 / keep-alive / 代理头非信任，均有测试
 锚定）；首次上线按 §7.3 清单在目标环境实测。无 mTLS；网关不校验 `Host` 头。
+
+## 8. 运营撤销流程（S-57，TECH_SPEC §6.7 撤销面）
+
+委托撤销事件流（§4.6）：链上 `DSA.revoke`（owner）→ **运营者传播进聚合器**。传播入口 =
+网关管理端点 `POST /v1/admin/revocations`（admin key 门面，同 `/v1/admin/tenants`）：
+
+```bash
+curl -X POST https://gw.example.com/v1/admin/revocations \
+  -H "Authorization: Bearer $MERIDIAN_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"delegation_hash":"<64hex>"}'
+# 200 {"newly_revoked":true,"revocation_root":"<64hex>","revoked_len":1}
+```
+
+| 响应 | 含义 | 处置 |
+|---|---|---|
+| `200 newly_revoked:true` | 新撤销生效，`revocation_root` = 撤销后当刻根 | 记录根值，走下方确认两步 |
+| `200 newly_revoked:false` | 该委托此前已撤销（幂等重放，根不变） | 无需处置 |
+| `400 E_DELEG_UNKNOWN` | 聚合器注册表无此 dh | **先核对 dh**（手滑 dh 会白扰在途 witness）——若链上确已注册而聚合器没有，说明该委托注册事件未达本副本 |
+| `401 / 404` | admin key 错 / 未配置 | 配置问题，与 §7.3 清单项 1 对齐 |
+
+**确认两步**（撤销是否真生效）：
+
+1. `GET /v1/revocation-witness/<dh>`（租户 key）→ `404 E_REVOKED` = 已入撤销集；
+2. 拿另一张未撤销委托查 witness，`root` 应等于撤销响应里的 `revocation_root`（同一棵树）。
+
+**多副本（S-39 副本组）逐副本撤销**：副本组无跨副本复制，每个副本的撤销集独立——
+对**每个**副本的网关各调一次本端点（副本 `instance` 见 monitor 集群指标）。漏调副本会
+继续接受已撤销委托的新意图，直至 `replicas_converged`（撤销根三元组不等）告警暴露。
+**新意图的 `E_REVOKED` 拒绝即时生效于本进程**；撤销根上链随下个密封 epoch（≤ 1 epoch）。
+
+**诚实边界**：链上 `RevocationRegistry.revoke` 不会自动进聚合器（v1 无链上监听器），
+链上撤销 → 聚合器撤销之间是运营者人工传播，窗口期风险由运营者债券罚没兜底（§6.5）；
+管理操作经 TLS 终结点之后执行（§7）；批量撤销 v1 不做（单请求单 dh，逐笔确认根推进）。
