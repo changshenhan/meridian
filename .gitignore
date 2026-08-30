@@ -12,6 +12,9 @@ Thumbs.db
 # 本地基准（CI 每次自记录，不提交本机噪声基线）
 # 注：bench/baseline.json 保留为参考基线，不 ignore
 
+# cargo 在 contracts/ 子目录跑会落 ../target（S-57 difffuzz 脚手架相对路径坑）
+contracts/target/
+
 # Noir 构建产物（CI 生成，不提交）
 circuits/target/
 smoke/target/

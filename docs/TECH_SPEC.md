@@ -1638,6 +1638,22 @@ contract BatchSettler {
   随笔押金 `CHALLENGE_BOND`，成功路径原额退回）成功→债券罚没+`settlementFunded` 退运营者
   +epoch voided→claim 拒绝。依赖 forge build 产物 + anvil，缺任一则 `[SKIP]`（不阻塞
   Rust 主门禁）。
+- **跨实现差分 fuzz（S-57，2026-08-31，审计四步路径 ③）**：S-11a 的交叉实现契约
+  （`IntentHelper.computeIntentHash` ↔ `core::dsa::intent_hash` / `Merkle` ↔
+  `aggregator::merkle` / `DSA.sha256(delegationABI)` ↔ `delegation_hash` /
+  `nettingRoot = keccak256(abi.encode(net))` ↔ `lattice::abi_encode_net`）此前只有
+  **单个** golden vector（`Merkle.t.sol` / `IntentHelper.t.sol` 各一）+ 深度审计的
+  人工逐行读码。本步把「读出来一致」升级为「机器批量差分」：`contracts/rust-smoke/
+  src/bin/difffuzz.rs`（splitmix64 固定种子，跨平台确定性，零新依赖）调**生产实现**
+  （不是测试替身）批量产 golden vectors → `contracts/test/fixtures/differential.json`
+  （并行数组，64 意图 + 32 委托 + 8 叶 + 10 棵树（n=1..16 含非 2 幂补齐）+ 16 净额
+  向量，每棵树附包含证明（index + siblings）供 `Merkle.computeRoot` 重推）→
+  `contracts/test/Differential.t.sol` 逐条比对 Solidity 镜像（含 `abi.encode(net)`
+  编码字节级比对，不只比根）。门禁：`verify.sh` 新步 **8b**——重生成 fixture 到
+  `target/` 与入库版本 `cmp` 漂移闸（改任一侧规范不回填 fixture 即红）+ forge 差分
+  测试。诚实边界：单向差分（Rust → Solidity 镜像），反向（Solidity 产 Rust 消费）
+  由 S-11d rust-smoke 三场景 + forge 全量兜底；随机向量固定种子，不追新输入——要更
+  宽的输入面，改种子重生成并提交（漂移闸强制 fixture 与代码同步）。
 - 热路径零分配用分配器钩子断言（`dhat` 或自写 alloc hook），不靠估计。
 - **GitHub CI**（`.github/workflows/ci.yml`）：**可选第二道网**，2026-08-17 起被账户
   计费阻断（私有 Actions included 额度耗尽）而挂起。solidity（forge）与 ZK（nargo/bb）

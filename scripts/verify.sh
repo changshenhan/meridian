@@ -120,6 +120,18 @@ fi
 if command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; then
     step "8/10 solidity (forge build + test)"
     run "forge build+test" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts && forge build && forge test'
+
+    # S-57：跨实现差分 fuzz（TECH_SPEC §8.3，审计四步路径 ③）。重生成 fixture 到
+    # target/ 与入库版本 cmp（漂移闸——改任一侧规范不回填 fixture 即红）+ 差分测试。
+    # 写 target/ 不碰工作树；forge 侧 8/10 已跑 DifferentialTest（fixture 入库版），
+    # 这里只对漂移负责。
+    step "8b/10 跨实现差分 fuzz (S-57, Rust 生产实现 -> golden fixture -> forge 镜像)"
+    run "difffuzz regen" bash -c "cd contracts/rust-smoke && cargo run --quiet --bin difffuzz -- --out '$ROOT/target/differential.json'"
+    if cmp -s "$ROOT/target/differential.json" "$ROOT/contracts/test/fixtures/differential.json"; then
+        pass "difffuzz golden 无漂移（重生成 == 入库 fixture）"
+    else
+        fail "difffuzz golden 漂移：contracts/test/fixtures/differential.json 与重生成不一致（改了规范或种子未回填 fixture）"
+    fi
 else
     skip "forge 未找到 → solidity 门禁跳过"
 fi
