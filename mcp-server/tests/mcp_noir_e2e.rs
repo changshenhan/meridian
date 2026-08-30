@@ -231,12 +231,11 @@ fn mcp_noir_prover_full_path_via_pay_tool() {
         let wit_body = body(&wit);
         let wit_root = hex::decode(wit_body["root"].as_str().unwrap()).unwrap();
         let wit_path_raw = hex::decode(wit_body["path"].as_str().unwrap()).unwrap();
+        let (path_chunks, path_rest) = wit_path_raw.as_chunks::<32>();
+        assert!(path_rest.is_empty(), "path 必须是 32B 整数倍（S-45 wire 口径）");
         let witness = RevocationWitness {
             root: wit_root.clone().try_into().unwrap(),
-            path: wit_path_raw
-                .chunks_exact(32)
-                .map(|c| c.try_into().unwrap())
-                .collect(),
+            path: path_chunks.to_vec(),
         };
         assert_eq!(witness.path.len(), 256, "S-42 深度 256 树");
 
