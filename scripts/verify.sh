@@ -2,10 +2,11 @@
 #
 # meridian 本地验证流水线（S-10d 门禁）。
 #
-# 背景：GitHub 私有仓库 Actions 于 2026-08-17 起被账户计费阻断（账户 included 额度
-# $12 被 ANAI 私有 repo 用尽 93.5% + 无 spending limit → 全账户私有 CI 硬停）。meridian
-# 的验证门禁因此改为本地执行——跑在记录 baseline.json 的同一台参考机上，比共享 runner
-# （±10% 噪声）更稳，且零 GitHub 计费分钟。
+# 背景：GitHub Actions 曾于 2026-08-17 起被账户计费阻断（账户 included 额度被私有
+# repo 用尽 + 无 spending limit → 全账户私有 CI 硬停），meridian 的验证门禁因此改为
+# 本地执行——跑在记录 baseline.json 的同一台参考机上，比共享 runner（±10% 噪声）
+# 更稳，且零 GitHub 计费分钟。2026-08-30 起 Actions 恢复可用，ci/noir/solidity 三
+# job 作为 push 后第二道网继续盯绿（本地门禁仍是主门禁）。
 #
 # 用法：
 #   scripts/verify.sh            # 全量门禁（本脚本即主门禁，pre-push 钩子调用）
@@ -132,6 +133,12 @@ if command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; then
     else
         fail "difffuzz golden 漂移：contracts/test/fixtures/differential.json 与重生成不一致（改了规范或种子未回填 fixture）"
     fi
+
+    # S-58（TECH_SPEC §8.3，审计四步路径 ④）：分支覆盖门禁。src 全合约行/函数 100%、
+    # 分支 100%（BatchSettler 豁免 1 条结构不可达边：押金销毁 require 失败边）。阈值
+    # 与豁免口径都在 scripts/coverage_gate.sh 文件头，缺口=补负向测试不是调阈值。
+    step "8c/10 分支覆盖门禁 (S-58, forge coverage lcov)"
+    run "coverage gate" bash "$ROOT/scripts/coverage_gate.sh"
 else
     skip "forge 未找到 → solidity 门禁跳过"
 fi

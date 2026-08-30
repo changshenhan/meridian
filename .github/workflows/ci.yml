@@ -183,6 +183,14 @@ jobs:
           forge build
           forge test
 
+      # S-58（TECH_SPEC §8.3，审计四步路径 ④）：分支覆盖门禁，与本地 verify.sh 步 8c
+      # 同一脚本同阈值（src 全合约行/函数 100%、分支 100%，BatchSettler 豁免 1 条
+      # 结构不可达边——押金销毁 require 失败边，口径见脚本文件头）。
+      - name: coverage gate (S-58)
+        run: |
+          export PATH="$HOME/.foundry/bin:$PATH"
+          bash scripts/coverage_gate.sh
+
       # 链上冒烟：spawn anvil → 部署三合约 → register→revoke→commit→settle 全链路。
       # 交叉实现契约：Solidity sha256(delegationABI) == meridian-core delegation_hash。
       - name: alloy smoke — anvil deploy + full chain

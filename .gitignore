@@ -15,6 +15,9 @@ Thumbs.db
 # cargo 在 contracts/ 子目录跑会落 ../target（S-57 difffuzz 脚手架相对路径坑）
 contracts/target/
 
+# S-58 coverage gate 中间产物（脚本正常自删，防中断残留）
+contracts/lcov.info
+
 # Noir 构建产物（CI 生成，不提交）
 circuits/target/
 smoke/target/

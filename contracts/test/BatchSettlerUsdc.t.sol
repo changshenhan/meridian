@@ -318,6 +318,13 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         assertEq(usdc.balanceOf(address(bs)), 100e6, "USDC retained in contract");
         assertEq(funded, 100e6, "retained refund re-credited");
 
+        // S-58 覆盖缺口：运营者仍被冻结 → withdrawRefund 的 transfer 返回 false →
+        // TokenTransferFailed 整笔回滚，记账不丢（revert 冒泡变体见下方 catch 分支测试）。
+        vm.expectRevert(BatchSettler.TokenTransferFailed.selector);
+        bs.withdrawRefund(EPOCH);
+        (,,, uint256 fundedStill,,,,,,) = _epochView(EPOCH);
+        assertEq(fundedStill, 100e6, "retained accounting intact after failed pull");
+
         // 拉取兜底：解除黑名单后运营者取回留存量。
         usdc.setBlacklist(address(this), false);
         vm.expectEmit();
@@ -403,17 +410,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
             bool voided
         )
     {
-        (
-            commitmentRoot,
-            revocationRoot,
-            bondedAmount,
-            settlementFunded,
-            settledAt,
-            nettingRoot,
-            committed,
-            settled,
-            challenged,
-            voided
-        ) = bs.epochs(epochId);
+        // 同 BatchSettler.t.sol：直接回传 10 元组，避开 coverage 编译（无优化器）栈太深。
+        return bs.epochs(epochId);
     }
 }

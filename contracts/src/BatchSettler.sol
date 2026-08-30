@@ -259,6 +259,9 @@ contract BatchSettler {
         if (reason != RejectReason.None) {
             // CEI：事件（状态）先行，再外部调用。销毁目标 address(0) 无代码，无重入面。
             emit ChallengeRejected(epochId, msg.sender, uint8(reason));
+            // require 的失败边结构不可达（S-58 覆盖扫描唯一豁免边，TECH_SPEC §8.3）：
+            // ETH 向无代码地址推送不可能失败，无测试可达路径。保留 require 只为
+            // 显式声明资金面不变量，绝不作为可达校验依赖。
             (bool okBurn,) = payable(address(0)).call{value: challengeBond}("");
             require(okBurn, "bond burn failed");
             return;

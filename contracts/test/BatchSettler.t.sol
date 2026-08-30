@@ -38,6 +38,28 @@ contract ToggleOperator {
     }
 }
 
+/// S-58 覆盖缺口测试替身：无 receive 的收款人合约 —— claim 的 ETH push 返回 false
+///（不走 revert 路径，走 `require(ok, "claim transfer failed")`）。
+contract RejectEth {}
+
+/// S-58 覆盖缺口测试替身：拒收赔付的挑战者合约 —— 挑战成功路径「押金 + 债券一笔
+/// call 给 msg.sender」失败 → require(okPayout) 整笔挑战回滚（挑战者只能伤到自己）。
+contract SelfishChallenger {
+    BatchSettler internal bs;
+
+    constructor(BatchSettler s) payable {
+        bs = s;
+    }
+
+    function challenge(uint256 epochId, BatchSettler.FraudProof calldata fp) external {
+        bs.challenge{value: address(this).balance}(epochId, fp);
+    }
+
+    receive() external payable {
+        revert("challenger refuses payout");
+    }
+}
+
 /// S-11a：BatchSettler 生产化 —— operator 守卫、延迟 claim（原生 ETH）、完整挑战流
 /// （漏单/低付欺诈证明 + 债券罚没 + void + 退款）。
 /// `epochs()` getter 返回 10 元组（net[]/claimed 被跳过）：
@@ -133,18 +155,9 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
             bool voided
         )
     {
-        (
-            commitmentRoot,
-            revocationRoot,
-            bondedAmount,
-            settlementFunded,
-            settledAt,
-            nettingRoot,
-            committed,
-            settled,
-            challenged,
-            voided
-        ) = bs.epochs(epochId);
+        // 直接回传 10 元组：先解构成局部变量再回填命名返回值会把两层 10 个局部叠在同一
+        // 栈帧里，`forge coverage`（禁优化器编译）在此报 stack too deep。
+        return bs.epochs(epochId);
     }
 
     // ------------------------------------------------------------------ S-38 挑战押金 helper
@@ -256,18 +269,8 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
             bool voided
         )
     {
-        (
-            commitmentRoot,
-            revocationRoot,
-            bondedAmount,
-            settlementFunded,
-            settledAt,
-            nettingRoot,
-            committed,
-            settled,
-            challenged,
-            voided
-        ) = target.epochs(epochId);
+        // 同 _epochView：直接回传 10 元组，避开 coverage 编译（无优化器）栈太深。
+        return target.epochs(epochId);
     }
 
     // ------------------------------------------------------------------ commit / operator
@@ -920,5 +923,194 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
     function _emptyFraud() internal pure returns (BatchSettler.FraudProof memory fp) {
         BatchSettler.IntentProof[] memory none = new BatchSettler.IntentProof[](0);
         fp = BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: none});
+    }
+
+    // ------------------------------------------------------------------ S-58 分支覆盖缺口收口（forge coverage scan → 负向缝隙）
+
+    /// claim 的 ETH push 失败（收款人合约无 receive）→ require 整笔回滚：claimed 位随
+    /// 回滚复位（第二次 claim 仍走转账失败而非 AlreadyClaimed = 可重试语义）、资金留在
+    /// 合约、同 epoch 其他行不受污染（收款人自选地址，重试是唯一兜底——审计报告
+    /// 「记录在案的已知边界」的行为锚）。
+    function test_claim_transfer_failure_rolls_back_claimed_flag() public {
+        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](2);
+        net[0] = BatchSettler.NetInstruction({recipient: address(new RejectEth()), amount: 100});
+        net[1] = BatchSettler.NetInstruction({recipient: address(0xB2), amount: 200});
+        _settleWith(net);
+        vm.warp(block.timestamp + bs.CHALLENGE_WINDOW() + 1);
+
+        vm.expectRevert("claim transfer failed");
+        bs.claim(EPOCH, 0);
+        vm.expectRevert("claim transfer failed");
+        bs.claim(EPOCH, 0); // 复位而非卡死在已置位：若 claimed 位被持久化，这里已是 AlreadyClaimed
+        assertEq(address(bs).balance, 300, "failed claim retains funds");
+
+        bs.claim(EPOCH, 1);
+        assertEq(address(bs).balance, 100, "unrelated row unaffected");
+    }
+
+    /// 挑战者合约拒收赔付 → require(okPayout) 整笔挑战回滚：押金随交易退回挑战者、
+    /// epoch 状态零改动、仍可被他人挑战。审查方向的反面：这条边只会惩罚挑战者自己，
+    /// 不可能被用于阻止 epoch voided。
+    function test_challenge_payout_rejection_rolls_back_and_epoch_stays_challengeable() public {
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
+        net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 100});
+        _settleWith(net); // 漏掉 0xB1 → 诚实 kind1 欺诈证明
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](1);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        BatchSettler.FraudProof memory fp =
+            BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
+
+        SelfishChallenger greedy = new SelfishChallenger{value: challengeBond}(bs);
+        vm.expectRevert("bond transfer failed");
+        greedy.challenge(EPOCH, fp);
+
+        // 整笔回滚：债券 / 结算资金 / epoch 状态全部原位。
+        (,, uint256 bondedAmount, uint256 settlementFunded,,,,, bool challenged, bool voided) =
+            _epochView(EPOCH);
+        assertEq(bondedAmount, BOND);
+        assertEq(settlementFunded, 100);
+        assertFalse(challenged);
+        assertFalse(voided);
+        assertEq(address(bs).balance, BOND + 100, "contract untouched");
+        assertEq(address(greedy).balance, challengeBond, "bond rolled back to challenger");
+
+        // epoch 仍可被正常挑战者挑战成功。
+        vm.prank(CHALLENGER);
+        bs.challenge{value: challengeBond}(EPOCH, fp);
+        (,,,,,,,, bool challengedAfter, bool voidedAfter) = _epochView(EPOCH);
+        assertTrue(challengedAfter);
+        assertTrue(voidedAfter);
+    }
+
+    /// kind1（漏单）携带多条意图 → BadFraudKind。即使每条都是真包含证明也不放行——
+    /// 漏单陈述的定义就是单条（`intents.length != 1` 边）。
+    function test_kind1_multiple_intents_rejected_slashes_bond() public {
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](2);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        intents[1] = _intent(2, address(0xB1), 120, dh);
+        uint64[] memory seqs = new uint64[](2);
+        seqs[0] = 1;
+        seqs[1] = 2;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
+        net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 220});
+        _settleWith(net);
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](2);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        ips[1] = toIntentProof(intents[1], proofs[1]);
+        _challengeRejected(
+            BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips}),
+            uint8(BatchSettler.RejectReason.BadFraudKind)
+        );
+    }
+
+    /// kind2 目标行越界（`targetNetIndex >= net.length`）→ NetIndexOutOfBounds 原因码
+    /// （驳回 + 押金销毁，不是 revert；进入逐条验证之前就拦下）。
+    function test_kind2_target_net_index_out_of_bounds_rejected_slashes_bond() public {
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+        _settleWith(_net()); // 2 行，合法目标 0/1
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](1);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        _challengeRejected(
+            BatchSettler.FraudProof({kind: 2, targetNetIndex: 2, intents: ips}),
+            uint8(BatchSettler.RejectReason.NetIndexOutOfBounds)
+        );
+    }
+
+    /// 低付子集混入伪造意图（不在承诺格）→ BadInclusionProof：子集是逐条包含性校验，
+    /// 不是只验第一条；伪造意图同收款人（过 kind2 收款人一致性闸）且不同哈希（过
+    /// DuplicateIntent 闸），只能倒在根校验上。
+    function test_kind2_fabricated_intent_in_subset_rejected_slashes_bond() public {
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](2);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        intents[1] = _intent(2, address(0xB1), 120, dh);
+        uint64[] memory seqs = new uint64[](2);
+        seqs[0] = 1;
+        seqs[1] = 2;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+
+        // 真实 Σ=220，net 记 50 → 本是真低付；混入伪造意图后整笔驳回。
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
+        net[0] = BatchSettler.NetInstruction({recipient: address(0xB1), amount: 50});
+        _settleWith(net);
+
+        IntentFields memory fake = intents[1];
+        fake.delegationHash = keccak256("fabricated");
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](2);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        ips[1] = toIntentProof(fake, proofs[1]);
+        _challengeRejected(
+            BatchSettler.FraudProof({kind: 2, targetNetIndex: 0, intents: ips}),
+            uint8(BatchSettler.RejectReason.BadInclusionProof)
+        );
+    }
+
+    /// withdrawRefund 的 push 自身失败（运营者仍拒收 ETH）→ require 整笔回滚：
+    /// settlementFunded 记账不丢，解除拒收后同一笔重试成功（push 失败与 pull 成功
+    /// 是两条独立覆盖边；push 失败不阻断挑战的语义见上方专项测试）。
+    function test_withdraw_refund_push_failure_is_retryable() public {
+        ToggleOperator op = new ToggleOperator();
+        BatchSettler target = new BatchSettler(address(op), address(0), CHALLENGE_BOND);
+        op.bind(target);
+        op.setAccept(false); // 运营者拒收 ETH
+
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        op.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
+        net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 100});
+        op.settle{value: 100}(EPOCH, net, keccak256(abi.encode(net)));
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](1);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        vm.prank(CHALLENGER);
+        target.challenge{value: challengeBond}(
+            EPOCH,
+            BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips})
+        );
+        (,,, uint256 funded,,,,, bool challenged, bool voided) = _epochViewOn(target, EPOCH);
+        assertTrue(challenged);
+        assertTrue(voided);
+        assertEq(funded, 100, "refund push failed -> retained");
+
+        vm.expectRevert("refund transfer failed");
+        op.withdrawRefund(EPOCH);
+        (,,, uint256 fundedStill,,,,,,) = _epochViewOn(target, EPOCH);
+        assertEq(fundedStill, 100, "retained accounting intact after failed pull");
+        assertEq(address(target).balance, 100);
+
+        op.setAccept(true);
+        vm.expectEmit();
+        emit BatchSettler.RefundWithdrawn(EPOCH, 100);
+        op.withdrawRefund(EPOCH);
+        (,,, uint256 fundedAfter,,,,,,) = _epochViewOn(target, EPOCH);
+        assertEq(fundedAfter, 0, "drained after pull");
     }
 }

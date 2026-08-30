@@ -1,8 +1,8 @@
-# Meridian 审计范围书（v1 · 2026-08-29）
+# Meridian 审计范围书（v1 · 2026-08-29，S-58 与实态对齐 · 2026-08-31）
 
 > 用途：委托第三方安全审计时随附的范围与不变量定义。审计前如代码变更，以 tag
-> `audit-v1` 为准重验。当前状态：**范围书就绪，审计委托未启动**（无资金预算，
-> 启动时从本文件直接出发）。
+> `audit-v1` 为准重验。当前状态：**范围书就绪且已与实态对齐（S-58，含 §6 冻结清单），
+> 审计委托未启动**（付费项，预算待批；启动时从本文件 + §6 清单直接出发）。
 
 ## 1. 范围内（In Scope）
 
@@ -86,10 +86,65 @@
   得多——记录在案，见 TECH_SPEC §6.5）。残余自报：金额不随 gas 价格运行时自适应，随
   Phase 2 多运营者治理结构一起定夺。
 
-## 5. 测试与证据基线
+## 5. 测试与证据基线（S-58 对齐至 2026-08-31，commit 见 git log）
 
-- forge 67/67（含 S-28 USDC 10 例：黑名单/双资产退款/资产隔离；S-38 挑战押金 2 例 +
-  既有挑战负向用例改为"驳回即没收"断言；S-50 押金参数化 2 例：零押金构造拒绝 /
-  非缺省押金端到端）。
-- anvil rust-smoke 三场景 e2e（快乐路径/撤销/欺诈挑战）+ m1_demo 10 万笔端到端。
-- 全量门禁 `scripts/verify.sh` 10 步（pre-push 强制）。
+**合约面（forge）**：
+
+- forge **90/90**（S-38 押金制负向组改 `_challengeRejected` 断言；S-50 押金参数化 2 例；
+  S-58 覆盖缺口 6 例：claim push 失败回滚可重试 / 挑战者拒收赔付整笔回滚 / kind1 多意图
+  → BadFraudKind / kind2 目标行越界 / kind2 混入伪造意图 → BadInclusionProof /
+  withdrawRefund push 失败可重试；USDC 套件含 false 返回与 revert 冒泡两种 token 失败语义）。
+- **invariant fuzz**（2026-08-31，四步路径 ②）：`test/BatchSettlerInvariant.t.sol`
+  64 runs × depth 256，三条全局不变量（资金守恒 ghost 记账 / 状态机单调 / voided 后
+  claim 必拒），handler 覆盖 commit/settle 三模式/窗口内双路挑战/warp 过窗 claim。
+- **跨实现差分 fuzz**（S-57，四步路径 ③）：Rust 生产实现批量产 140 golden vectors →
+  forge 镜像四契约逐条比对（intent_hash ×64 / DSA owner 切片 ×32 / Merkle 树·根·证明·
+  深度 / nettingRoot 编码**字节级** ×16），第三实现 Python 独立重算交叉确认；fixture
+  漂移闸（verify.sh 8b）。
+- **分支覆盖门禁**（S-58，四步路径 ④）：`scripts/coverage_gate.sh`（verify.sh 8c +
+  CI solidity job）——src 全合约行/函数 100%、分支 100%，唯一豁免 BatchSettler 1 条
+  结构不可达边（押金销毁 `require(okBurn)` 失败边，代码注释 + slither 报告定性）。
+  阈值与豁免口径在脚本文件头；**缺口=补负向测试，不是调阈值**。
+- **slither 全量扫描 + 人工定性**（2026-08-31，`docs/audit/slither-2026-08-31.md`）：
+  首扫 12 结果 → 修复 2 处真问题（settle CEI 重排 / ZeroOperator 构造期挡下）、余项全部
+  已知设计族并逐条代码内定性；深度人工审计第二轮修复高危审查向量（退款 push 失败
+  阻断挑战）+ withdrawRefund 拉取兜底。
+
+**链上面**：
+
+- anvil rust-smoke 三场景 e2e（快乐路径/撤销/欺诈挑战）+ m1_demo 10 万笔端到端
+  （verify.sh 步 10；CI 同款 alloy smoke）。
+
+**ZK/装配面（范围外声明的对照证据）**：
+
+- 电路本地验收 `scripts/formal_zk.sh` 8 步（约束 < 2^18 门禁）+ 真 prover
+  `NoirProver`（S-43）× 真验证 `BbVerifier`（S-40）闭环 e2e（verify.sh 9b/9c/9d/9e/9f）
+  + 撤销根绑定闸（S-44/S-48 构造期配对闸）。
+
+**门禁**：全量 `scripts/verify.sh`（fmt/clippy/测试/bench/perf gate/agg_sim/forge/差分
+fuzz/覆盖门禁/ZK e2e/rust-smoke），pre-push 强制；GitHub Actions 三 job（ci/noir/
+solidity）为 push 后第二道网。
+
+## 6. 审计冻结清单（外聘审计启动时逐项执行，S-58 立）
+
+冻结 = 把「当前实测态」钉成审计对象，之后到审计结束**只改 docs/audit/**（发现项记录），
+不动 contracts/src。清单：
+
+1. **主门禁复跑**：`scripts/verify.sh` 全绿（含步 8b 差分 fuzz 漂移闸 / 8c 覆盖门禁 /
+   9b~9f ZK e2e）×2（push 前 + pre-push）。
+2. **覆盖门禁复扫**：`bash scripts/coverage_gate.sh` 绿（行/函数 100%、分支 100% −
+   BatchSettler 1 条不可达豁免边）。若冻结前临时改码，重跑后数字必须回到本文件 §5
+   记录值，否则改 §5 并说明。
+3. **slither 复扫**：结果集必须 ⊆ 本文件 §4 + `docs/audit/slither-2026-08-31.md` 的
+   已知设计族（零新增真问题），每条与代码内定性注释一一对应。
+4. **差分 fixture 漂移闸**：verify.sh 8b 绿（Solidity 镜像与 Rust 生产实现无漂移）。
+5. **打 tag**：`git tag -a audit-v1 -m "audit freeze <date>" && git push origin audit-v1`
+   ——范围书开头「以 tag audit-v1 为准」的锚点在此刻才成立。
+6. **范围书数字核对**：§1 文件清单与 `contracts/src/` 目录实态一致（5 合约）；§5
+   测试计数与 `forge test` 实跑一致；§4 已知问题与 TECH_SPEC 诚实边界口径一致。
+7. **提交范围书**：本文件 + `docs/audit/` 报告随合同交付给审计方；TECH_SPEC §6.4/§6.5/
+   §7 作为业务逻辑说明书附录。
+
+**冻结期纪律**：期间任何 src 改动（哪怕一行注释）= 解冻，回到第 1 步重走全清单。
+外聘审计是付费项（预算待批，价位参考见 slither 报告末节），未获预算批准前本清单
+**不执行**、tag **不打**——打了 tag 而不送审只会制造「已审计」的假象。

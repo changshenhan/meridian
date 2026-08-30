@@ -1654,11 +1654,31 @@ contract BatchSettler {
   测试。诚实边界：单向差分（Rust → Solidity 镜像），反向（Solidity 产 Rust 消费）
   由 S-11d rust-smoke 三场景 + forge 全量兜底；随机向量固定种子，不追新输入——要更
   宽的输入面，改种子重生成并提交（漂移闸强制 fixture 与代码同步）。
+- **分支覆盖门禁（S-58，2026-08-31，审计四步路径 ④）**：`scripts/coverage_gate.sh` ——
+  `forge coverage --report lcov` 对 `contracts/src` 全部 5 合约出行/语句/分支/函数覆盖，
+  阈值硬闸：**行 100%、函数 100%、分支 100%**，唯一豁免 `BatchSettler.sol` 允许分支欠
+  **1** 条——向 `address(0)` 销毁挑战押金的 `require(okBurn, "bond burn failed")`
+  （§6.5）失败边**结构不可达**：ETH 向无代码地址推送不可能失败，无测试可达路径，代码
+  注释与 `docs/audit/slither-2026-08-31.md` §coverage 同步定性，阈值放宽是记录在案的
+  豁免而非放水。接线：`verify.sh` 新步 **8c**（forge 存在时随 8/8b 同批跑）+ ci.yml
+  solidity job 同款步。扫描结果（2026-08-31 实测）：BatchSettler 行 134/134、其余 4 合约
+  行/分支/函数全 100%，BatchSettler 分支 61/62（豁免 1 条即满）。**实施坑（已钉）**：
+  `forge coverage` 禁优化器编译——测试侧 10 元组「解构成局部变量再回填命名返回值」
+  会 stack too deep；S-58 前用 `--ir-minimum` 兜底跑出的覆盖数据整体失真（Merkle/
+  IntentHelper 假性缺分支、行归因漂移，把人工排查引向伪缺口）——`_epochView`/
+  `_epochViewOn` 改为直接 `return bs.epochs(epochId)` 后全量测试在无优化器下可编译，
+  数据才可信。缺口收口 = 7 条负向测试（claim push 失败回滚可重试 / 挑战者拒收赔付整笔
+  回滚且 epoch 仍可挑战 / withdrawRefund push 失败可重试（ETH）/ withdrawRefund
+  transfer 返 false → TokenTransferFailed（token）/ kind1 多意图 → BadFraudKind /
+  kind2 目标行越界 → NetIndexOutOfBounds / kind2 混入伪造意图 → BadInclusionProof），
+  全部是审计面负向缝隙而非凑数行。冻结清单（外聘审计启动时逐项执行）见
+  `docs/audit-scope.md` §6。
 - 热路径零分配用分配器钩子断言（`dhat` 或自写 alloc hook），不靠估计。
-- **GitHub CI**（`.github/workflows/ci.yml`）：**可选第二道网**，2026-08-17 起被账户
-  计费阻断（私有 Actions included 额度耗尽）而挂起。solidity（forge）与 ZK（nargo/bb）
-  job 需 Linux 工具链：ZK 一侧已由 S-37 的 WSL2 兜底进本地 pre-push（见上），forge/anvil
-  本机未装时 `verify.sh` 仍打印 `[SKIP]`（不阻塞 Rust 主门禁）。
+- **GitHub CI**（`.github/workflows/ci.yml`）：**第二道网**（2026-08-30 起恢复可用，
+  S-35b 后每轮 push 均实跑并盯绿：ci / noir / solidity 三 job；额度阻断期间曾挂起，
+  历史记录见 git log）。solidity（forge）与 ZK（nargo/bb）job 需 Linux 工具链：
+  ZK 一侧已由 S-37 的 WSL2 兜底进本地 pre-push（见上），forge/anvil 本机未装时
+  `verify.sh` 仍打印 `[SKIP]`（不阻塞 Rust 主门禁）。
 
 ### 8.4 输出 schema（JSON）
 
