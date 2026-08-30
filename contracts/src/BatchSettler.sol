@@ -117,6 +117,9 @@ contract BatchSettler {
     error WrongChallengeBond();
     // S-50：押金金额为 0 的部署（等于静默回退到 S-38 之前的垃圾挑战面），构造期挡下。
     error ZeroChallengeBond();
+    // 审计加固：operator 零地址 = commit/settle 恒 NotOperator（自 DoS）。asset 的零地址是
+    // 合法哨兵（= 原生 ETH 模式，S-28），不做零检查。
+    error ZeroOperator();
     // S-28 资产参数化。
     error TokenTransferFailed();
     error EthValueInTokenMode();
@@ -141,7 +144,9 @@ contract BatchSettler {
     mapping(uint256 => Epoch) public epochs;
 
     constructor(address operator_, address asset_, uint256 challengeBond_) {
+        if (operator_ == address(0)) revert ZeroOperator();
         operator = operator_;
+        // slither-disable-next-line missing-zero-check（故意：asset=address(0) 是合法哨兵，= 原生 ETH 模式，S-28）
         asset = asset_;
         if (challengeBond_ == 0) revert ZeroChallengeBond();
         challengeBond = challengeBond_;
@@ -182,22 +187,26 @@ contract BatchSettler {
         if (nettingRoot != keccak256(abi.encode(net))) revert WrongNettingRoot();
         uint256 total = _sumNet(net);
         // S-28 结算资金来源：ETH 模式 = msg.value；token 模式 = 从运营者 transferFrom 拉款
-        //（需事先 approve），且禁止 ETH 随单进入（防卡死）。失败整笔回滚，无中间态。
+        //（需事先 approve），且禁止 ETH 随单进入（防卡死）。
         if (asset == address(0)) {
             if (msg.value < total) revert InsufficientSettlementFunding();
         } else {
             if (msg.value != 0) revert EthValueInTokenMode();
-            if (!IERC20(asset).transferFrom(msg.sender, address(this), total)) {
-                revert TokenTransferFailed();
-            }
         }
-
+        // 审计加固（CEI）：先写全部状态再拉外部资金，杜绝 asset 回调（ERC777 类）重入
+        // settle 二次结算的理论缝——尽管重入者只能是运营者自己选的 asset，仍按
+        // checks-effects-interactions 收口，不给审计留 Finding。失败整笔回滚，无中间态。
         ep.settled = true;
         ep.nettingRoot = nettingRoot;
         ep.settledAt = uint64(block.timestamp);
         ep.settlementFunded = total;
         for (uint256 i = 0; i < net.length; i++) {
             ep.net.push(net[i]);
+        }
+        if (asset != address(0)) {
+            if (!IERC20(asset).transferFrom(msg.sender, address(this), total)) {
+                revert TokenTransferFailed();
+            }
         }
         emit Settled(epochId, nettingRoot, uint64(net.length));
     }
@@ -291,6 +300,7 @@ contract BatchSettler {
             // 低付：同一收款人的已提交意图子集，uint256 和 > net[target].amount。
             if (fp.targetNetIndex >= ep.net.length) return RejectReason.NetIndexOutOfBounds;
             address targetRecipient = ep.net[fp.targetNetIndex].recipient;
+            // slither-disable-next-line uninitialized-local（误报：Solidity 默认 0 初始化，下方累加）
             uint256 sum;
             bytes32[] memory hashes = new bytes32[](fp.intents.length);
             for (uint256 i = 0; i < fp.intents.length; i++) {

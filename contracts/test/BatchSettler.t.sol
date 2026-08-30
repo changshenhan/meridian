@@ -151,6 +151,15 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         new BatchSettler(address(this), address(0), 0);
     }
 
+    /// 审计加固：operator 零地址 = commit/settle 恒 NotOperator（自 DoS），构造期挡下。
+    /// asset 零地址是合法哨兵（ETH 模式），对照断言防误伤。
+    function test_constructor_rejects_zero_operator() public {
+        vm.expectRevert(BatchSettler.ZeroOperator.selector);
+        new BatchSettler(address(0), address(0), 1 ether);
+        // asset 零地址（ETH 模式）不受影响，正常部署。
+        new BatchSettler(address(this), address(0), 1 ether);
+    }
+
     /// S-50：非缺省押金端到端 —— 参数不是摆设，金额真进了入场闸与成功路径赔付
     /// （押金原额退回 + 运营者债券罚没一笔给挑战者），且 epoch voided 后 claim 拒绝。
     function test_challenge_bond_is_a_deployment_parameter() public {
