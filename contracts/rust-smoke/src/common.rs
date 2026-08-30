@@ -65,7 +65,7 @@ sol! {
         function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot) external payable;
         function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot) external payable;
         function claim(uint256 epochId, uint256 netIndex) external;
-        function challenge(uint256 epochId, FraudProof calldata fp) external;
+        function challenge(uint256 epochId, FraudProof calldata fp) external payable;
     }
 }
 
@@ -79,6 +79,8 @@ pub const OWNER_KEY_BYTES: [u8; 32] = [7u8; 32];
 pub const ONE_ETH: u128 = 1_000_000_000_000_000_000;
 /// commit 债券（msg.value）。
 pub const BOND: u128 = ONE_ETH;
+/// S-38 挑战押金（与 BatchSettler.CHALLENGE_BOND 一致，challenge 随笔 msg.value）。
+pub const CHALLENGE_BOND: u128 = ONE_ETH / 10;
 /// 与 BatchSettler 的 `CHALLENGE_WINDOW`（6h）一致。
 pub const CHALLENGE_WINDOW_SECS: u64 = 6 * 3600;
 pub const AGENT_KEY_BYTES: [u8; 32] = [5u8; 32];

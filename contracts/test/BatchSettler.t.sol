@@ -12,6 +12,10 @@ import {ChallengeTestHelper} from "./ChallengeTestHelper.sol";
 /// [5]nettingRoot [6]committed [7]settled [8]challenged [9]voided。
 contract BatchSettlerTest is Test, ChallengeTestHelper {
     BatchSettler internal bs;
+    /// S-38：挑战押金缓存（setUp 读一次）。注意不能写在 `{value: bs.CHALLENGE_BOND()}`
+    /// 里 —— value 表达式里的外部 getter 调用会吃掉 vm.prank / vm.expectRevert 的
+    /// "下一次调用"预期，导致 msg.sender 漂移 / 预期落空。
+    uint256 internal challengeBond;
     uint256 internal constant EPOCH = 1;
     uint256 internal constant BOND = 1 ether;
     address internal constant CHALLENGER = address(0xC0FFEE);
@@ -20,6 +24,9 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
     function setUp() public {
         // operator = 测试合约自身（可直呼 commit/settle）。asset = address(0) → 原生 ETH（v2 行为）。
         bs = new BatchSettler(address(this), address(0));
+        // S-38：挑战者要实际押入 CHALLENGE_BOND，显式预注资（不依赖 foundry 默认余额）。
+        vm.deal(CHALLENGER, 10 ether);
+        challengeBond = bs.CHALLENGE_BOND();
     }
 
     /// 测试合约作为 operator 需能接收 void 时的结算资金退款。
@@ -102,6 +109,34 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
             challenged,
             voided
         ) = bs.epochs(epochId);
+    }
+
+    // ------------------------------------------------------------------ S-38 挑战押金 helper
+
+    /// S-38：提交押金发起将被驳回的挑战 —— 断言 ChallengeRejected 事件 + 押金全额销毁
+    /// （address(0)，任何一方不可取回）+ epoch 状态零改动（不置 challenged/voided、运营者
+    /// 债券与结算资金原封、合约余额进出相抵）。
+    function _challengeRejected(BatchSettler.FraudProof memory fp, uint8 reason) internal {
+        (, , uint256 bondedBefore, uint256 fundedBefore, , , , , , ) = _epochView(EPOCH);
+        uint256 challengerBefore = CHALLENGER.balance;
+        uint256 contractBefore = address(bs).balance;
+        uint256 burnBefore = address(0).balance;
+
+        vm.expectEmit();
+        emit BatchSettler.ChallengeRejected(EPOCH, CHALLENGER, reason);
+        vm.prank(CHALLENGER);
+        bs.challenge{value: challengeBond}(EPOCH, fp);
+
+        assertEq(address(0).balance, burnBefore + challengeBond, "bond burned");
+        assertEq(address(bs).balance, contractBefore, "contract balance in == out");
+        assertEq(CHALLENGER.balance, challengerBefore - challengeBond, "bond forfeited");
+        (, , uint256 bondedAfter, uint256 fundedAfter, , , , bool settled, bool challenged, bool voided)
+            = _epochView(EPOCH);
+        assertEq(bondedAfter, bondedBefore, "operator bond untouched");
+        assertEq(fundedAfter, fundedBefore, "settlement fund untouched");
+        assertTrue(settled);
+        assertFalse(challenged, "rejected challenge must not mark epoch challenged");
+        assertFalse(voided, "rejected challenge must not void epoch");
     }
 
     // ------------------------------------------------------------------ commit / operator
@@ -257,9 +292,11 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         uint256 operatorBefore = address(this).balance;
 
         vm.prank(CHALLENGER);
-        bs.challenge(EPOCH, fp);
+        bs.challenge{value: challengeBond}(EPOCH, fp);
 
+        // 净得 = 运营者债券（押金原额退回，一笔 call 结清）。
         assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond to challenger");
+        assertEq(address(bs).balance, 0, "contract drained on success");
         assertEq(address(this).balance, operatorBefore, "no settlement fund to refund (net=0)");
         (,,,,,, bool committed, bool settled, bool challenged, bool voided) = _epochView(EPOCH);
         assertTrue(settled);
@@ -294,12 +331,12 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
 
         uint256 operatorBefore = address(this).balance;
         vm.prank(CHALLENGER);
-        bs.challenge(EPOCH, fp);
+        bs.challenge{value: challengeBond}(EPOCH, fp);
         assertEq(address(this).balance, operatorBefore + 100, "settlement fund refunded");
     }
 
-    /// 收款人确实在 net[] → 不是漏单。
-    function test_challenge_missing_recipient_negative_reverts() public {
+    /// 收款人确实在 net[] → 不是漏单：押金没收、epoch 不动（S-38 驳回即没收）。
+    function test_challenge_missing_recipient_rejected_slashes_bond() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](1);
         intents[0] = _intent(1, address(0xB1), 100, dh);
@@ -317,9 +354,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         BatchSettler.FraudProof memory fp =
             BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
 
-        vm.prank(CHALLENGER);
-        vm.expectRevert(BatchSettler.NotFraud.selector);
-        bs.challenge(EPOCH, fp);
+        _challengeRejected(fp, uint8(BatchSettler.RejectReason.NotFraud));
     }
 
     // ------------------------------------------------------------------ challenge: under-payment (kind 2)
@@ -345,7 +380,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
             BatchSettler.FraudProof({kind: 2, targetNetIndex: 0, intents: ips});
 
         vm.prank(CHALLENGER);
-        bs.challenge(EPOCH, fp);
+        bs.challenge{value: challengeBond}(EPOCH, fp);
         (,,,,,, bool committed, bool settled, bool challenged, bool voided) = _epochView(EPOCH);
         assertTrue(settled);
         assertTrue(challenged);
@@ -376,15 +411,15 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
             BatchSettler.FraudProof({kind: 2, targetNetIndex: 0, intents: ips});
 
         vm.prank(CHALLENGER);
-        bs.challenge(EPOCH, fp);
+        bs.challenge{value: challengeBond}(EPOCH, fp);
         (,,,,,, bool committed, bool settled, bool challenged, bool voided) = _epochView(EPOCH);
         assertTrue(settled);
         assertTrue(challenged);
         assertTrue(voided);
     }
 
-    /// 子集和 ≤ net[R].amount → 非低付（多付不可证，出界）。
-    function test_challenge_underpayment_negative_reverts() public {
+    /// 子集和 ≤ net[R].amount → 非低付（多付不可证，出界）：押金没收、epoch 不动。
+    function test_challenge_underpayment_rejected_slashes_bond() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](1);
         intents[0] = _intent(1, address(0xB1), 60, dh);
@@ -403,13 +438,11 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         BatchSettler.FraudProof memory fp =
             BatchSettler.FraudProof({kind: 2, targetNetIndex: 0, intents: ips});
 
-        vm.prank(CHALLENGER);
-        vm.expectRevert(BatchSettler.NotFraud.selector);
-        bs.challenge(EPOCH, fp);
+        _challengeRejected(fp, uint8(BatchSettler.RejectReason.NotFraud));
     }
 
-    /// 防假阳性 #2：低付子集跨收款人（B2 的意图 targeting net[B1]）→ 拒绝。
-    function test_challenge_cross_recipient_subset_reverts() public {
+    /// 防假阳性 #2：低付子集跨收款人（B2 的意图 targeting net[B1]）→ 驳回（押金没收）。
+    function test_challenge_cross_recipient_subset_rejected_slashes_bond() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](2);
         intents[0] = _intent(1, address(0xB1), 100, dh);
@@ -432,13 +465,11 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         BatchSettler.FraudProof memory fp =
             BatchSettler.FraudProof({kind: 2, targetNetIndex: 0, intents: ips});
 
-        vm.prank(CHALLENGER);
-        vm.expectRevert(BatchSettler.BadFraudKind.selector);
-        bs.challenge(EPOCH, fp);
+        _challengeRejected(fp, uint8(BatchSettler.RejectReason.BadFraudKind));
     }
 
-    /// 防假阳性 #1：同一笔意图在低付子集里重复计入 → 拒绝。
-    function test_challenge_duplicate_intent_reverts() public {
+    /// 防假阳性 #1：同一笔意图在低付子集里重复计入 → 驳回（押金没收）。
+    function test_challenge_duplicate_intent_rejected_slashes_bond() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](1);
         intents[0] = _intent(1, address(0xB1), 100, dh);
@@ -457,14 +488,12 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         BatchSettler.FraudProof memory fp =
             BatchSettler.FraudProof({kind: 2, targetNetIndex: 0, intents: ips});
 
-        vm.prank(CHALLENGER);
-        vm.expectRevert(BatchSettler.DuplicateIntent.selector);
-        bs.challenge(EPOCH, fp);
+        _challengeRejected(fp, uint8(BatchSettler.RejectReason.DuplicateIntent));
     }
 
     // ------------------------------------------------------------------ challenge: inclusion adversarial
 
-    function test_challenge_wrong_leaf_index_reverts() public {
+    function test_challenge_wrong_leaf_index_rejected_slashes_bond() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](1);
         intents[0] = _intent(1, address(0xB1), 100, dh);
@@ -480,12 +509,10 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         BatchSettler.FraudProof memory fp =
             BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
 
-        vm.prank(CHALLENGER);
-        vm.expectRevert(BatchSettler.BadInclusionProof.selector);
-        bs.challenge(EPOCH, fp);
+        _challengeRejected(fp, uint8(BatchSettler.RejectReason.BadInclusionProof));
     }
 
-    function test_challenge_leaf_index_out_of_bounds_reverts() public {
+    function test_challenge_leaf_index_out_of_bounds_rejected_slashes_bond() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](1);
         intents[0] = _intent(1, address(0xB1), 100, dh);
@@ -501,12 +528,10 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         BatchSettler.FraudProof memory fp =
             BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
 
-        vm.prank(CHALLENGER);
-        vm.expectRevert(BatchSettler.BadInclusionProof.selector);
-        bs.challenge(EPOCH, fp);
+        _challengeRejected(fp, uint8(BatchSettler.RejectReason.BadInclusionProof));
     }
 
-    function test_challenge_wrong_accepted_count_reverts() public {
+    function test_challenge_wrong_accepted_count_rejected_slashes_bond() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](2);
         intents[0] = _intent(1, address(0xB1), 100, dh);
@@ -524,12 +549,10 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         BatchSettler.FraudProof memory fp =
             BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
 
-        vm.prank(CHALLENGER);
-        vm.expectRevert(BatchSettler.BadInclusionProof.selector);
-        bs.challenge(EPOCH, fp);
+        _challengeRejected(fp, uint8(BatchSettler.RejectReason.BadInclusionProof));
     }
 
-    function test_challenge_fabricated_intent_reverts() public {
+    function test_challenge_fabricated_intent_rejected_slashes_bond() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](1);
         intents[0] = _intent(1, address(0xB1), 100, dh);
@@ -545,9 +568,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         BatchSettler.FraudProof memory fp =
             BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
 
-        vm.prank(CHALLENGER);
-        vm.expectRevert(BatchSettler.BadInclusionProof.selector);
-        bs.challenge(EPOCH, fp);
+        _challengeRejected(fp, uint8(BatchSettler.RejectReason.BadInclusionProof));
     }
 
     // ------------------------------------------------------------------ challenge: window / kind / double
@@ -578,13 +599,13 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
             BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
 
         vm.prank(CHALLENGER);
-        bs.challenge(EPOCH, fp); // 第一次成功
+        bs.challenge{value: challengeBond}(EPOCH, fp); // 第一次成功
 
         vm.expectRevert(abi.encodeWithSelector(BatchSettler.EpochAlreadyChallenged.selector, EPOCH));
         bs.challenge(EPOCH, fp); // 第二次拒绝
     }
 
-    function test_challenge_bad_kind_reverts() public {
+    function test_challenge_bad_kind_rejected_slashes_bond() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](1);
         intents[0] = _intent(1, address(0xB1), 100, dh);
@@ -599,9 +620,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         BatchSettler.FraudProof memory fp =
             BatchSettler.FraudProof({kind: 3, targetNetIndex: 0, intents: ips});
 
-        vm.prank(CHALLENGER);
-        vm.expectRevert(BatchSettler.BadFraudKind.selector);
-        bs.challenge(EPOCH, fp);
+        _challengeRejected(fp, uint8(BatchSettler.RejectReason.BadFraudKind));
     }
 
     function test_challenge_unknown_epoch_reverts() public {
@@ -609,11 +628,71 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         bs.challenge(777, _emptyFraud());
     }
 
-    function test_challenge_empty_intents_reverts() public {
+    /// S-38：意图数为 0 / 超上界是押金入场后的"实质验证失败"（gas 上界守卫）→ 驳回没收。
+    function test_challenge_empty_intents_rejected_slashes_bond() public {
         bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
         _settleWith(_net());
-        vm.expectRevert(BatchSettler.TooManyIntents.selector);
-        bs.challenge(EPOCH, _emptyFraud());
+        _challengeRejected(_emptyFraud(), uint8(BatchSettler.RejectReason.TooManyIntents));
+    }
+
+    /// S-38：押金金额不等（少付/多付）→ 押金入场前 revert（WrongChallengeBond），无押金风险。
+    function test_challenge_wrong_bond_value_reverts() public {
+        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        _settleWith(_net());
+        uint256 contractBefore = address(bs).balance;
+
+        vm.prank(CHALLENGER);
+        vm.expectRevert(BatchSettler.WrongChallengeBond.selector);
+        bs.challenge{value: challengeBond - 1}(EPOCH, _emptyFraud());
+        vm.prank(CHALLENGER);
+        vm.expectRevert(BatchSettler.WrongChallengeBond.selector);
+        bs.challenge{value: challengeBond + 1}(EPOCH, _emptyFraud());
+
+        assertEq(address(bs).balance, contractBefore, "no bond escrowed on wrong value");
+    }
+
+    /// S-38：驳回不消耗挑战权 —— 一次失败挑战后，同一 epoch 仍可被合法欺诈证明挑战成功
+    /// （押金 + 运营者债券全给挑战者，epoch 才置 challenged/voided）。
+    function test_challenge_rejected_then_valid_challenge_succeeds() public {
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+
+        // 欺诈结算：net 只含 B9（漏掉 B1）。
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
+        net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 0});
+        _settleWith(net);
+
+        // 第一次：伪造意图（amount 篡改 → 包含失败）→ 驳回没收，epoch 不动。
+        BatchSettler.IntentProof[] memory badIps = new BatchSettler.IntentProof[](1);
+        badIps[0] = toIntentProof(intents[0], proofs[0]);
+        badIps[0].amount = 101;
+        _challengeRejected(
+            BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: badIps}),
+            uint8(BatchSettler.RejectReason.BadInclusionProof)
+        );
+
+        // 第二次：真实证明 → 挑战成功，押金 + 运营者债券一并结清。
+        BatchSettler.IntentProof[] memory goodIps = new BatchSettler.IntentProof[](1);
+        goodIps[0] = toIntentProof(intents[0], proofs[0]);
+        uint256 challengerBefore = CHALLENGER.balance;
+
+        vm.prank(CHALLENGER);
+        bs.challenge{value: challengeBond}(
+            EPOCH, BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: goodIps})
+        );
+
+        // 净得 = 运营者债券（两次押金：第一次已没收，第二次原额退回）。
+        assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond to challenger, bond returned");
+        assertEq(address(bs).balance, 0, "contract drained");
+        (,,,,,, , bool settled, bool challenged, bool voided) = _epochView(EPOCH);
+        assertTrue(settled);
+        assertTrue(challenged);
+        assertTrue(voided);
     }
 
     // ------------------------------------------------------------------ shared fixtures

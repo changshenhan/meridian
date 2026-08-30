@@ -16,6 +16,11 @@ import {Merkle} from "./Merkle.sol";
 ///        settlementFunded（= Σnet）全额退运营者。
 ///      · challenge 完整验证欺诈证明（漏单 kind=1 / 低付 kind=2，sha256 包含证明）→
 ///        债券罚没给挑战者、退款给运营者、整 epoch voided（后续 claim 拒绝）。
+///      · S-38 挑战押金（TECH_SPEC §6.5）：challenge 变 payable，随笔押金 CHALLENGE_BOND
+///        （原生 ETH，与 asset 无关）。押金入场前 4 类 revert（未结算 / 已挑战 / 窗口外 /
+///        金额不等，零押金风险）；入场后任何实质验证失败不再 revert —— 发 ChallengeRejected
+///        事件、押金全额销毁（address(0)，任何一方不可取回）、epoch 状态一字不动（仍可再
+///        挑战）。押金从不停留为合约状态（成功退回 / 失败销毁，本笔交易内结清），不扩大资金面。
 ///      · S-28 资产参数化：`asset` 构造参数，`address(0)` = 原生 ETH（v2 行为逐字节保留），
 ///        `asset = USDC/ERC-20` 时结算资金（settle `transferFrom`）/ claim / void 退款走 token，
 ///        债券恒为原生 ETH（惩罚质押与结算资产分离）。token 模式强制 `msg.value == 0`。
@@ -83,7 +88,20 @@ contract BatchSettler {
     );
     event Settled(uint256 indexed epochId, bytes32 nettingRoot, uint64 netCount);
     event ChallengeSucceeded(uint256 indexed epochId, address indexed challenger, uint8 kind);
+    /// S-38：欺诈证明被驳回（押金没收销毁，epoch 状态不变）。reason 见 RejectReason。
+    event ChallengeRejected(uint256 indexed epochId, address indexed challenger, uint8 reason);
     event Claimed(uint256 indexed epochId, address indexed recipient, uint256 amount);
+
+    /// S-38：欺诈证明驳回原因码（押金入场后不再 revert，改为本枚举随事件上报）。
+    enum RejectReason {
+        None,                // 占位（0 值不随事件使用 = 验证通过）
+        NotFraud,            // 证明自洽但不构成欺诈（漏单收款人在 net[] / 低付子集和不超行额）
+        BadInclusionProof,   // 叶索引越界 / 兄弟深度不匹配 / 根不匹配（含伪造意图）
+        DuplicateIntent,     // 低付子集同笔意图重复计入（防假阳性 #1）
+        BadFraudKind,        // kind 非法 / kind1 意图数 != 1 / 跨收款人子集（防假阳性 #2）
+        TooManyIntents,      // 意图数为 0 或超出 gas 上界
+        NetIndexOutOfBounds  // kind2 目标行越界
+    }
 
     error EpochAlreadyCommitted(uint256 epochId);
     error EpochAlreadySettled(uint256 epochId);
@@ -95,13 +113,10 @@ contract BatchSettler {
     error ChallengeWindowOpen();
     error AlreadyClaimed(uint256 epochId, uint256 netIndex);
     error NetIndexOutOfBounds(uint256 epochId, uint256 netIndex);
-    error TooManyIntents();
-    error DuplicateIntent();
-    error BadInclusionProof();
-    error NotFraud();
     error InsufficientSettlementFunding();
-    error BadFraudKind();
     error NotOperator();
+    // S-38：挑战押金金额不等（msg.value != CHALLENGE_BOND，押金入场前 revert）。
+    error WrongChallengeBond();
     // S-28 资产参数化。
     error TokenTransferFailed();
     error EthValueInTokenMode();
@@ -111,6 +126,9 @@ contract BatchSettler {
     /// 单次挑战最多携带的意图数（gas 上界：epoch_capacity=100k → 树深 17，每意图 ~19 次
     /// sha256 预编译；32 意图 ≈ 500-600k gas，块内可行）。
     uint256 public constant MAX_INTENTS_PER_CHALLENGE = 32;
+    /// S-38 挑战押金（原生 ETH，与 asset 无关）：垃圾挑战的押金成本（此前只靠 gas，见
+    /// TECH_SPEC §6.5）。固定常量；金额动态化随 Phase 2 多运营者一起定。
+    uint256 public constant CHALLENGE_BOND = 0.1 ether;
 
     /// 唯一结算运营者：commit/settle 的唯一合法调用者（S-11 防 griefing）。
     address public immutable operator;
@@ -202,62 +220,39 @@ contract BatchSettler {
         emit Claimed(epochId, ni.recipient, ni.amount);
     }
 
-    /// 挑战：窗口内任何人可对 commit≠settle 发起欺诈证明。验证通过 → 债券罚没给挑战者、
-    /// settlementFunded 退运营者、整 epoch voided。验证失败 → 回滚（挑战者吃 gas，v1 反垃圾）。
-    function challenge(uint256 epochId, FraudProof calldata fp) external {
+    /// 挑战（S-38 押金制，TECH_SPEC §6.5）：窗口内任何人可对 commit≠settle 发起欺诈证明，
+    /// 随笔押金 CHALLENGE_BOND（原生 ETH，token 模式下债券/押金仍为 ETH）。
+    /// 押金入场前 revert（无押金风险）：epoch 未结算 / 已成功挑战或 voided / 窗口关闭 /
+    /// msg.value != CHALLENGE_BOND。押金入场后"驳回即没收"：任何实质验证失败不再 revert，
+    /// 发 ChallengeRejected + 押金全额销毁（address(0)）、epoch 状态一字不动（仍可再挑战）。
+    /// 验证通过 → 押金退回 + 运营者债券罚没给挑战者、settlementFunded 退运营者、整 epoch voided。
+    function challenge(uint256 epochId, FraudProof calldata fp) external payable {
         Epoch storage ep = epochs[epochId];
         if (!ep.settled) revert EpochUnknown(epochId);
         if (ep.challenged || ep.voided) revert EpochAlreadyChallenged(epochId);
         if (block.timestamp > uint256(ep.settledAt) + CHALLENGE_WINDOW) {
             revert ChallengeWindowClosed();
         }
-        if (fp.intents.length == 0 || fp.intents.length > MAX_INTENTS_PER_CHALLENGE) {
-            revert TooManyIntents();
+        if (msg.value != CHALLENGE_BOND) revert WrongChallengeBond();
+
+        RejectReason reason = _verifyFraud(ep, fp);
+        if (reason != RejectReason.None) {
+            // CEI：事件（状态）先行，再外部调用。销毁目标 address(0) 无代码，无重入面。
+            emit ChallengeRejected(epochId, msg.sender, uint8(reason));
+            (bool okBurn,) = payable(address(0)).call{value: CHALLENGE_BOND}("");
+            require(okBurn, "bond burn failed");
+            return;
         }
 
-        if (fp.kind == 1) {
-            // 漏单：一条已提交意图，其收款人不在 net[] 中。
-            if (fp.intents.length != 1) revert BadFraudKind();
-            bytes32 ih = _intentHash(fp.intents[0]);
-            _verifyInclusion(ep, fp.intents[0], ih);
-            address recipient = address(fp.intents[0].recipient);
-            (bool found,) = _indexOfRecipient(ep, recipient);
-            if (found) revert NotFraud();
-        } else if (fp.kind == 2) {
-            // 低付：同一收款人的已提交意图子集，uint256 和 > net[target].amount。
-            if (fp.targetNetIndex >= ep.net.length) {
-                revert NetIndexOutOfBounds(epochId, fp.targetNetIndex);
-            }
-            address targetRecipient = ep.net[fp.targetNetIndex].recipient;
-            uint256 sum;
-            bytes32[] memory hashes = new bytes32[](fp.intents.length);
-            for (uint256 i = 0; i < fp.intents.length; i++) {
-                IntentProof calldata ip = fp.intents[i];
-                // 防假阳性 #2：跨收款人子集禁止（只与目标行比较）。
-                if (address(ip.recipient) != targetRecipient) revert BadFraudKind();
-                bytes32 ih = _intentHash(ip);
-                // 防假阳性 #1：同笔意图重复计入禁止。
-                for (uint256 j = 0; j < i; j++) {
-                    if (ih == hashes[j]) revert DuplicateIntent();
-                }
-                hashes[i] = ih;
-                _verifyInclusion(ep, ip, ih);
-                sum += ip.amount;
-            }
-            if (sum <= ep.net[fp.targetNetIndex].amount) revert NotFraud();
-        } else {
-            revert BadFraudKind();
-        }
-
-        // CEI：先改状态，再外部调用。
+        // CEI：先改状态，再外部调用。押金退回 + 运营者债券一笔给挑战者。
         ep.challenged = true;
         ep.voided = true;
         uint256 bond = ep.bondedAmount;
         uint256 refund = ep.settlementFunded;
         ep.bondedAmount = 0;
         ep.settlementFunded = 0;
-        (bool okBond,) = payable(msg.sender).call{value: bond}("");
-        require(okBond, "bond transfer failed");
+        (bool okPayout,) = payable(msg.sender).call{value: CHALLENGE_BOND + bond}("");
+        require(okPayout, "bond transfer failed");
         if (refund > 0) {
             // S-28：settlementFunded 退款按结算资产原路退回（ETH 或 token）。
             if (asset == address(0)) {
@@ -268,6 +263,50 @@ contract BatchSettler {
             }
         }
         emit ChallengeSucceeded(epochId, msg.sender, fp.kind);
+    }
+
+    /// 欺诈证明实质验证（S-38：不再 revert，失败返回原因码；None = 欺诈成立）。判定逻辑与
+    /// 押金制之前逐字等价，仅把 revert 换成原因码返回。
+    function _verifyFraud(Epoch storage ep, FraudProof calldata fp)
+        internal
+        view
+        returns (RejectReason)
+    {
+        if (fp.intents.length == 0 || fp.intents.length > MAX_INTENTS_PER_CHALLENGE) {
+            return RejectReason.TooManyIntents;
+        }
+        if (fp.kind == 1) {
+            // 漏单：一条已提交意图，其收款人不在 net[] 中。
+            if (fp.intents.length != 1) return RejectReason.BadFraudKind;
+            bytes32 ih = _intentHash(fp.intents[0]);
+            if (!_verifyInclusion(ep, fp.intents[0], ih)) return RejectReason.BadInclusionProof;
+            address recipient = address(fp.intents[0].recipient);
+            (bool found,) = _indexOfRecipient(ep, recipient);
+            if (found) return RejectReason.NotFraud;
+        } else if (fp.kind == 2) {
+            // 低付：同一收款人的已提交意图子集，uint256 和 > net[target].amount。
+            if (fp.targetNetIndex >= ep.net.length) return RejectReason.NetIndexOutOfBounds;
+            address targetRecipient = ep.net[fp.targetNetIndex].recipient;
+            uint256 sum;
+            bytes32[] memory hashes = new bytes32[](fp.intents.length);
+            for (uint256 i = 0; i < fp.intents.length; i++) {
+                IntentProof calldata ip = fp.intents[i];
+                // 防假阳性 #2：跨收款人子集禁止（只与目标行比较）。
+                if (address(ip.recipient) != targetRecipient) return RejectReason.BadFraudKind;
+                bytes32 ih = _intentHash(ip);
+                // 防假阳性 #1：同笔意图重复计入禁止。
+                for (uint256 j = 0; j < i; j++) {
+                    if (ih == hashes[j]) return RejectReason.DuplicateIntent;
+                }
+                hashes[i] = ih;
+                if (!_verifyInclusion(ep, ip, ih)) return RejectReason.BadInclusionProof;
+                sum += ip.amount;
+            }
+            if (sum <= ep.net[fp.targetNetIndex].amount) return RejectReason.NotFraud;
+        } else {
+            return RejectReason.BadFraudKind;
+        }
+        return RejectReason.None;
     }
 
     function _sumNet(NetInstruction[] calldata net) internal pure returns (uint256 total) {
@@ -300,15 +339,16 @@ contract BatchSettler {
         );
     }
 
-    function _verifyInclusion(Epoch storage ep, IntentProof calldata ip, bytes32 ih) internal view {
-        if (ip.leafIndex >= ip.acceptedCount) revert BadInclusionProof();
-        if (ip.siblings.length != Merkle.treeDepth(ip.acceptedCount)) revert BadInclusionProof();
+    /// 包含性验证（S-38：bool 化，失败由 `_verifyFraud` 归入 BadInclusionProof 原因码）。
+    function _verifyInclusion(Epoch storage ep, IntentProof calldata ip, bytes32 ih)
+        internal
+        view
+        returns (bool)
+    {
+        if (ip.leafIndex >= ip.acceptedCount) return false;
+        if (ip.siblings.length != Merkle.treeDepth(ip.acceptedCount)) return false;
         bytes32 leafHash = Merkle.leaf(ip.seq, ih);
-        if (
-            Merkle.computeRoot(leafHash, ip.leafIndex, ip.acceptedCount, ip.siblings)
-                != ep.commitmentRoot
-        ) {
-            revert BadInclusionProof();
-        }
+        return Merkle.computeRoot(leafHash, ip.leafIndex, ip.acceptedCount, ip.siblings)
+            == ep.commitmentRoot;
     }
 }

@@ -469,6 +469,7 @@ pub trait Ingest {
 | 运营者质押债券（**原生 ETH**，`commit` 时 `msg.value`） | 等价双花 / 漏单 / 提交与承诺不符的 net[] | 债券罚没，判给挑战者 |
 | 预算账本诚实 | 已撤销仍放行 / 超限记账 | 债券罚没 + 声誉分（Phase 2） |
 | 撤销根最新 | 用过时撤销根放行已撤销委托 | 债券罚没 |
+| 挑战者押金（`challenge` 随笔 `msg.value`，原生 ETH，S-38） | 欺诈证明被驳回（押金入场后任何实质验证失败） | 押金全额销毁（`address(0)`，任何一方不可取回）；epoch 状态不变、仍可再挑战 |
 
 - **欺诈证明类型（S-11，sound + 有界）**：
   - **漏单（missing-recipient）**：出示一条明文 SpendIntent + `seq`/`leafIndex`/
@@ -481,9 +482,32 @@ pub trait Ingest {
     外加边界：`leafIndex < acceptedCount`、`siblings.length == treeDepth(acceptedCount)`。
 - **挑战窗口**：`settle` 后 `CHALLENGE_WINDOW`（6h）内，任何人可对 `commit ≠ settle` 提交
   欺诈证明。**CEI 顺序**：验证通过 → 先置 `challenged`/`voided` → 债券罚没给挑战者 +
-  `settlementFunded`（= Σnet）全额退运营者 → 后续 claim 全部拒绝。验证失败整笔回滚（挑战者
-  吃 gas——窗口内无押金，v1 反垃圾手段）。单次挑战 `MAX_INTENTS_PER_CHALLENGE = 32`
-  （epoch_capacity=100k → 树深 17，每意图 ~19 次 sha256 预编译，~500-600k gas）。
+  `settlementFunded`（= Σnet）全额退运营者 → 后续 claim 全部拒绝。单次挑战
+  `MAX_INTENTS_PER_CHALLENGE = 32`（epoch_capacity=100k → 树深 17，每意图 ~19 次 sha256
+  预编译，~500-600k gas）。
+- **挑战押金（S-38，收口 audit-scope §4「challenge 无押金」）**：v1 反垃圾原本只靠 gas
+  （无效挑战整笔回滚、挑战者零损失）——垃圾挑战向量在 gas 便宜的链上不成立。S-38 起
+  `challenge` 变 `payable`，押金 `CHALLENGE_BOND = 0.1 ether`（合约常量，原生 ETH，与
+  `asset` 无关、与运营者债券同币种；金额可配置化随 Phase 2 多运营者一起定）：
+  1. **押金入场前 revert（零成本守卫，无押金风险）**：epoch 未结算（`EpochUnknown`）、
+     已被成功挑战或 voided（`EpochAlreadyChallenged`）、窗口关闭（`ChallengeWindowClosed`）、
+     `msg.value != CHALLENGE_BOND`（`WrongChallengeBond`）。这四类是"状态/参数不合法"，
+     证明根本没被审理，不构成垃圾挑战向量。
+  2. **押金入场后"驳回即没收"**：押金随交易进入合约，欺诈证明的任何实质验证失败（非欺诈
+     `NotFraud`、包含证明不成立、同笔重复计入、跨收款人子集、kind 形状非法、意图数越界、
+     目标行越界）**不再 revert**——返回 `ChallengeRejected(epochId, challenger, reason)`
+     事件，押金全额转入 `address(0)` 销毁，epoch 状态**一字不动**（不置 `challenged`/不
+     `voided`/运营者债券与结算资金原封），该 epoch 仍可被再次挑战。垃圾挑战者每次尝试
+     实付 0.1 ETH，gas 之外有了真押金。
+  3. **没收款销毁（不判给任何一方）**：押金没收款转 `address(0)`，运营者/挑战者/其他方均
+     不可取回——不给运营者制造"被挑战有赏"的激励，也不给任何路径新增可窃取资金池。
+     （对照：运营者债券没收款**判给挑战者**，那是欺诈成立的赔偿，两者性质不同。）
+  4. **押金从不停留为合约状态**：成功路径挑战者拿回 `CHALLENGE_BOND + 运营者债券`（一笔
+     call），失败路径押金销毁，均在本笔交易内结清——合约不新增任何跨交易的挑战方余额记账，
+     不扩大 §6.4 的资金面。
+  5. **CEI 顺序**：拒绝路径 = 事件（状态）→ 销毁转账；成功路径 = 先置 `challenged`/`voided`
+     → 挑战者转账 → 运营者退款转账。两次外部调用目标分别是挑战者（可能拒收 → `require`
+     整笔回滚，与 S-11 行为一致）与运营者。
 - **诚实路径**：v1 信任运营者（我们自己是第一个运营者），债券起震慑作用；Phase 2 引入多运营者 + 共享账本（L3 前置）。
 - **出界**：超付不可证（需完备性）；按 epoch 结算资金后超付是运营者自损（自掏 Σnet 付虚高
   行），不掏空其他 claim 方。整 epoch void 会惩罚诚实收款人（该 epoch 全部 claim 拒绝）——
@@ -848,6 +872,7 @@ contract BatchSettler {
                  uint256 bondedAmount);
     event Settled(uint256 indexed epochId, bytes32 nettingRoot, uint64 netCount);
     event ChallengeSucceeded(uint256 indexed epochId, address indexed challenger, uint8 kind);
+    event ChallengeRejected(uint256 indexed epochId, address indexed challenger, uint8 reason);
     event Claimed(uint256 indexed epochId, address indexed recipient, uint256 amount);
 
     address public immutable operator;                 // 唯一运营者（onlyOperator 守卫）
@@ -855,6 +880,7 @@ contract BatchSettler {
                                                        //        否则 = ERC-20 结算资产（如 USDC）
     uint256 public constant CHALLENGE_WINDOW = 6 hours;
     uint256 public constant MAX_INTENTS_PER_CHALLENGE = 32;
+    uint256 public constant CHALLENGE_BOND = 0.1 ether; // S-38 挑战押金（原生 ETH，与 asset 无关）
 
     constructor(address operator_, address asset_);    // bond 恒为原生 ETH（两模式相同）
 
@@ -863,14 +889,18 @@ contract BatchSettler {
     function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot)
         external payable onlyOperator;                // keccak(net) 校验 + 存 net[] + msg.value ≥ Σnet
     function claim(uint256 epochId, uint256 netIndex) external;  // 窗口后逐条领取结算资产（ETH/token）；voided 拒
-    function challenge(uint256 epochId, FraudProof calldata fp) external; // 窗口内完整验证欺诈证明
+    function challenge(uint256 epochId, FraudProof calldata fp)
+        external payable;                             // S-38 押金制：入场前 4 类 revert；入场后
+                                                      // 驳回即销毁押金（ChallengeRejected），epoch 不动
 
     error EpochAlreadyCommitted(uint256); error EpochAlreadySettled(uint256);
     error EpochAlreadyChallenged(uint256); error EpochUnknown(uint256); error EpochVoided(uint256);
     error WrongNettingRoot(); error ChallengeWindowClosed(); error ChallengeWindowOpen();
     error AlreadyClaimed(uint256,uint256); error NetIndexOutOfBounds(uint256,uint256);
-    error TooManyIntents(); error DuplicateIntent(); error BadInclusionProof(); error NotFraud();
-    error InsufficientSettlementFunding(); error BadFraudKind(); error NotOperator();
+    error InsufficientSettlementFunding(); error NotOperator();
+    error WrongChallengeBond();                        // S-38：msg.value != CHALLENGE_BOND
+    // S-38 移除（押金入场后不再 revert，改为 ChallengeRejected 的 reason 码）：
+    // TooManyIntents / DuplicateIntent / BadInclusionProof / NotFraud / BadFraudKind
     error TokenTransferFailed(); error EthValueInTokenMode();   // S-28 资产参数化
 }
 ```
@@ -998,9 +1028,10 @@ contract BatchSettler {
   workspace）在一条 anvil 会话内跑三场景——① 快乐路径：注册→submit→密封结算→
   `commit`（债券+撤销根）→`settle`（资金足）→过窗 `claim` 收款人收精确净额；② 撤销：
   链上 revoke→聚合器 revoke→新意图 `E_REVOKED` 拒→下个 epoch 撤销根变化；③ 欺诈：
-  `commit` 诚实根→`settle` 漏单（自洽 netting root）→kind=1 包含证明 `challenge` 成功→
-  债券罚没+`settlementFunded` 退运营者+epoch voided→claim 拒绝。依赖 forge build 产物 +
-  anvil，缺任一则 `[SKIP]`（不阻塞 Rust 主门禁）。
+  `commit` 诚实根→`settle` 漏单（自洽 netting root）→kind=1 包含证明 `challenge`（S-38
+  随笔押金 `CHALLENGE_BOND`，成功路径原额退回）成功→债券罚没+`settlementFunded` 退运营者
+  +epoch voided→claim 拒绝。依赖 forge build 产物 + anvil，缺任一则 `[SKIP]`（不阻塞
+  Rust 主门禁）。
 - 热路径零分配用分配器钩子断言（`dhat` 或自写 alloc hook），不靠估计。
 - **GitHub CI**（`.github/workflows/ci.yml`）：**可选第二道网**，2026-08-17 起被账户
   计费阻断（私有 Actions included 额度耗尽）而挂起。solidity（forge）与 ZK（nargo/bb）

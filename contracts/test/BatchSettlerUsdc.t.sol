@@ -13,6 +13,9 @@ import {MockUSDC} from "./MockUSDC.sol";
 contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     BatchSettler internal bs;
     MockUSDC internal usdc;
+    /// S-38：挑战押金缓存（setUp 读一次）—— 不能内联进 `{value: ...}` 表达式（外部
+    /// getter 会吃掉 vm.prank / vm.expectRevert 的下一次调用预期，见 BatchSettler.t.sol）。
+    uint256 internal challengeBond;
     uint256 internal constant EPOCH = 1;
     uint256 internal constant BOND = 1 ether;
     address internal constant CHALLENGER = address(0xC0FFEE);
@@ -24,6 +27,9 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         // operator = 测试合约自身；asset = MockUSDC。
         bs = new BatchSettler(address(this), address(usdc));
         usdc.mint(address(this), MINT);
+        // S-38：挑战押金恒为原生 ETH，挑战者预注资。
+        vm.deal(CHALLENGER, 10 ether);
+        challengeBond = bs.CHALLENGE_BOND();
     }
 
     // ------------------------------------------------------------------ helpers
@@ -177,8 +183,8 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
 
     // ------------------------------------------------------------------ challenge
 
-    /// kind=1 漏单挑战（USDC 模式）：债券（ETH）给挑战者，settlementFunded（USDC）退运营者，
-    /// epoch voided，claim 拒绝 —— 双资产分流正确。
+    /// kind=1 漏单挑战（USDC 模式）：债券 + 挑战押金（均 ETH）给挑战者，settlementFunded
+    /// （USDC）退运营者，epoch voided，claim 拒绝 —— 双资产分流正确（S-38 押金恒 ETH）。
     function test_challenge_slashes_eth_bond_and_refunds_usdc() public {
         bytes32 dh = keccak256("delegation-1");
         IntentFields[] memory intents = new IntentFields[](1);
@@ -203,9 +209,9 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         uint256 opEthBefore = address(this).balance;
 
         vm.prank(CHALLENGER);
-        bs.challenge(EPOCH, fp);
+        bs.challenge{value: challengeBond}(EPOCH, fp);
 
-        // 债券按 ETH 罚没；结算资金按 USDC 原路退。
+        // 债券按 ETH 罚没（押金原额退回，净得 = 债券）；结算资金按 USDC 原路退。
         assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond (ETH) to challenger");
         assertEq(usdc.balanceOf(address(this)), opUsdcBefore, "USDC refunded (net=0)");
         assertEq(address(this).balance, opEthBefore, "no ETH refund");
@@ -241,7 +247,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
 
         uint256 opUsdcBefore = usdc.balanceOf(address(this));
         vm.prank(CHALLENGER);
-        bs.challenge(EPOCH, fp);
+        bs.challenge{value: challengeBond}(EPOCH, fp);
         assertEq(usdc.balanceOf(address(this)), opUsdcBefore + 100e6, "USDC fund refunded");
     }
 

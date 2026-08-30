@@ -235,11 +235,13 @@ async fn run_smoke() -> Result<()> {
     };
 
     let challenger_before = provider.get_balance(challenger.address()).await?;
+    // S-38：challenge 变 payable，随笔押金 CHALLENGE_BOND（成功路径原额退回）。
     let ch_rec = settler_ch
         .challenge(U256::from(1), fp)
+        .value(U256::from(CHALLENGE_BOND))
         .send().await.context("challenge send")?
         .get_receipt().await.context("challenge receipt")?;
-    assert!(ch_rec.status(), "challenge 必须成功（不漏单则 NotFraud revert）");
+    assert!(ch_rec.status(), "challenge 必须成功（不漏单则驳回没收押金）");
     assert!(
         ch_rec.logs().iter().any(|l| {
             l.topics().first() == Some(&keccak256("ChallengeSucceeded(uint256,address,uint8)"))
@@ -249,7 +251,7 @@ async fn run_smoke() -> Result<()> {
     let challenger_after = provider.get_balance(challenger.address()).await?;
     assert!(
         challenger_after - challenger_before > U256::from(BOND / 2),
-        "债券罚没给挑战者（扣 gas 后仍 > 一半债券）"
+        "债券罚没给挑战者（押金原额退回，扣 gas 后仍 > 一半债券）"
     );
     // epoch voided → 过窗后 claim 被 EpochVoided 拒。
     fast_forward(&provider).await?;
