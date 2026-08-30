@@ -22,7 +22,7 @@
 //! `try_commit` 的 `entry` 查找与 nonce 记录插入都在容量内 → 零分配。
 //! WAL 失败 panic（持久化骨干，不可降级）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -64,6 +64,12 @@ pub struct IngestConfig {
     pub wal_sync_every: usize,
     /// 每委托 nonce 集容量预置（B8 零分配的关键，`register` 时 provision）。
     pub nonce_capacity_per_delegation: usize,
+    /// 撤销根绑定闸（S-44，TECH_SPEC §6.2 / §4.6 残余③）：`true` 时证明公共输入
+    /// `revocation_root` 必须 ∈ 撤销状态根集合（本账本出现过的全部撤销状态根），否则
+    /// `E_REV_ROOT` 拒——自选根（空根 / 伪造根）的装饰性 ZK 收口。缺省 `false`：占位
+    /// prover 口径不动（占位 witness 的根无语义），装配真验证后端（§6.13 `BbVerifier`）
+    /// 时必须同步置 `true`（与 §6.13 / §6.14「生产默认不动，真后端显式开启」同口径）。
+    pub enforce_revocation_root: bool,
 }
 
 impl IngestConfig {
@@ -80,6 +86,7 @@ impl IngestConfig {
             epoch_secs: 60,
             wal_sync_every: 10_000,
             nonce_capacity_per_delegation: 4_096,
+            enforce_revocation_root: false,
         }
     }
 }
@@ -92,6 +99,7 @@ impl Default for IngestConfig {
             epoch_secs: 10,
             wal_sync_every: 1_000,
             nonce_capacity_per_delegation: 4_096,
+            enforce_revocation_root: false,
         }
     }
 }
@@ -491,6 +499,12 @@ pub struct Aggregator {
     /// `submit` 全路径延迟直方图（S-35，TECH_SPEC §6.11）：固定桶原子增量，零分配零锁
     /// （B8 口径不变）。会话计数不持久化（同 `rejected`），崩溃恢复后从 0 起。
     latency: LatencyHistogram,
+    /// 撤销状态根集合（S-44，撤销根绑定闸的接受集）：本账本出现过的全部撤销状态根。
+    /// 撤销集只增 → 状态根随撤销事件单调推进，集合 ≤ 撤销事件数 + 1。**进程内不持久化**
+    /// （TECH_SPEC §4.6 残余③诚实边界）：重启后 = {空根, 当前根}，跨重启 + 跨换代的在途
+    /// 证明以 `E_REV_ROOT` 拒（拒绝是安全方向）。仅在 `enforce_revocation_root = true`
+    /// 时维护（闸关闭 = 占位口径，零额外开销）。
+    revocation_roots: RwLock<HashSet<[u8; 32]>>,
     /// 本实例启动时刻（unix 秒；`snapshot()` 健康快照用）。
     started_at: u64,
     /// 实例标识（`meridian-<pid>`；S-15 多实例时每实例一 metrics endpoint）。
@@ -571,7 +585,7 @@ impl Aggregator {
             Some(n) => ShardedState::with_capacity(cfg.ledger_shards, n),
             None => ShardedState::new(cfg.ledger_shards),
         };
-        Aggregator {
+        let agg = Aggregator {
             cfg,
             registry: DelegationRegistry::new(),
             state,
@@ -584,10 +598,29 @@ impl Aggregator {
             seq: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             latency: LatencyHistogram::new(),
+            revocation_roots: RwLock::new(HashSet::new()),
             started_at: now,
             instance_id: format!("meridian-{}", std::process::id()),
             now_fn,
+        };
+        agg.seed_revocation_roots();
+        agg
+    }
+
+    /// 撤销状态根集合种子（S-44）：空根（账本 genesis 状态，任何账本都真实出现过）+
+    /// 当刻根（WAL 重放路径由 `restore_from_wal` 在撤销集重建后补种）。仅在绑定闸开启时
+    /// 维护——闸关闭 = 占位口径，零额外开销（`sparse_root()` 与每 epoch 密封同成本级）。
+    fn seed_revocation_roots(&self) {
+        if !self.cfg.enforce_revocation_root {
+            return;
         }
+        let mut roots = self
+            .revocation_roots
+            .write()
+            .expect("revocation roots poisoned");
+        // 空根：撤销集为空的确定树根（S-41 规范，与电路空树逐位同源）。
+        roots.insert(RevocationSet::new().sparse_root());
+        roots.insert(self.revocations.sparse_root());
     }
 
     /// 从 WAL 重放恢复（崩溃恢复入口）。返回 (聚合器, 是否截断了撕裂尾)。
@@ -614,6 +647,10 @@ impl Aggregator {
                 agg.revocations.insert(*delegation_hash);
             }
         }
+        // 1a'. 撤销状态根集合补种（S-44）：重放后的当刻根进接受集。历史中间状态根不重算
+        // （逐状态重算 = O(撤销数²) 次 MSM 建树，且集合本就进程内不持久化）——跨重启 +
+        // 跨换代的在途证明以 E_REV_ROOT 拒（诚实边界，TECH_SPEC §4.6 残余③）。
+        agg.seed_revocation_roots();
         // 1. 注册表 + provision。
         for rec in &records {
             if let DecodedRecord::Register(sd, agent_pub_bytes) = rec {
@@ -734,7 +771,16 @@ impl Aggregator {
         self.wal
             .append_revoke(delegation_hash)
             .expect("WAL failure (durability backbone)");
-        self.revocations.insert(delegation_hash)
+        let fresh = self.revocations.insert(delegation_hash);
+        // 撤销状态根集合推进（S-44）：新状态根进接受集（撤销集只增 → 根单调变化，重复
+        // 撤销幂等不产生新状态）。仅在绑定闸开启时维护（闸关闭零开销，占位口径）。
+        if fresh && self.cfg.enforce_revocation_root {
+            self.revocation_roots
+                .write()
+                .expect("revocation roots poisoned")
+                .insert(self.revocations.sparse_root());
+        }
+        fresh
     }
 
     /// 撤销集当前根（下个 epoch 承诺时锚定；测试 / 观测）。
@@ -808,6 +854,19 @@ impl Aggregator {
         // 6. 公共输入与信封一致（证明与信封不是同一笔意图 → 拒）。
         if let Err(e) = check_public_inputs_consistent(&pi, intent) {
             return self.reject(ih, e);
+        }
+        // 6b. 撤销根绑定闸（S-44，§6.2 / §4.6 残余③）：电路只证「path 与 root 自洽」，
+        //     root 可由 prover 自选——绑定到本账本真实出现过的撤销状态，装饰性 ZK（拿
+        //     空根 / 伪造根伪造非成员陈述）收口。置于 try_commit 之前：被拒不耗 nonce /
+        //     窗口槽。安全性由步 2b 当前撤销闸兜底（任一历史状态未撤销 + 当前未撤销）。
+        if self.cfg.enforce_revocation_root
+            && !self
+                .revocation_roots
+                .read()
+                .expect("revocation roots poisoned")
+                .contains(&pi.revocation_root)
+        {
+            return self.reject(ih, Error::ERevRoot);
         }
         // 7. 预留窗口槽（记账前入窗口 → 无回滚；满 / 密封自动换窗重试）。
         let slot = self.windows.reserve(ih, now);
@@ -1062,6 +1121,7 @@ mod tests {
             epoch_secs: 60,
             wal_sync_every: 100_000,
             nonce_capacity_per_delegation: 100,
+            enforce_revocation_root: false,
         }
     }
 
@@ -2649,6 +2709,179 @@ mod tests {
         let r = agg2.submit(&make_env(dh, [1u8; 20], &agent_key, [0xEE; 20], 5, 3, now));
         assert!(r.accepted);
         assert_eq!(agg2.next_nonce(&dh), Some(4));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // S-44：撤销根绑定闸（§6.2 / §4.6 残余③）
+    // -----------------------------------------------------------------------
+
+    fn test_cfg_enforce_root() -> IngestConfig {
+        let mut cfg = test_cfg();
+        cfg.enforce_revocation_root = true;
+        cfg
+    }
+
+    fn test_aggregator_cfg(cfg: IngestConfig, clock: &Arc<AtomicU64>, path: &Path) -> Aggregator {
+        let c = Arc::clone(clock);
+        let wal = Wal::open(path, 100_000).unwrap();
+        Aggregator::with_clock(
+            cfg,
+            Box::new(FormatVerifier),
+            wal,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// 替换信封证明的 `revocation_root` 公共输入（该字段不参与 `check_public_inputs_consistent`
+    /// ——S-44 前它整体无闸，绑定闸是第一个约束它的检查）。
+    fn with_revocation_root(env: &IntentEnvelope, root: [u8; 32]) -> IntentEnvelope {
+        let mut e = env.clone();
+        e.proof.public_inputs.revocation_root = root;
+        e
+    }
+
+    #[test]
+    fn revocation_root_gate_off_accepts_any_root() {
+        // 缺省（闸关）：任意根照单全收——占位口径行为逐字节不变（S-44 不动生产默认）。
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revroot-off");
+        let agg = test_aggregator(&clock, &path);
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+        let r = agg.submit(&with_revocation_root(&env, [0xAB; 32]));
+        assert!(r.accepted, "gate off: self-chosen root accepted (占位口径)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn revocation_root_gate_rejects_self_chosen_root_without_consuming_nonce() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revroot-self");
+        let agg = test_aggregator_cfg(test_cfg_enforce_root(), &clock, &path);
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        // 自选根（伪造 / 空集外的任意值）→ E_REV_ROOT。
+        let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+        let r = agg.submit(&with_revocation_root(&env, [0xAB; 32]));
+        assert!(!r.accepted);
+        assert_eq!(r.reject_reason, Some(Error::ERevRoot));
+        assert_eq!(agg.accepted_count(), 0);
+        // 闸在 try_commit 之前：nonce 未消耗，同意图换正确根重出证明可接受。
+        let r2 = agg.submit(&with_revocation_root(&env, agg.revocation_root()));
+        assert!(
+            r2.accepted,
+            "same intent re-proved with anchored root accepted"
+        );
+        assert_eq!(r2.seq, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn revocation_root_gate_accepts_current_and_historical_roots() {
+        // 根换代不拒在途证明：旧状态 witness（换代前取的快照）仍在接受集——
+        // 语义 =「在该状态时未撤销」，安全性由管线步 2b 当前撤销闸兜底。
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revroot-hist");
+        let agg = test_aggregator_cfg(test_cfg_enforce_root(), &clock, &path);
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let (dh_other, _) = register_default(&agg, [2u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+
+        let root0 = agg.revocation_root(); // 空集状态（genesis）
+        let env1 = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+        assert!(agg.submit(&with_revocation_root(&env1, root0)).accepted);
+
+        // 撤销别人 → 根换代；dh 自身的在途证明（root0 witness）仍接受。
+        assert!(agg.revoke(dh_other));
+        let root1 = agg.revocation_root();
+        assert_ne!(root0, root1);
+        let env2 = make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 10, 2, now);
+        assert!(
+            agg.submit(&with_revocation_root(&env2, root0)).accepted,
+            "historical state root still accepted"
+        );
+
+        // 当刻根当然接受；集合外的自选根拒。
+        let env3 = make_env(dh, [1u8; 20], &agent_key, [0xCC; 20], 10, 3, now);
+        assert!(agg.submit(&with_revocation_root(&env3, root1)).accepted);
+        let env4 = make_env(dh, [1u8; 20], &agent_key, [0xDD; 20], 10, 4, now);
+        assert_eq!(
+            agg.submit(&with_revocation_root(&env4, [0xCD; 32]))
+                .reject_reason,
+            Some(Error::ERevRoot)
+        );
+
+        // 已撤销委托：步 2b 先拒（撤销闸先于绑定闸，E_REVOKED 语义不被绑定闸遮蔽）。
+        let env5 = make_env(dh_other, [2u8; 20], &agent_key, [0xEE; 20], 10, 1, now);
+        assert_eq!(
+            agg.submit(&with_revocation_root(&env5, root1))
+                .reject_reason,
+            Some(Error::ERevoked)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn revocation_root_gate_history_is_in_process_only() {
+        // 诚实边界（§4.6 残余③）：状态根集合进程内不持久化——重启后 = {空根, 当前根}，
+        // 跨重启 + 跨换代的中间状态 witness 以 E_REV_ROOT 拒（拒绝是安全方向）。
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revroot-restart");
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        let mid_root;
+        let dh;
+        {
+            let agg = test_aggregator_cfg(test_cfg_enforce_root(), &clock, &path);
+            let (d, _) = register_default(&agg, [1u8; 20]);
+            let (other, _) = register_default(&agg, [2u8; 20]);
+            dh = d;
+            // 两代撤销：R1（中间态）→ R2（重启前终点）。R1 的在途 witness 进程内有效。
+            assert!(agg.revoke(other));
+            mid_root = agg.revocation_root();
+            assert!(agg.revoke([0xEE; 32]));
+            let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+            assert!(agg.submit(&with_revocation_root(&env, mid_root)).accepted);
+            agg.wal.flush().unwrap();
+        }
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            test_cfg_enforce_root(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+
+        // 重启后再换代：重启前的中间状态根（含重启前的当刻根——重放后只补种重放终点）
+        // 出集 → 拒。
+        assert!(agg2.revoke([0xFF; 32]));
+        let env2 = make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 10, 2, now);
+        assert_eq!(
+            agg2.submit(&with_revocation_root(&env2, mid_root))
+                .reject_reason,
+            Some(Error::ERevRoot)
+        );
+        // 当刻根与空根（种子）仍在集内。
+        let env3 = make_env(dh, [1u8; 20], &agent_key, [0xCC; 20], 10, 3, now);
+        assert!(
+            agg2.submit(&with_revocation_root(&env3, agg2.revocation_root()))
+                .accepted
+        );
+        let env4 = make_env(dh, [1u8; 20], &agent_key, [0xDD; 20], 10, 4, now);
+        assert!(
+            agg2.submit(&with_revocation_root(
+                &env4,
+                RevocationSet::new().sparse_root()
+            ))
+            .accepted
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

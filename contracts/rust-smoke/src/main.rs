@@ -289,7 +289,7 @@ fn aggregator(clock: Arc<AtomicU64>, wal_path: &std::path::Path) -> Aggregator {
             epoch_capacity: EPOCH_CAPACITY,
             epoch_secs: 60,
             wal_sync_every: 1_000,
-            nonce_capacity_per_delegation: 64,
+            nonce_capacity_per_delegation: 64,            enforce_revocation_root: false,
         },
         Box::new(FormatVerifier),
         wal,

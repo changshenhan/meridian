@@ -275,9 +275,17 @@ pub fn check_budget(
   建树（目标作为空叶插入）一致；**电路消费交叉锚 S-43 已落地**（§6.14 真 prover 步 6：
   Noir `compute_merkle_root` 吃聚合器产路径重算 == 公共输入根，`nargo execute` 断言 8
   自校验，e2e 实证）；prover 侧消费聚合器树出 witness 随 §6.14 兑现。
-  残余③：根随 epoch 上链与证明生成
-  之间的一致性（SDK 对哪个根出证明、锚定根换代时
-  在途证明如何处理）待真 ZK 全集成时定夺。
+  残余③ **S-44（2026-08-30）定夺收口（聚合器半边）**：证明公共输入 `revocation_root`
+  绑定聚合器账本的撤销状态——摄取管线新增撤销根绑定闸（§6.2），`pi.revocation_root`
+  必须 ∈ **撤销状态根集合**（本账本出现过的全部撤销状态根；撤销集只增 → 状态根按撤销
+  事件单调推进，集合 ≤ 撤销事件数 + 1）。非成员证明在任一历史状态成立 + 管线步 2b 的
+  当前撤销闸（`E_REVOKED`）⇒ 当前未撤销：安全性由 2b 兜底、密码学陈述由绑定闸锚到
+  真实状态——**自选根（空根 / 伪造根）的装饰性 ZK 收口**。根换代时在途证明（witness
+  取自旧状态快照）不因换代被拒——旧状态根仍在集合内，语义 =「在该状态时未撤销」，
+  与 §6.5「撤销前已接受的意图仍留在承诺中支付（非追溯）」同一口径。诚实边界：状态根
+  集合为**进程内**（不落 WAL）——重启后集合 = {空根, 当前根}，跨重启 + 跨换代的在途
+  证明（witness 取自重启前的中间状态）以 `E_REV_ROOT` 拒（不安全方向为拒绝，可取新
+  witness 重出证明；SDK 侧自动刷新重试见 §6.14 诚实边界 3）。
 
 ### 4.7 两种模式映射（实现同一接口）
 
@@ -467,6 +475,22 @@ pub trait Ingest {
   意图重发**仍返回原 `seq`——SDK 断线重试绝不因 `EIntentExpired` 误判失败而换新 nonce
   重发（那才是双花的来源）。跨意图复用 nonce 仍 `E_Nonce`（§6.2 不允许复用，原语义
   不变）。
+- **撤销根绑定闸（S-44，§4.6 残余③聚合器半边）**：验证明与公共输入一致性检查之后、
+  预留窗口槽之前——`pi.revocation_root` 必须 ∈ 撤销状态根集合（本账本出现过的全部
+  撤销状态根：空根 ∪ 每次 `revoke` 后的新根 ∪ 当前根），否则 `E_REV_ROOT` 拒（不耗
+  nonce / 窗口槽——闸在 `try_commit` 之前，被拒意图不占 nonce 占位）。语义：电路只证
+  「path 与 root 自洽」，root 本身可由 prover 自选——绑定闸把公共输入锚到聚合器真实
+  出现过的撤销状态，装饰性 ZK（拿空根伪造非成员陈述）收口。**配置开关**
+  `IngestConfig::enforce_revocation_root`，缺省 `false`（占位 prover 口径不动：占位
+  witness 的根无语义，默认装配行为逐字节不变——与 §6.13 `MERIDIAN_VERIFY_BACKEND`
+  缺省 `format`、§6.14 缺省 `PlaceholderProver` 同一口径：生产默认不动，真后端显式
+  开启）；装配真验证后端（§6.13 `BbVerifier`）时必须同步置 `true`（bb 模式 + 绑定闸
+  = 全链真 ZK 的完整形态）。撤销集只增 → 集合 ≤ 撤销事件数 + 1，闸成本 = 一次哈希集
+  查找（热路径零分配）；根的计算只在 `revoke` 事件与集合未命中时发生（与 §6.3 每
+  epoch 密封已付的 `sparse_root()` 同成本级，不新增热路径代价）。诚实边界：集合进程内
+  不持久化（重启后 = {空根, 当前根}），见 §4.6 残余③；SDK 对 `E_REV_ROOT` 的自动
+  刷新重试（witness 重新获取 + 同意图重出证明，nonce 未消耗故安全）为后续项，当前
+  按业务拒绝定局透传。
 
 ### 6.3 排序与承诺（commitment lattice，防抢跑）
 
@@ -1056,8 +1080,13 @@ Poseidon）留在 Noir**（S-05 教训守住）。
    `AttestationPubKey`；证明公共输入 `agent_commit` 由 oracle 从 `attestation_secret`
    派生——两处同源（同一 secret）由调用方保证，聚合器登记以公共输入为准（§9）。Rust 侧
    Jubjub 密钥生成仍是接缝（本件不生成密钥，只消费标量）。
-3. **撤销根换代**：prove 请求的 witness 是聚合器当刻树快照；根随 epoch 上链（§4.6 残余③）
-   与在途证明的一致性处理不在本件。
+3. **撤销根换代**：prove 请求的 witness 是聚合器当刻树快照。**S-44（§4.6 残余③聚合器
+   半边）收口绑定语义**：聚合器侧撤销根绑定闸（§6.2，`enforce_revocation_root`）接受
+   本账本出现过的全部撤销状态根——换代窗口内的在途证明（旧状态 witness）不被换代本身
+   拒，安全性由管线步 2b 当前撤销闸兜底。**SDK 半边（本件仍未收口，后续项）**：SDK 的
+   witness 为手动装配（`set_revocation_witness`），无自动新鲜度——被 `E_REV_ROOT` 拒
+   （绑定闸开启 + witness 取自重启前的中间状态等窄窗口）时按业务拒绝定局；自动刷新
+   （witness 查询端点 + 同意图重出证明，nonce 未消耗故安全）为后续项。
 4. gen-witness 的 `MAX_REVOKED = 2` 固定撤销集仍只服务正式管线 fixture；真撤销 witness
    一律来自聚合器 `RevocationSet`（S-42），oracle 的撤销树输出弃用。
 
@@ -1330,6 +1359,9 @@ contract BatchSettler {
 | `E_ATTEST_BIND` | 换钥重绑被拒（attestation 双钥绑定，S-05） |
 | `E_INTENT_SIG` | agent 签名验证失败 |
 | `E_PROOF` | ZK 证明无效 |
+| `E_VERIFY_BACKEND` | 真验证后端不可得（S-40，fail-closed 不降级） |
+| `E_PROVER` | 证明生成失败（S-43，fail-closed 不降级） |
+| `E_REV_ROOT` | 证明公共输入 `revocation_root` 不在聚合器撤销状态根集合（S-44 绑定闸，§6.2；仅 `enforce_revocation_root = true` 时触发） |
 | `E_BUDGET_PER_SPEND` | 超过单笔上限 |
 | `E_BUDGET_RATE` | 超过窗口速率 |
 | `E_BUDGET_TOTAL` | 超过累计总上限 |

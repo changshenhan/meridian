@@ -249,6 +249,7 @@ pub fn measure_kernel_single_threaded(batch: &KernelBatch) -> f64 {
         epoch_secs: 60,
         wal_sync_every: 10_000_000, // 测量期间不 fsync（缓冲兜底，B8 口径）
         nonce_capacity_per_delegation: batch.per_agent + 64,
+        enforce_revocation_root: false,
     };
     let mut wal_path = std::env::temp_dir();
     wal_path.push(format!("meridian-gate-kernel-{}.wal", std::process::id()));
@@ -305,6 +306,7 @@ pub fn measure_kernel_rss_mib() -> f64 {
         epoch_secs: 60,
         wal_sync_every: 10_000_000, // 与吞吐测量同口径：不 fsync（缓冲兜底）
         nonce_capacity_per_delegation: batch.per_agent + 64,
+        enforce_revocation_root: false,
     };
     let mut wal_path = std::env::temp_dir();
     wal_path.push(format!("meridian-gate-rss-{}.wal", std::process::id()));

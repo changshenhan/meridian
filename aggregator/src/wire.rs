@@ -188,6 +188,9 @@ mod tests {
             Error::EOrdering,
             Error::EAttestBind,
             Error::EDelegUnknown,
+            Error::EVerifyBackend,
+            Error::EProver,
+            Error::ERevRoot,
         ] {
             assert_eq!(Error::from_code(e.as_code()), Some(e));
         }

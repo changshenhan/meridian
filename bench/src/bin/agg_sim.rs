@@ -112,6 +112,7 @@ fn bench_cfg(epoch_capacity: usize, nonce_capacity: usize) -> IngestConfig {
         epoch_secs: 60,
         wal_sync_every: 10_000_000, // 吞吐测量期间不 fsync（缓冲 8MB 兜底，B8 口径）
         nonce_capacity_per_delegation: nonce_capacity,
+        enforce_revocation_root: false,
     }
 }
 

@@ -251,7 +251,7 @@ fn m1_config(wal_path: &std::path::Path) -> IngestConfig {
         epoch_capacity: EPOCH_CAPACITY,
         epoch_secs: 60,
         wal_sync_every: 1_000,
-        nonce_capacity_per_delegation: 4_096,
+        nonce_capacity_per_delegation: 4_096,        enforce_revocation_root: false,
     }
 }
 

@@ -112,7 +112,9 @@ impl SdkClient {
     }
 
     /// 配置撤销非成员 witness（S-43：聚合器 `RevocationSet::non_membership_witness`
-    /// 直出）。新鲜度与根换代的一致性见 TECH_SPEC §6.14 诚实边界 3 / §4.6 残余③。
+    /// 直出）。新鲜度与根换代的一致性见 TECH_SPEC §6.14 诚实边界 3 / §4.6 残余③
+    /// （S-44：聚合器侧绑定闸开启时，witness 取自重启前的中间状态会以 `E_REV_ROOT` 拒
+    /// ——按业务拒绝定局；自动刷新重试为后续项）。
     pub fn set_revocation_witness(&mut self, w: RevocationWitness) {
         self.revocation = Some(w);
     }

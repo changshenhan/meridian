@@ -28,6 +28,9 @@ pub enum Error {
     /// 证明生成失败（S-43：nargo/bb 缺失、witness 求解失败、交叉校验失配、撤销 witness
     /// 不自洽）——fail-closed，绝不降级回占位证明（TECH_SPEC §6.14）。
     EProver,
+    /// 证明公共输入 `revocation_root` 不在聚合器撤销状态根集合（S-44 撤销根绑定闸，
+    /// TECH_SPEC §6.2 / §4.6 残余③）——自选根的装饰性 ZK 拒绝，不耗 nonce / 窗口槽。
+    ERevRoot,
 }
 
 impl Error {
@@ -52,6 +55,7 @@ impl Error {
             Error::EDelegUnknown => "E_DELEG_UNKNOWN",
             Error::EVerifyBackend => "E_VERIFY_BACKEND",
             Error::EProver => "E_PROVER",
+            Error::ERevRoot => "E_REV_ROOT",
         }
     }
 
@@ -76,6 +80,7 @@ impl Error {
             "E_DELEG_UNKNOWN" => Error::EDelegUnknown,
             "E_VERIFY_BACKEND" => Error::EVerifyBackend,
             "E_PROVER" => Error::EProver,
+            "E_REV_ROOT" => Error::ERevRoot,
             _ => return None,
         })
     }
