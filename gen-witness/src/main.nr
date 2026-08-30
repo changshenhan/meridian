@@ -654,4 +654,45 @@ mod tests {
         assert(unsafe { eq256(down, z) });
         assert(!(unsafe { eq256(up, z) }));
     }
+
+    #[test]
+    fn aggregator_non_membership_path_digest() {
+        // S-42 跨实现锚（TECH_SPEC §4.6 残余②前半）：本电路 `build_path`（CI 管线喂正式
+        // 电路 `revocation_path` witness 的实现）对 fixture 撤销集 {0x01…32, 0x02…32} 产出的
+        // 非成员路径，与聚合器 `RevocationSet::non_membership_witness`（S-42，Rust 侧）产出
+        // 的路径必须**逐字节同一**——任一层相异即红。逐层 pin 256 个 Field 太重，取
+        // 「逐层 Field 大端 32B 扁平（256×32 = 8192B）→ sha256」摘要（对任一层的任何字节
+        // 漂移敏感）。golden = 聚合器 Rust 侧单测 `non_membership_path_digest_matches_noir_golden`
+        // 同值（双向：Rust 锁 hex ↔ 本测试锁字节常量）。
+        let dh = fixture_delegation_hash();
+        let ra = revoked_a();
+        let rb = revoked_b();
+        // Safety: compute_empty_roots / build_path 均 unconstrained（brillig），只求值不证明。
+        let empty_roots = unsafe { compute_empty_roots() };
+        let path = unsafe {
+            build_path(
+                dh,
+                [ra, rb],
+                [encode_field(ra), encode_field(rb)],
+                MAX_REVOKED,
+                empty_roots,
+            )
+        };
+        // 逐层 Field → 32B 大端扁平（聚合器 path[d] 也是 BE Field 32B 外形，TECH_SPEC §4.6）。
+        let mut flat: [u8; 8192] = [0; 8192];
+        for i in 0..REVOCATION_DEPTH {
+            let pb: [u8; 32] = path[i].to_be_bytes();
+            for j in 0..32u32 {
+                flat[(i * 32) + j] = pb[j];
+            }
+        }
+        let digest = sha256::digest(flat);
+        // golden = 9342885b1237b774f32c279e3f43139a0dbfab9bc11d966afc194ceb47a4269e
+        let want: [u8; 32] = [
+            0x93, 0x42, 0x88, 0x5b, 0x12, 0x37, 0xb7, 0x74, 0xf3, 0x2c, 0x27, 0x9e, 0x3f, 0x43,
+            0x13, 0x9a, 0x0d, 0xbf, 0xab, 0x9b, 0xc1, 0x1d, 0x96, 0x6a, 0xfc, 0x19, 0x4c, 0xeb,
+            0x47, 0xa4, 0x26, 0x9e,
+        ];
+        assert(digest == want);
+    }
 }

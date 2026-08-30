@@ -111,18 +111,88 @@ impl RevocationSet {
     /// 空集 = 全空树根（深度 256 的确定性常量）。
     pub fn sparse_root(&self) -> [u8; 32] {
         let set = self.set.read().expect("revocations poisoned");
-        build_root(&set, SPARSE_DEPTH)
+        build_nodes(&set, SPARSE_DEPTH).root()
+    }
+
+    /// 非成员 witness（S-42，TECH_SPEC §4.6 残余②前半）：目标 `dh` 处插入空叶（未撤销）
+    /// 所需的 `root` + 兄弟路径。供 prover 侧出撤销 witness（候选①「真 prover」消费——
+    /// 电路 §5.2 断言 8 吃 `path` 重算根、与公共输入 `revocation_root` 对账）。
+    ///
+    /// 与 [`Self::sparse_root`] 同一条压实实现（同一节点缓存、同一确定性），故 `root` 与
+    /// `sparse_root()` 恒等。`path[d]` = 深度 d 层目标索引的兄弟子树根（BE Field 32B）；
+    /// 兄弟分支为空时 = `empty_roots[d]`。方向约定与电路 `compute_merkle_root` 一致：
+    /// 索引第 d 位为 0 → 当前节点是左孩子 → 重算取 `H(当前 ‖ path[d])`，为 1 取
+    /// `H(path[d] ‖ 当前)`。
+    ///
+    /// 目标已在撤销集时返回 `None`——已撤销委托的叶子不是 `EMPTY`，其路径是**成员**证明，
+    /// 不属于本接口语义（fail-closed：调用方不能拿成员路径冒充非成员）。
+    pub fn non_membership_witness(&self, dh: &[u8; 32]) -> Option<NonMembershipWitness> {
+        if self.is_revoked(dh) {
+            return None;
+        }
+        let set = self.set.read().expect("revocations poisoned");
+        Some(build_nodes(&set, SPARSE_DEPTH).path_for(dh))
     }
 }
 
-/// 压实根。`depth` 参数化（测试与公共入口共用一条实现）：树只覆盖索引低 `depth` 位，
-/// 第 d 层节点索引 = 索引右移 d。
-fn build_root(set: &HashSet<[u8; 32]>, depth: usize) -> [u8; 32] {
+/// 非成员 witness（TECH_SPEC §4.6）：`root` + 深度 256 的兄弟路径。
+/// `path[d]` 均为 BE Field 32B（电路 `revocation_path` witness 同口径）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonMembershipWitness {
+    pub root: [u8; 32],
+    pub path: Vec<[u8; 32]>,
+}
+
+/// 压实树的部分节点缓存：`(深度 d, 该深度节点索引) → 子树根`（d 从 0 叶层到 depth 根层）。
+/// `sparse_root` 与 `non_membership_witness` 共用——保证根与路径出自同一棵确定性树。
+struct NodeCache {
+    nodes: HashMap<(usize, [u8; 32]), Fe>,
+    depth: usize,
+}
+
+impl NodeCache {
+    fn root(&self) -> [u8; 32] {
+        // 空集缓存为空 → 全空树根（build_root 原口径）；非空集必达根层节点。
+        self.nodes
+            .get(&(self.depth, [0u8; 32]))
+            .copied()
+            .unwrap_or(empty_roots()[self.depth])
+            .to_be_bytes()
+    }
+
+    /// 沿目标索引自叶向根取兄弟子树根（`path[d]`）。
+    fn path_for(&self, target: &[u8; 32]) -> NonMembershipWitness {
+        let empty = empty_roots();
+        let mut idx = truncate_idx(*target, self.depth);
+        let mut path = Vec::with_capacity(self.depth);
+        for (d, empty_root) in empty.iter().enumerate().take(self.depth) {
+            let mut sib = idx;
+            sib[0] ^= 1; // 兄弟索引 = 本层索引翻转最低位（LE u256 的第 d 位）
+            path.push(nodes_get(&self.nodes, d, sib, *empty_root).to_be_bytes());
+            idx = shr1(idx);
+        }
+        NonMembershipWitness {
+            root: self.root(),
+            path,
+        }
+    }
+}
+
+/// 节点缓存查询：命中已压实分支用缓存，否则该兄弟分支全空 → `empty_roots[d]`。
+fn nodes_get(nodes: &HashMap<(usize, [u8; 32]), Fe>, d: usize, sib: [u8; 32], empty: Fe) -> Fe {
+    nodes.get(&(d, sib)).copied().unwrap_or(empty)
+}
+
+/// 建树：逐撤销叶自叶向根上推 + 节点缓存（`sparse_root` / `non_membership_witness` 共用）。
+fn build_nodes(set: &HashSet<[u8; 32]>, depth: usize) -> NodeCache {
     let empty = empty_roots();
     if set.is_empty() {
-        return empty[depth].to_be_bytes();
+        // 空集：无撤销叶可上推，全部节点 = 空子树根（path_for 的缓存查询同样兜到 empty）。
+        return NodeCache {
+            nodes: HashMap::new(),
+            depth,
+        };
     }
-    // 部分树节点：(深度 d, 该深度节点索引) → 子树根。d 从 0（叶层）到 depth（根层）。
     let mut nodes: HashMap<(usize, [u8; 32]), Fe> = HashMap::with_capacity(depth * set.len());
     for dh in set.iter() {
         let mut idx = truncate_idx(*dh, depth);
@@ -131,7 +201,7 @@ fn build_root(set: &HashSet<[u8; 32]>, depth: usize) -> [u8; 32] {
         for (d, empty_root) in empty[..depth].iter().enumerate() {
             let mut sib = idx;
             sib[0] ^= 1; // 兄弟索引 = 本层索引翻转最低位（LE u256 的第 d 位）
-            let sibling = nodes.get(&(d, sib)).copied().unwrap_or(*empty_root);
+            let sibling = nodes_get(&nodes, d, sib, *empty_root);
             value = if sib[0] & 1 == 1 {
                 // 本层第 d 位为 0 → 当前节点是左孩子 → H(当前 ‖ 兄弟)
                 pedersen_hash2(value, sibling)
@@ -142,12 +212,13 @@ fn build_root(set: &HashSet<[u8; 32]>, depth: usize) -> [u8; 32] {
             nodes.insert((d + 1, idx), value);
         }
     }
-    nodes[&(depth, [0u8; 32])].to_be_bytes()
+    NodeCache { nodes, depth }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
 
     fn dh(seed: u8) -> [u8; 32] {
         [seed; 32]
@@ -356,11 +427,216 @@ mod tests {
                     }
                 }
                 assert_eq!(
-                    build_root(&set.set.read().expect("poisoned"), depth),
+                    build_nodes(&set.set.read().expect("poisoned"), depth).root(),
                     naive(&positions, depth).to_be_bytes(),
                     "depth={depth} positions={positions:?}"
                 );
             }
         }
+    }
+
+    // ——— S-42：非成员路径（TECH_SPEC §4.6 残余②前半）———
+
+    /// 电路口径的路径重算：EMPTY 叶起步，逐层 `H(当前 ‖ 兄弟)` / `H(兄弟 ‖ 当前)`
+    /// （左/右由索引第 d 位定，与电路 `compute_merkle_root` 同一方向约定）。
+    fn recompute(target: &[u8; 32], path: &[[u8; 32]]) -> [u8; 32] {
+        assert_eq!(path.len(), SPARSE_DEPTH);
+        let mut cur = Fe::zero();
+        for (d, sib) in path.iter().enumerate() {
+            let bit = (target[d / 8] >> (d % 8)) & 1;
+            cur = if bit == 0 {
+                pedersen_hash2(cur, Fe::from_be_bytes(sib))
+            } else {
+                pedersen_hash2(Fe::from_be_bytes(sib), cur)
+            };
+        }
+        cur.to_be_bytes()
+    }
+
+    /// 根锚：非成员 witness 的 `root` 与 `sparse_root()` 恒等（同一条压实实现），且路径
+    /// 重算（电路口径）回到同一根——路径与根自洽，prover 侧拿去即过电路断言 8 的根对账。
+    #[test]
+    fn non_membership_path_recomputes_sparse_root() {
+        let cases: &[&[[u8; 32]]] = &[
+            &[], // 空集：path = 全空子树根表
+            &[dh(0x21)],
+            &[dh(0x01), dh(0x02)], // gen-witness fixture 同集
+            &[dh(0xAA), dh(0xAB), dh(0x11)],
+        ];
+        for revoked in cases {
+            let rs = RevocationSet::new();
+            for d in *revoked {
+                rs.insert(*d);
+            }
+            let target = dh(0x21);
+            if revoked.contains(&target) {
+                continue;
+            }
+            let w = rs
+                .non_membership_witness(&target)
+                .expect("未撤销必有 witness");
+            assert_eq!(w.root, rs.sparse_root(), "root 与 sparse_root 恒等");
+            assert_eq!(recompute(&target, &w.path), w.root, "路径重算回根");
+        }
+    }
+
+    /// 与独立朴素建树交叉：把目标作为**空叶**（值 0）插入撤销集后的朴素递归根 ==
+    /// witness 的 root（逐例 depth 1..=8，覆盖兄弟分支非空/共享子树路径）。
+    #[test]
+    fn non_membership_path_matches_naive_builder_with_empty_leaf() {
+        let naive_root = |positions: &[(u32, Option<[u8; 32]>)], depth: usize| -> Fe {
+            fn rec(
+                level: usize,
+                node: u32,
+                positions: &[(u32, Option<[u8; 32]>)],
+                empty: &[Fe],
+            ) -> Fe {
+                if level == 0 {
+                    match positions.iter().find(|(i, _)| *i == node) {
+                        Some((_, Some(v))) => Fe::encode_field_le31(v),
+                        // None = 目标空叶（非成员）；缺席 = 无关分支 → 空子树根
+                        Some((_, None)) => empty[0],
+                        None => empty[0],
+                    }
+                } else {
+                    pedersen_hash2(
+                        rec(level - 1, node * 2, positions, empty),
+                        rec(level - 1, node * 2 + 1, positions, empty),
+                    )
+                }
+            }
+            rec(depth, 0, positions, empty_roots())
+        };
+        let mut x = 0x5EEDu32;
+        let mut rng = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for depth in 1..=8usize {
+            for _case in 0..32 {
+                let count = (rng() % 5) as usize;
+                let set = RevocationSet::new();
+                let mut positions: Vec<(u32, Option<[u8; 32]>)> = Vec::new();
+                for _ in 0..count {
+                    let idx = rng() & ((1 << depth) - 1);
+                    let mut d = [0u8; 32];
+                    d[0] = idx as u8;
+                    if set.insert(d) {
+                        positions.push((idx, Some(d)));
+                    }
+                }
+                // 目标 = 撤销集之外的确定性位置（撞上已撤销位置则跳过本例）。
+                let target_idx = rng() & ((1 << depth) - 1);
+                let mut target = [0u8; 32];
+                target[0] = target_idx as u8;
+                if set.is_revoked(&target) {
+                    continue;
+                }
+                positions.push((target_idx, None));
+                // 公共入口恒为全深 256（朴素建树下钻不了 2^256）；depth 参数化走同一条
+                // build_nodes/NodeCache 实现（truncate_idx 建小树），与 naive 同深度对账。
+                let w = build_nodes(&set.set.read().expect("poisoned"), depth).path_for(&target);
+                assert_eq!(
+                    w.root,
+                    naive_root(&positions, depth).to_be_bytes(),
+                    "depth={depth} target={target_idx} positions={positions:?}"
+                );
+            }
+        }
+    }
+
+    /// fail-closed：目标已撤销 → `None`（成员路径不冒充非成员）；未撤销 → `Some`。
+    #[test]
+    fn non_membership_is_none_for_revoked_target() {
+        let rs = RevocationSet::new();
+        rs.insert(dh(0x21));
+        assert!(rs.non_membership_witness(&dh(0x21)).is_none());
+        assert!(rs.non_membership_witness(&dh(0x22)).is_some());
+        // 空集：任何目标都非成员。
+        assert!(RevocationSet::new()
+            .non_membership_witness(&dh(0x33))
+            .is_some());
+    }
+
+    /// 空集路径 = 空子树根表逐层（`path[d] == empty_roots[d]`），root = 全空树根。
+    #[test]
+    fn non_membership_path_of_empty_set_is_empty_roots() {
+        let rs = RevocationSet::new();
+        let w = rs.non_membership_witness(&dh(0x07)).expect("空集非成员");
+        let empty = empty_roots();
+        for (d, p) in w.path.iter().enumerate() {
+            assert_eq!(*p, empty[d].to_be_bytes(), "path[{d}]");
+        }
+        assert_eq!(w.root, empty[SPARSE_DEPTH].to_be_bytes());
+    }
+
+    /// 兄弟分支命中撤销叶：目标与一撤销叶仅 bit 0 相异（同父）→ `path[0]` = 该撤销叶
+    /// （encode_field 口径），且重算回根——prover 侧目标与撤销叶相邻时缓存命中路径。
+    #[test]
+    fn non_membership_path_hits_revoked_sibling_leaf() {
+        let rs = RevocationSet::new();
+        let mut sib = dh(0x21);
+        sib[0] ^= 0x01; // bit 0 翻转 → 与目标同父
+        rs.insert(sib);
+        let target = dh(0x21);
+        let w = rs.non_membership_witness(&target).expect("未撤销");
+        assert_eq!(
+            w.path[0],
+            Fe::encode_field_le31(&sib).to_be_bytes(),
+            "path[0] = 相邻撤销叶"
+        );
+        assert_eq!(recompute(&target, &w.path), w.root);
+        assert_eq!(w.root, rs.sparse_root());
+    }
+
+    /// fixture 全树交叉锚（S-41 同源）：撤销集 {0x01…32, 0x02…32} 的非成员 witness 根 ==
+    /// 已锁定的 Noir golden 根（与 `gen_witness_fixture_root_matches_noir` 同值）。
+    #[test]
+    fn non_membership_witness_root_matches_fixture_golden() {
+        let rs = RevocationSet::new();
+        rs.insert([0x01; 32]);
+        rs.insert([0x02; 32]);
+        let target = fixture_dh();
+        let w = rs.non_membership_witness(&target).expect("目标不在撤销集");
+        assert_eq!(
+            hex::encode(w.root),
+            "092fca75790d95bddddd0b1995d54253c7677ee1e798d6ee4c6d251b9f2d8621"
+        );
+        assert_eq!(recompute(&target, &w.path), w.root);
+    }
+
+    /// gen-witness fixture 的 delegation_hash（[0x21+i]）。
+    fn fixture_dh() -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, b) in (0x21..0x41).take(32).enumerate() {
+            out[i] = b;
+        }
+        out
+    }
+
+    /// **跨实现锚（Noir 侧同款测试 `aggregator_non_membership_path_digest`）**：fixture 撤销集
+    /// 的非成员路径逐层 Field 大端 32B 扁平（256×32 = 8192B）后取 sha256——gen-witness
+    /// `build_path`（CI 管线喂电路 `revocation_path` witness 的实现）必须产出**同一字节序列**。
+    /// 摘要比逐层 pin 256 个 Field 紧凑，且逐字节敏感（任一层相异即红）。
+    #[test]
+    fn non_membership_path_digest_matches_noir_golden() {
+        let rs = RevocationSet::new();
+        rs.insert([0x01; 32]);
+        rs.insert([0x02; 32]);
+        let target = fixture_dh();
+        let w = rs.non_membership_witness(&target).expect("目标不在撤销集");
+        let mut flat = Vec::with_capacity(256 * 32);
+        for p in &w.path {
+            flat.extend_from_slice(p);
+        }
+        assert_eq!(flat.len(), 8192);
+        let digest = sha2::Sha256::digest(&flat);
+        assert_eq!(
+            hex::encode(digest),
+            "9342885b1237b774f32c279e3f43139a0dbfab9bc11d966afc194ceb47a4269e",
+            "路径摘要漂移：Noir 侧 golden 需同步重算（gen-witness aggregator_non_membership_path_digest）"
+        );
     }
 }

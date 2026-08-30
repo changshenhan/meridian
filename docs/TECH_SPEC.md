@@ -266,8 +266,16 @@ pub fn check_budget(
   `pi.revocation_root` 可以来自聚合器账本树（§6.13 诚实边界 3 收口）。残余边界：
   ① 电路内撤销叶 = `encode_field(dh)` 只编码低 31 字节（byte 31 不参与叶值）——叶值非单射，
   但叶**位置**（全 256-bit 索引）单射，两 dh 仅 byte 31 相异时占同值异位两叶，无碰撞可乘；
-  ② 聚合器尚不产出非成员路径（prover 侧消费聚合器树出 witness 属下一步候选②「真 prover」
-  范围）；③ 根随 epoch 上链与证明生成之间的一致性（SDK 对哪个根出证明、锚定根换代时
+  ② **S-42（2026-08-30）聚合器已产出非成员路径**：`RevocationSet::non_membership_witness(dh)`
+  返回 `{root, path[256]}`——`path[d]` = 深度 d 层目标索引的兄弟子树根（BE Field 32B，与
+  `build_root` 同一条插入循环先建全量节点缓存、再沿目标索引上溯取兄弟，兄弟分支为空时取
+  `empty_roots[d]`）；目标 dh 已在撤销集时返回 `None`（fail-closed，撤销叶的路径是成员证明、
+  不是本接口的语义）。与 `sparse_root()` 同根（同一缓存、同一确定性压实），Rust 侧锚：路径
+  重算根（EMPTY 叶 + 逐层兄弟，左/右由索引位定）与 `sparse_root()` 逐例相等、与独立朴素递归
+  建树（目标作为空叶插入）一致；**电路消费交叉锚（Noir `compute_merkle_root` 吃 Rust 产路径
+  重算 == 公共输入根）随真 prover 落地**（下一步候选①，届时 nargo execute 即电路自校验）。
+  prover 侧消费聚合器树出 witness 属候选①「真 prover」范围；③ 根随 epoch 上链与证明生成
+  之间的一致性（SDK 对哪个根出证明、锚定根换代时
   在途证明如何处理）待真 ZK 全集成时定夺。
 
 ### 4.7 两种模式映射（实现同一接口）
