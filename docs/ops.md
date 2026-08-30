@@ -220,10 +220,38 @@ curl -X POST https://gw.example.com/v1/admin/revocations \
 1. `GET /v1/revocation-witness/<dh>`（租户 key）→ `404 E_REVOKED` = 已入撤销集；
 2. 拿另一张未撤销委托查 witness，`root` 应等于撤销响应里的 `revocation_root`（同一棵树）。
 
-**多副本（S-39 副本组）逐副本撤销**：副本组无跨副本复制，每个副本的撤销集独立——
-对**每个**副本的网关各调一次本端点（副本 `instance` 见 monitor 集群指标）。漏调副本会
-继续接受已撤销委托的新意图，直至 `replicas_converged`（撤销根三元组不等）告警暴露。
-**新意图的 `E_REVOKED` 拒绝即时生效于本进程**；撤销根上链随下个密封 epoch（≤ 1 epoch）。
+**多副本（S-39 副本组）撤销传播（S-59 fanout）**：在**任一副本**（通常主副本）的配置里
+声明其余副本，撤销一次调用即达全组——本地先撤销（即时生效），再并行转发到各对端的
+同款端点：
+
+```json
+{ "listen": "127.0.0.1:9400", "...": "...",
+  "revocation_peers": [
+    { "url": "http://127.0.0.1:9401", "admin_key": "<peer-b-admin-key>", "timeout_ms": 2000 },
+    { "url": "http://127.0.0.1:9402", "admin_key": "<peer-c-admin-key>" }
+  ] }
+```
+
+响应带逐副本结果（未配置 peers 时该字段不出现，单副本口径不变）：
+
+```json
+{"newly_revoked":true,"revocation_root":"<64hex>","revoked_len":1,
+ "fanout":[{"peer":"http://127.0.0.1:9401","accepted":true,"newly_revoked":true},
+           {"peer":"http://127.0.0.1:9402","accepted":false,"detail":"connect: ..."}]}
+```
+
+| `fanout` 结果 | 处置 |
+|---|---|
+| 全部 `accepted:true` | 完成，走确认两步 |
+| 某 peer `accepted:false`（连接/超时/非 200） | **重放同请求**（幂等，`newly_revoked:false` 但 fanout 照常执行 = 补漏重试）直到该 peer `accepted:true`；本地撤销不受影响已生效 |
+| 某 peer `detail` 含 `E_DELEG_UNKNOWN` | 对端副本未注册该 dh（副本账本漂移）——先核对副本摄取健康，不要盲目重试 |
+| 某 peer 恒 401/404 | 对端 admin key 未配 / 未配置——配置问题，不会自愈 |
+
+未配置 `revocation_peers` 的副本组退回**逐副本人工撤销**：对每个副本的网关各调一次
+本端点（副本 `instance` 见 monitor 集群指标）。无论哪种路径，漏调副本都会继续接受
+已撤销委托的新意图，直至 `replicas_converged`（撤销根三元组不等）告警暴露——告警是
+最后防线不是传播机制。**新意图的 `E_REVOKED` 拒绝即时生效于本进程**；撤销根上链随
+下个密封 epoch（≤ 1 epoch）。
 
 **诚实边界**：链上 `RevocationRegistry.revoke` 不会自动进聚合器（v1 无链上监听器），
 链上撤销 → 聚合器撤销之间是运营者人工传播，窗口期风险由运营者债券罚没兜底（§6.5）；

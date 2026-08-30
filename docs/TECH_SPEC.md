@@ -826,11 +826,34 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
     "revoked_len": <n>}`。`revocation_root` = 撤销后当刻树根（撤销集非空立即换根）；
     **链上承诺随下个密封 epoch**（§4.6）。运营者交叉确认：同 dh 再查
     `/v1/revocation-witness/{dh}` → `404 E_REVOKED`，其余委托 witness 根 = 响应根。
-- **语义边界（诚实）**：撤销即时生效于**本进程**（该委托新意图 `E_REVOKED` 拒）；
-  **多副本部署（S-39 副本组）无跨副本复制——逐副本各自调本端点**，漏调副本继续接受
-  已撤销委托直至 `replicas_converged` 告警（ops.md 运营撤销流程按逐副本口径）。
+- **语义边界（诚实）**：撤销即时生效于**本进程**（该委托新意图 `E_REVOKED` 拒）。
   链上 `RevocationRegistry` 的 revoke 与本端点是两级独立动作（链上撤销不自动进聚合器，
   v1 无链上监听器——运营者负责传播，§4.6 债券罚没兜底「已撤销仍消费」窗口）。
+
+**撤销跨副本传播（S-59，§6.7 管理面）**：
+
+- 缺口本体：S-57 端点只撤销**本进程**，副本组（S-39）各副本互不感知——逐副本人工调
+  端点，漏调副本继续接受已撤销委托直至 `replicas_converged` 告警（monitor 滞后告警是
+  事後发现，不是阻断）。本件把传播**机制化**：撤销入口一次调用即达全组，人工逐副本
+  从主路径退为故障兜底。
+- 配置（`Config.revocation_peers`，serde default 空 = **缺省口径逐字节不变**——单副本
+  零改动，响应体不出现 fanout 字段）：每项 `{ "url", "admin_key", "timeout_ms" }`——
+  对端网关 base URL（**必须 `http://`**，网关恒明文 + 反代终结的部署口径不变，配置期
+  拒 `https://`：std-only 无 TLS 依赖，静默接受只会变成运行时必败）+ 对端 admin key
+  （对端可各不相同；对端未配置 admin key = 其端点 404，outcome 记失败）+ 单对端超时
+  （缺省 2000ms）。
+- 语义：`POST /v1/admin/revocations` 先**本地撤销**（安全优先——本地即时生效不等对端），
+  再**并行** fanout 到全部 peer（每对端一个线程，POST 同款端点 + 对端 key，body 为
+  归一化 dh）。响应增 `fanout: [{peer, accepted, newly_revoked?, detail?}]`
+  （`skip_serializing_if` 空缺省不出现；`accepted` = 对端 HTTP 200；失败原因进
+  `detail`：连接/超时/非 200 状态 + 对端 body 摘要）。**整体状态恒 200**——撤销本体
+  成功后不因对端故障降级（撤销单调不可回滚，回滚 = 假撤销）；对端失败 **fail-visible**
+  不吞错、**不 auto-retry**（网关无后台任务，重试是运营者动作：幂等重放同请求即可，
+  重放路径 `newly_revoked: false` 但 fanout 照常执行 = 补漏重试）。
+- 语义边界（诚实）：fanout 是**尽力传播不是共识**——对端列表来自静态配置，配置漏写
+  副本依旧漏（`replicas_converged` 告警仍是最后防线）；对端 400 `E_DELEG_UNKNOWN`
+  （副本账本漂移，对端未注册该 dh）原样透传进 `detail` 不猜测；网关不做发现、不做
+  心跳、不缓存对端状态（S-39 monitor 集群面已覆盖可观测性）。链上撤销两级独立口径不变。
 
 **HTTP 状态映射**：
 

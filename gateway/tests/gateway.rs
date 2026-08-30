@@ -918,6 +918,265 @@ fn e2e_admin_revoke_blocks_paying_over_http() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b++. S-59 撤销跨副本传播（§6.7 管理面）：revocation_peers fanout——本地先撤销
+//       （安全优先），再并行转发到对端同款端点，逐对端结果 fail-visible。
+// ---------------------------------------------------------------------------
+
+use meridian_gateway::RevocationPeer;
+
+/// 起一个真 socket 网关，返回 (addr, agg句柄)——带 admin key（fanout 对端形态）。
+fn spawn_admin_gateway(
+    tag: &str,
+    admin: &str,
+    peers: Vec<RevocationPeer>,
+) -> (String, Arc<Aggregator>) {
+    let (_wal, agg) = aggregator(tag);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let gw = Arc::new(
+        Gateway::with_tenants(
+            Arc::clone(&agg),
+            tenants_one("e2e-key", "e2e-tenant", u64::MAX),
+            64 * 1024,
+        )
+        .with_admin_key(Some(admin.into()))
+        .with_revocation_peers(peers),
+    );
+    std::thread::spawn(move || {
+        let _ = serve(gw, listener, 256, Duration::from_secs(5));
+    });
+    (addr, agg)
+}
+
+/// S-59 主链：A 配 B/C 两对端，一次撤销三方同根——A/B/C 三账本 `revoked_len`、
+/// 撤销根一致；响应 fanout 数组逐对端 accepted + newly_revoked。
+#[test]
+fn fanout_propagates_revocation_to_all_peers() {
+    // 先起 B/C（无对端），再起 A（指向 B/C）——地址要先拿到。
+    let (b_addr, agg_b) = spawn_admin_gateway("fanout-peer-b", "adm-b", Vec::new());
+    let (c_addr, agg_c) = spawn_admin_gateway("fanout-peer-c", "adm-c", Vec::new());
+    let (a_addr, agg_a) = spawn_admin_gateway(
+        "fanout-origin",
+        "adm-a",
+        vec![
+            RevocationPeer {
+                url: format!("http://{b_addr}"),
+                admin_key: "adm-b".into(),
+                timeout_ms: 5_000,
+            },
+            RevocationPeer {
+                url: format!("http://{c_addr}"),
+                admin_key: "adm-c".into(),
+                timeout_ms: 5_000,
+            },
+        ],
+    );
+
+    // 同一委托注册进三个账本（同参数 → 同 dh，副本组同一逻辑账本的测试形态）。
+    let owner_key = owner_signing_key_from_bytes([7u8; 32]);
+    let d = Delegation {
+        agent: [4u8; 20],
+        owner: [2u8; 20],
+        nonce: 7,
+        max_per_spend: 1_000,
+        rate: RateLimit {
+            window_secs: 60,
+            max_per_window: 1_000_000,
+        },
+        total_cap: 1_000_000,
+        categories: vec![],
+        not_before: 0,
+        expires_at: u64::MAX,
+        version: 1,
+    };
+    let sd = sign_delegation(&d, &owner_key);
+    let agent_pub: AgentPubKey = AgentSigningKey::from_bytes(&[5u8; 32]).verifying_key();
+    for agg in [&agg_a, &agg_b, &agg_c] {
+        agg.register(sd.clone(), agent_pub);
+    }
+    let dh = delegation_hash(&d);
+
+    // 对 A 撤销一次：本地生效 + 并行 fanout 到 B/C。
+    let (status, body) = raw_post(
+        &a_addr,
+        "/v1/admin/revocations",
+        Some("adm-a"),
+        &revoke_body(&dh),
+    );
+    assert_eq!(status, 200, "body: {body}");
+    let resp: meridian_gateway::AdminRevocationResponse =
+        serde_json::from_str(&body).expect("revoke dto");
+    assert!(resp.newly_revoked);
+    let mut fan = resp.fanout.clone();
+    fan.sort_by(|x, y| x.peer.cmp(&y.peer));
+    assert_eq!(fan.len(), 2, "body: {body}");
+    for o in &fan {
+        assert!(o.accepted, "outcome: {o:?}");
+        assert_eq!(o.newly_revoked, Some(true), "outcome: {o:?}");
+        assert!(o.detail.is_none(), "outcome: {o:?}");
+    }
+
+    // 三账本同一撤销承诺（同一棵确定性树 → 根逐字节一致）。
+    assert_eq!(agg_a.revoked_len(), 1);
+    assert_eq!(agg_b.revoked_len(), 1, "fanout 达 B");
+    assert_eq!(agg_c.revoked_len(), 1, "fanout 达 C");
+    let root = agg_a.revocation_root();
+    assert_eq!(agg_b.revocation_root(), root, "B 与 A 同根");
+    assert_eq!(agg_c.revocation_root(), root, "C 与 A 同根");
+    assert_eq!(hex::encode(root), resp.revocation_root);
+}
+
+/// S-59 fail-visible：对端宕机（连不上）→ 该对端 accepted=false + detail 有因，
+/// **本地撤销照常生效**、其余对端照常达成、整体恒 200（撤销单调不可回滚）。
+#[test]
+fn fanout_peer_down_is_fail_visible_and_local_still_revokes() {
+    // 占一个端口后立刻释放 = 确定连不上的端口；其余对端健康。
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let dead_addr = dead.local_addr().expect("addr").to_string();
+    drop(dead);
+    let (b_addr, agg_b) = spawn_admin_gateway("fanout-down-peer-b", "adm-b", Vec::new());
+    let (a_addr, agg_a) = spawn_admin_gateway(
+        "fanout-down-origin",
+        "adm-a",
+        vec![
+            RevocationPeer {
+                url: format!("http://{dead_addr}"),
+                admin_key: "adm-a".into(),
+                timeout_ms: 500,
+            },
+            RevocationPeer {
+                url: format!("http://{b_addr}"),
+                admin_key: "adm-b".into(),
+                timeout_ms: 5_000,
+            },
+        ],
+    );
+    let dh = register_delegation(&agg_a, [4u8; 20]);
+    register_delegation(&agg_b, [4u8; 20]);
+
+    let (status, body) = raw_post(
+        &a_addr,
+        "/v1/admin/revocations",
+        Some("adm-a"),
+        &revoke_body(&dh),
+    );
+    assert_eq!(status, 200, "对端宕机不降级整体状态，body: {body}");
+    let resp: meridian_gateway::AdminRevocationResponse =
+        serde_json::from_str(&body).expect("revoke dto");
+    assert!(resp.newly_revoked, "本地撤销照常生效");
+    let dead_out = resp
+        .fanout
+        .iter()
+        .find(|o| o.peer.contains(&dead_addr))
+        .expect("dead peer outcome present");
+    assert!(!dead_out.accepted);
+    assert!(dead_out.newly_revoked.is_none());
+    let detail = dead_out.detail.as_ref().expect("fail-visible detail");
+    assert!(detail.contains("connect"), "detail: {detail}");
+    let live_out = resp
+        .fanout
+        .iter()
+        .find(|o| o.peer.contains(&b_addr))
+        .expect("live peer outcome present");
+    assert!(live_out.accepted, "其余对端不受单点故障影响: {live_out:?}");
+    assert!(agg_a.is_revoked(&dh));
+    assert_eq!(agg_b.revoked_len(), 1);
+}
+
+/// S-59 补漏重试：首轮对端不可达，撤销已生效；修复后（真实对端就位）**幂等重放**
+/// `newly_revoked:false` 但 fanout 照常执行 → 对端达成。这是运营者重试路径的口径锚。
+#[test]
+fn fanout_idempotent_replay_retries_failed_peer() {
+    // 首轮：对端指向死端口 → fail-visible。
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let dead_addr = dead.local_addr().expect("addr").to_string();
+    drop(dead);
+    let (_p, agg) = aggregator("fanout-replay-origin");
+    let gw = Gateway::with_tenants(Arc::clone(&agg), tenants_one("k1", "t1", 1_000), 64 * 1024)
+        .with_admin_key(Some("adm".into()))
+        .with_revocation_peers(vec![RevocationPeer {
+            url: format!("http://{dead_addr}"),
+            admin_key: "adm".into(),
+            timeout_ms: 500,
+        }]);
+    let dh = register_delegation(&agg, [4u8; 20]);
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/revocations",
+        Some("adm"),
+        &revoke_body(&dh),
+    );
+    assert_eq!(r.status, 200);
+    assert!(
+        r.body.contains("accepted\":false"),
+        "首轮对端失败: {}",
+        r.body
+    );
+
+    // 「修复」= 换上真对端（重建 gateway 同账本句柄，新对端账本注册同 dh）。
+    let (b_addr, agg_b) = spawn_admin_gateway("fanout-replay-peer-b", "adm-b", Vec::new());
+    register_delegation(&agg_b, [4u8; 20]);
+    let gw_fixed = Gateway::with_tenants(
+        Arc::clone(&agg),
+        TenantTable::from_conf(&Default::default()),
+        64 * 1024,
+    )
+    .with_admin_key(Some("adm".into()))
+    .with_revocation_peers(vec![RevocationPeer {
+        url: format!("http://{b_addr}"),
+        admin_key: "adm-b".into(),
+        timeout_ms: 5_000,
+    }]);
+    let r = gw_fixed.handle(
+        "POST",
+        "/v1/admin/revocations",
+        Some("adm"),
+        &revoke_body(&dh),
+    );
+    assert_eq!(r.status, 200, "body: {}", r.body);
+    let resp: meridian_gateway::AdminRevocationResponse =
+        serde_json::from_str(&r.body).expect("revoke dto");
+    assert!(!resp.newly_revoked, "幂等重放不重复撤销");
+    assert_eq!(resp.fanout.len(), 1);
+    assert!(resp.fanout[0].accepted, "outcome: {:?}", resp.fanout);
+    assert_eq!(resp.fanout[0].newly_revoked, Some(true), "对端这次新撤销");
+    assert_eq!(agg_b.revoked_len(), 1, "补漏达成");
+    assert_eq!(agg_b.revocation_root(), agg.revocation_root(), "同根");
+}
+
+/// S-59 缺省口径：未配置 peers 的撤销响应**不出现 fanout 字段**（单副本口径逐字节
+/// 不变，S-57 消费方零感知）；对端 url 配置校验只收 `http://host:port`。
+#[test]
+fn fanout_absent_without_peers_and_url_validation() {
+    let (_p, agg) = aggregator("fanout-absent");
+    let gw = Gateway::with_tenants(Arc::clone(&agg), tenants_one("k1", "t1", 1_000), 64 * 1024)
+        .with_admin_key(Some("adm".into()));
+    let dh = register_delegation(&agg, [4u8; 20]);
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/revocations",
+        Some("adm"),
+        &revoke_body(&dh),
+    );
+    assert_eq!(r.status, 200);
+    assert!(!r.body.contains("fanout"), "body: {}", r.body);
+
+    // url 校验：https 拒（std-only 无 TLS 依赖）/ 缺端口 / 缺 host / 带路径 / 坏端口。
+    let mk = |url: &str| RevocationPeer {
+        url: url.into(),
+        admin_key: "k".into(),
+        timeout_ms: 1_000,
+    };
+    assert!(mk("https://h:1").parse_url().is_err(), "https 必须配置期拒");
+    assert!(mk("http://host").parse_url().is_err());
+    assert!(mk("http://:9401").parse_url().is_err());
+    assert!(mk("http://host:9401/x").parse_url().is_err());
+    assert!(mk("http://host:0x50").parse_url().is_err());
+    let (host, port) = mk("http://127.0.0.1:9401").parse_url().expect("ok");
+    assert_eq!((host.as_str(), port), ("127.0.0.1", 9401));
+}
+
+// ---------------------------------------------------------------------------
 // 1c. S-56 反代面：TLS 反代部署口径（TECH_SPEC §6.7 部署拓扑节 / ops.md §7）的测试锚
 //     —— 反代可注入的头部不是信任锚、chunked 请求恒拒。钉的是文档口径里的
 //     「已实测语义」，不是某个具体反代的配置。

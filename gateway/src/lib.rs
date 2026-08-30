@@ -13,6 +13,8 @@
 //!   `RwLock` 读多写少；admin_key 独立于租户表，未配置 = 端点不存在。
 //! - 运营者撤销面（S-57）：`POST /v1/admin/revocations` 把 `Aggregator::revoke`（§4.6
 //!   撤销事件流的运营者入口）补进网络操作面——此前只有进程内调用，运营者无从触发。
+//! - 撤销跨副本传播（S-59）：配置 `revocation_peers` 后撤销一次调用即达全组（本地先
+//!   撤销，再并行 fanout，逐对端结果 fail-visible）；空配置 = 单副本口径逐字节不变。
 //! - 部署拓扑（S-56）：TLS 由反代终结（§6.7 部署拓扑节 / ops.md §7）——网关恒明文 +
 //!   回环绑定，反代是信任边界但**不是认证边界**（代理注入头不是信任锚，测试钉死）。
 
@@ -65,6 +67,53 @@ pub struct Config {
     /// key 用）。缺省不配置 = 管理端点不存在（404，不泄露管理面存在性）。
     #[serde(default)]
     pub admin_key: Option<String>,
+    /// 撤销 fanout 对端（S-59，§6.7）：副本组内其余副本的 admin 面。空（缺省）=
+    /// 单副本口径逐字节不变（撤销只作用于本进程）。
+    #[serde(default)]
+    pub revocation_peers: Vec<RevocationPeer>,
+}
+
+/// 撤销 fanout 对端（S-59）。`url` 必须 `http://`——网关恒明文（S-56 部署口径），
+/// std-only 无 TLS 依赖，配置期拒绝 `https://`（静默接受只会变成运行时必败）。
+/// `admin_key` 是**对端**的 admin key（对端可各不相同）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevocationPeer {
+    pub url: String,
+    pub admin_key: String,
+    #[serde(default = "default_peer_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_peer_timeout_ms() -> u64 {
+    2000
+}
+
+impl RevocationPeer {
+    /// 解析 `http://host:port` 形态的 base URL（S-59）。只接受 http（见类型注释）；
+    /// 返回 (host, port)，路径恒 `/v1/admin/revocations`。
+    pub fn parse_url(&self) -> Result<(String, u16), String> {
+        let rest = self
+            .url
+            .strip_prefix("http://")
+            .ok_or_else(|| format!("peer url must be http:// (got {:?})", self.url))?;
+        let host_port = rest.trim_end_matches('/');
+        if host_port.is_empty() || host_port.contains('/') {
+            return Err(format!(
+                "peer url must be http://host:port (got {:?})",
+                self.url
+            ));
+        }
+        let (host, port) = host_port
+            .rsplit_once(':')
+            .ok_or_else(|| format!("peer url missing port (got {:?})", self.url))?;
+        if host.is_empty() {
+            return Err(format!("peer url missing host (got {:?})", self.url));
+        }
+        let port: u16 = port
+            .parse()
+            .map_err(|_| format!("peer url bad port (got {:?})", self.url))?;
+        Ok((host.to_string(), port))
+    }
 }
 
 fn default_max_connections() -> usize {
@@ -91,6 +140,64 @@ impl Config {
     pub fn from_path(p: &std::path::Path) -> Result<Self, String> {
         let s = std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", p.display()))?;
         Self::from_json(&s)
+    }
+}
+
+/// S-59 fanout HTTP 客户端（std-only，`http://` 单一形态——网关恒明文，S-56 部署
+/// 口径不变）。对端是本 crate 的 `http::serve`（Content-Length 响应），只解析状态行
+/// 与 body，不实现通用 HTTP。连接/读写共用 `timeout_ms`。
+fn post_admin_revocation(peer: &RevocationPeer, body: &str) -> Result<(u16, String), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let (host, port) = peer.parse_url()?;
+    let timeout = Duration::from_millis(peer.timeout_ms);
+    let addr = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|_| stream.set_write_timeout(Some(timeout)))
+        .map_err(|e| format!("set timeout {addr}: {e}"))?;
+    let req = format!(
+        "POST /v1/admin/revocations HTTP/1.1\r\nHost: {addr}\r\n\
+         Authorization: Bearer {}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        peer.admin_key,
+        body.len()
+    );
+    stream
+        .write_all(req.as_bytes())
+        .and_then(|_| stream.write_all(body.as_bytes()))
+        .map_err(|e| format!("write {addr}: {e}"))?;
+    let mut resp = Vec::new();
+    stream
+        .read_to_end(&mut resp)
+        .map_err(|e| format!("read {addr}: {e}"))?;
+    let text = String::from_utf8_lossy(&resp);
+    let (head, resp_body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("peer {addr}: malformed response (no header/body split)"))?;
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("peer {addr}: malformed status line"))?;
+    Ok((status, resp_body.to_string()))
+}
+
+/// 对端失败摘要截断（S-59）：detail 进响应体，超长截断防对端超长 body 撑爆本响应
+/// （对端 body 上限 64KiB，多对端叠加仍有界化）。
+fn truncate_detail(s: &str) -> String {
+    const MAX: usize = 256;
+    if s.len() <= MAX {
+        s.to_string()
+    } else {
+        let mut cut = MAX;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…", &s[..cut])
     }
 }
 
@@ -188,6 +295,8 @@ pub struct Gateway {
     limiter: RateLimiter,
     max_body: usize,
     admin_key: Option<String>,
+    /// 撤销 fanout 对端（S-59，§6.7）。空 = 单副本口径（撤销只作用于本进程）。
+    revocation_peers: Vec<RevocationPeer>,
 }
 
 /// 管理端点响应（S-54）：整表替换成功后的摘要。
@@ -205,11 +314,27 @@ pub struct AdminRevocationRequest {
 
 /// 撤销端点响应（S-57）：撤销后当刻撤销承诺摘要。
 /// `revocation_root` = 撤销后当刻树根（64hex，与 `/v1/revocation-witness` 根同源）。
+/// `fanout`（S-59）仅在配置了 `revocation_peers` 时出现（空即不序列化，单副本口径
+/// 逐字节不变）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminRevocationResponse {
     pub newly_revoked: bool,
     pub revocation_root: String,
     pub revoked_len: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fanout: Vec<FanoutOutcome>,
+}
+
+/// 单对端 fanout 结果（S-59）。`accepted` = 对端 HTTP 200；失败原因进 `detail`
+/// （连接/超时/非 200 状态 + 对端 body 摘要）——fail-visible，不吞错、不重试。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FanoutOutcome {
+    pub peer: String,
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newly_revoked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl Gateway {
@@ -220,6 +345,7 @@ impl Gateway {
             limiter: RateLimiter::default(),
             max_body: cfg.max_body_bytes,
             admin_key: cfg.admin_key.clone(),
+            revocation_peers: cfg.revocation_peers.clone(),
         }
     }
 
@@ -231,12 +357,19 @@ impl Gateway {
             limiter: RateLimiter::default(),
             max_body,
             admin_key: None,
+            revocation_peers: Vec::new(),
         }
     }
 
     /// 注入管理面 key（builder，链在 `with_tenants`/`new` 之后）。
     pub fn with_admin_key(mut self, admin_key: Option<String>) -> Self {
         self.admin_key = admin_key;
+        self
+    }
+
+    /// 注入撤销 fanout 对端（builder，S-59；测试与 bin 装配用）。
+    pub fn with_revocation_peers(mut self, peers: Vec<RevocationPeer>) -> Self {
+        self.revocation_peers = peers;
         self
     }
 
@@ -342,6 +475,11 @@ impl Gateway {
     /// reverts——错 dh 请求期暴露，不静默污染撤销树/扰动在途 witness）；已撤销幂等重放
     /// → 200 `newly_revoked: false`（不重复落 WAL 撤销记录）；新撤销 → 200
     /// `newly_revoked: true` + 撤销后当刻根。
+    ///
+    /// S-59：配置了 `revocation_peers` 时本地撤销后**并行 fanout** 到全部对端（同款
+    /// 端点 + 对端 key）——重放路径（`newly_revoked: false`）fanout 照常执行 = 补漏
+    /// 重试。对端结果 fail-visible 进响应 `fanout` 数组，整体恒 200（撤销单调不可
+    /// 回滚，回滚 = 假撤销）；不 auto-retry，重试是运营者动作。
     fn handle_admin_revoke(&self, bearer: Option<&str>, body: &[u8]) -> Response {
         let Some(admin) = self.admin_key.as_deref() else {
             return Response::error(404, E_MALFORMED, "unknown route");
@@ -376,15 +514,71 @@ impl Gateway {
         } else {
             self.agg.revoke(dh)
         };
+        // S-59 fanout：本地已生效（安全优先），对端尽力传播。空配置 = 不发线程、
+        // 响应不出现 fanout 字段（单副本口径逐字节不变）。
+        let fanout = self.fanout_revocation(&dh);
         let resp = AdminRevocationResponse {
             newly_revoked: newly,
             revocation_root: hex::encode(self.agg.revocation_root()),
             revoked_len: self.agg.revoked_len(),
+            fanout,
         };
         Response::json(
             200,
             serde_json::to_string(&resp).expect("AdminRevocationResponse serializes"),
         )
+    }
+
+    /// S-59：撤销 fanout 到全部对端副本（§6.7）。每对端一个线程（对端数 = 副本组
+    /// 规模，个位数），单对端超时 `timeout_ms` 封顶总时延；任一对端失败不影响其余
+    /// 对端，也不影响本请求（结果逐条进响应）。
+    fn fanout_revocation(&self, dh: &[u8; 32]) -> Vec<FanoutOutcome> {
+        if self.revocation_peers.is_empty() {
+            return Vec::new();
+        }
+        let body = format!(r#"{{"delegation_hash":"0x{}"}}"#, hex::encode(dh));
+        let handles: Vec<_> = self
+            .revocation_peers
+            .iter()
+            .map(|peer| {
+                let body = body.clone();
+                let peer = peer.clone();
+                std::thread::spawn(move || {
+                    let url = peer.url.clone();
+                    match post_admin_revocation(&peer, &body) {
+                        Ok((200, resp_body)) => {
+                            let newly = serde_json::from_str::<AdminRevocationResponse>(&resp_body)
+                                .ok()
+                                .map(|r| r.newly_revoked);
+                            FanoutOutcome {
+                                peer: url,
+                                accepted: true,
+                                newly_revoked: newly,
+                                detail: None,
+                            }
+                        }
+                        Ok((status, resp_body)) => FanoutOutcome {
+                            peer: url,
+                            accepted: false,
+                            newly_revoked: None,
+                            detail: Some(truncate_detail(&format!(
+                                "peer status {status}: {resp_body}"
+                            ))),
+                        },
+                        Err(e) => FanoutOutcome {
+                            peer: url,
+                            accepted: false,
+                            newly_revoked: None,
+                            detail: Some(truncate_detail(&e)),
+                        },
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("fanout thread panics"))
+            .collect()
     }
 
     /// 认证 → 限流 → body 上限 → 分发。共用闸门顺序固定（§6.7）。

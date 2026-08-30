@@ -66,9 +66,16 @@ fn main() {
         TcpListener::bind(&cfg.listen).unwrap_or_else(|e| panic!("bind {}: {e}", cfg.listen));
     let tenants = cfg.tenants.len();
     let admin = if cfg.admin_key.is_some() { "on" } else { "off" };
+    let peers = cfg.revocation_peers.len();
+    // S-59：对端 url 配置期 fail-fast（坏 url 只会变成撤销时的必败 fanout）。
+    for peer in &cfg.revocation_peers {
+        if let Err(e) = peer.parse_url() {
+            panic!("bad revocation peer: {e}");
+        }
+    }
     let gw = Arc::new(Gateway::new(agg, &cfg));
     eprintln!(
-        "meridian-gateway listening on {} (tenants: {tenants}, max_conn: {}, admin: {admin})",
+        "meridian-gateway listening on {} (tenants: {tenants}, max_conn: {}, admin: {admin}, revocation_peers: {peers})",
         cfg.listen, cfg.max_connections
     );
     meridian_gateway::http::serve(
