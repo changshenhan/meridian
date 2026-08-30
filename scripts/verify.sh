@@ -245,6 +245,9 @@ if { command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; } \
     run "deployer compile" bash -c 'cd contracts/rust-smoke && cargo build --bin deploy'
     run "rust-smoke" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run'
     run "m1_demo" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run --release --bin m1_demo'
+    # P2-1 验证者挑战演练（TECH_SPEC §6.18）：镜像复算检出 commit≠settle → 欺诈证明 →
+    # challenge 全链（三幕：诚实静默 / kind1 漏单 / kind2 低付）。零合约改动，debug 够。
+    run "verifier_drill" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run --quiet --bin verifier_drill'
 else
     skip "forge/anvil 未找到 → rust-smoke 门禁跳过"
 fi

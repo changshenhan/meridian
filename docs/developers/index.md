@@ -64,6 +64,12 @@ Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互
   S-43 `NoirProver`），经显式装配开启（网关 `MERIDIAN_VERIFY_BACKEND=bb` + SDK
   `SdkClient::with_noir` + `enforce_revocation_root`，TECH_SPEC §6.13/§6.14/§6.15；
   `contracts/rust-smoke/src/bin/noir_demo.rs` 是可运行的装配示例），上层 API 不变。
+- **验证者面（P2-1，S-61）**：写者与验证者分离已有最小实证——独立验证者吃「已接受意图
+  镜像流」复算账本，检出 commit≠settle 后构造欺诈证明上链挑战
+  （`aggregator/src/fraud.rs` + `contracts/rust-smoke/src/bin/verifier_drill.rs` 三幕
+  演练，TECH_SPEC §6.18）。诚实边界：验证者**不解决写者单点**（审查/停机/绑合谋），
+  只提升「承诺与结算不符」的发现率；纯「承诺根错账」不可挑战（P2-3 撤销根与治理面接管）；
+  演练为进程内双实体，不宣称已部署独立验证者网络。
 
 ## 仓库结构
 

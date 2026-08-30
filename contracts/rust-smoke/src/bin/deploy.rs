@@ -110,13 +110,11 @@ async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> R
     }
 
     // ---- 真实部署 ----
-    let dsa_addr: Address;
     let mut deployed: Vec<(&str, Address)> = Vec::new();
 
-    let (addr, receipt) = deploy_with_receipt(provider, artifacts[0], &[], gas_limit).await?;
-    println!("  ✅ DSA                → {addr}（tx {}，gas {}）", receipt.transaction_hash, receipt.gas_used);
-    dsa_addr = addr;
-    deployed.push(("DSA", addr));
+    let (dsa_addr, receipt) = deploy_with_receipt(provider, artifacts[0], &[], gas_limit).await?;
+    println!("  ✅ DSA                → {dsa_addr}（tx {}，gas {}）", receipt.transaction_hash, receipt.gas_used);
+    deployed.push(("DSA", dsa_addr));
 
     let (addr, receipt) = deploy_with_receipt(provider, artifacts[1], &abi_addr(dsa_addr), gas_limit).await?;
     println!("  ✅ RevocationRegistry → {addr}（tx {}，gas {}）", receipt.transaction_hash, receipt.gas_used);

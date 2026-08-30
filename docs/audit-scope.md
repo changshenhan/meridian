@@ -113,7 +113,9 @@
 **链上面**：
 
 - anvil rust-smoke 三场景 e2e（快乐路径/撤销/欺诈挑战）+ m1_demo 10 万笔端到端
-  （verify.sh 步 10；CI 同款 alloy smoke）。
+  （verify.sh 步 10；CI 同款 alloy smoke）+ verifier_drill 三幕验证者挑战演练
+  （S-61，镜像复算检出 → challenge 全链：诚实静默 / kind1 漏单 / kind2 低付；
+  零合约改动，对账口径见 TECH_SPEC §6.18.6）。
 
 **ZK/装配面（范围外声明的对照证据）**：
 

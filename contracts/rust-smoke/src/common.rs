@@ -62,11 +62,26 @@ sol! {
         event Settled(uint256 indexed epochId, bytes32 nettingRoot, uint64 netCount);
         event ChallengeSucceeded(uint256 indexed epochId, address indexed challenger, uint8 kind);
         event Claimed(uint256 indexed epochId, address indexed recipient, uint256 amount);
+        /// P2-1 验证者读取面（TECH_SPEC §6.18.2）：自动 getter 对 struct 内数组成员整体
+        /// 省略（实测 ABI outputs 无 net[]）——本绑定只声明 getter 实际返回的 10 个字段。
+        struct EpochView {
+            bytes32 commitmentRoot;
+            bytes32 revocationRoot;
+            uint256 bondedAmount;
+            uint256 settlementFunded;
+            uint64 settledAt;
+            bytes32 nettingRoot;
+            bool committed;
+            bool settled;
+            bool challenged;
+            bool voided;
+        }
         function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot) external payable;
         function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot) external payable;
         function claim(uint256 epochId, uint256 netIndex) external;
         function challenge(uint256 epochId, FraudProof calldata fp) external payable;
         function challengeBond() external view returns (uint256);
+        function epochs(uint256 epochId) external view returns (EpochView memory);
     }
 }
 
@@ -139,13 +154,13 @@ pub fn make_env(
 
 /// spawn anvil（stdout/stderr 丢弃；错误即失败）。
 pub fn spawn_anvil() -> Result<Child> {
-    Ok(Command::new("anvil")
+    Command::new("anvil")
         .arg("--port")
         .arg("8545")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("spawn anvil（请确认 foundryup 已安装且 PATH 可达）")?)
+        .context("spawn anvil（请确认 foundryup 已安装且 PATH 可达）")
 }
 
 /// 等待 anvil RPC 就绪（最多 10s）。
