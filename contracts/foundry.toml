@@ -11,6 +11,13 @@ optimizer_runs = 200
 # DelegationHelper 的 bytes.concat 多参数在经典编译下 stack-too-deep → via-ir 解决。
 via_ir = true
 
+# 审计加固第二轮（四步路径 ②）：BatchSettler 状态机 invariant fuzz
+# （test/BatchSettlerInvariant.t.sol）。fail_on_revert 缺省 false——handler 的
+# 预期外 revert（窗口过期后的挑战等）静默跳过；真断言全在不变量函数与 try/catch 行为旗里。
+[invariant]
+runs = 64
+depth = 256
+
 [fmt]
 line_length = 100
 tab_width = 4
