@@ -429,6 +429,16 @@ expires_at / revocation_root / now）为准（接口已设计成"返回即登记
 > ② 延迟分解实测 CLI 进程开销仅 0.77ms p50（占 15.5%），纯验证数学 ≈4.21ms 为主导成本（MSM），
 > in-process wrapper 收益上界 ~15%。**100μs/笔 单靠批验证不可达，需递归聚合（Phase 2/4）才击穿**；
 > B4 预算线按诚实修订执行（§8.2）。
+>
+> **S-55 递归聚合实测收口（`docs/zk-recursion-eval.md`）**：上表 Phase 2 行在本 nightly
+> （bb 6.0.0-nightly.20260724）**实证 blocked-on-upstream**——Chonk folding 栈能折叠
+> spend_authorization（Load/Accumulate 通过），但 ① ChonkProve 被规范 hiding kernel ABI
+> 卡死（`HIDING_KERNEL_ULTRA_OPS 0 vs 363`，占位电路同样复现）；② 链长上限 8 折
+> （N≥8 触发 sumcheck `round_number < 256` 断言）；③ `write_solidity_verifier` 对 Chonk
+> 未实现（无 EVM 缝）；④ Mega/MegaZK poseidon2 flavor 重基丢掉 evm-no-zk 链上友好性。
+> 边际折叠成本实测 **≈1.0s/折**（≈200× 单笔直验 5.14ms），击穿 100μs/笔 需 N≥10⁴ 而
+> 链长限 8——量级倒挂，非调优可救。**v1/v1.1 实线维持单验证口径，吞吐靠非阻塞异步
+> 并发验证**；上游（Aztec）解耦 hiding kernel ABI 或实现 chonk solidity verifier 后重评。
 
 ### 5.5 约束预算（目标 + S-09 实测）
 
@@ -1458,7 +1468,7 @@ contract BatchSettler {
 | B1 | delegation 签名/验签 | ops/s, p99 | 验签 > 50k ops/s | 回归 >1% 红 |
 | B2 | ZK 证明生成（agent 侧） | p50/p99, 约束数 | p50 < 1s | 回归 >5% 红 |
 | B3 | ZK 单验证 | p99 | < 10ms | 回归 >5% 红 |
-| B4 | ZK 验证摊薄（≥256 笔/批） | 摊薄 μs/笔 | **S-18 诚实修订**（实测见 `docs/zk-batch-verify-eval.md` §5）：BB 原生批验证对 UltraHonk 不可用（CLI 无 handler + msgpack 仅 Chonk，实证）；实线 = 单验证 CLI 上界 **4983.8μs/笔**（参考机 32 核）；**≤100μs/笔 挂递归聚合（Phase 2/4）** | 回归 >5% 红 |
+| B4 | ZK 验证摊薄（≥256 笔/批） | 摊薄 μs/笔 | **S-18 诚实修订**（实测见 `docs/zk-batch-verify-eval.md` §5）：BB 原生批验证对 UltraHonk 不可用（CLI 无 handler + msgpack 仅 Chonk，实证）；实线 = 单验证 CLI 上界 **4983.8μs/笔**（参考机 32 核）；**≤100μs/笔 挂递归聚合（Phase 2/4）**——**S-55 实测该里程碑 blocked-on-upstream**（Chonk 栈可折叠但 prove 被规范 hiding kernel ABI 卡死 / 链长限 8 / 无 chonk solidity verifier，边际 ≈1.0s/折，见 `docs/zk-recursion-eval.md`）；v1/v1.1 吞吐靠非阻塞异步并发验证 | 回归 >5% 红 |
 | B5 | 聚合器摄入吞吐 | 笔/s（1/8/64 线程） | 单实例 ≥ 100k 笔/s | 回归 >1% 红 |
 | B6 | 摄入端到端延迟 | p99 | ≤ 50ms | 回归 >1% 红 |
 | B7 | 排序+承诺（100k 笔） | 耗时, 内存峰值 | < 1s, < 1GB | 回归 >1% 红 |
