@@ -46,9 +46,12 @@
 
 ## 3. 范围外（Out of Scope，诚实披露）
 
-- **ZK 电路**（`circuits/`，Noir）：约束逻辑审计需 Noir 专长，单独二期。当前生产
-  摄取路径用 `FormatVerifier`（TEMPORARY 占位），**未**依赖电路正确性——审计报告
-  须注明此临时态；真实 BB wrapper 接入后电路进范围。
+- **ZK 电路**（`circuits/`，Noir）：约束逻辑审计需 Noir 专长，单独二期。当前生产摄取
+  路径**缺省**用 `FormatVerifier`（TEMPORARY 占位），**未**依赖电路正确性——审计报告
+  须注明此临时态。S-40（2026-08-30）已交付真验证后端 `BbVerifier`（bb CLI wrapper，
+  TECH_SPEC §6.13）：`MERIDIAN_VERIFY_BACKEND=bb` 显式开启后摄取路径**依赖电路正确性**
+  （电路进审计范围）；该模式同时要求真电路 prover 产物（`PlaceholderProver` 产物会被
+  fail-closed 全拒），prove 侧实装仍是独立交付物。
 - 聚合器内核 Rust 侧（WAL/lattice）：不持链上资产，故障模式 = 停机非盗币；作为
   运营风险单独评估。
 - 网关/SDK（S-29）：明文 HTTP 已披露（部署须 TLS 反代）。

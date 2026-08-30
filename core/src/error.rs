@@ -22,6 +22,9 @@ pub enum Error {
     EAttestBind,
     /// 委托未注册（S-10：聚合器按 delegation_hash 查注册表，未注册拒绝）。
     EDelegUnknown,
+    /// 真验证后端不可用（S-40：bb 缺失 / 临时目录 / 进程 spawn 失败）——与 EProof 的
+    /// 密码学拒绝区分，fail-closed，绝不静默降级回格式校验（TECH_SPEC §6.13）。
+    EVerifyBackend,
 }
 
 impl Error {
@@ -44,6 +47,7 @@ impl Error {
             Error::EOrdering => "E_ORDERING",
             Error::EAttestBind => "E_ATTEST_BIND",
             Error::EDelegUnknown => "E_DELEG_UNKNOWN",
+            Error::EVerifyBackend => "E_VERIFY_BACKEND",
         }
     }
 
@@ -66,6 +70,7 @@ impl Error {
             "E_ORDERING" => Error::EOrdering,
             "E_ATTEST_BIND" => Error::EAttestBind,
             "E_DELEG_UNKNOWN" => Error::EDelegUnknown,
+            "E_VERIFY_BACKEND" => Error::EVerifyBackend,
             _ => return None,
         })
     }

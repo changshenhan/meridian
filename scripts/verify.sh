@@ -162,6 +162,17 @@ else
     fi
 fi
 
+# S-40：bb 后端 e2e（真 ZK 验证通路，TECH_SPEC §6.13）。纯 Rust 侧进程调 bb——Windows
+# 侧跑（cargo 在 Windows），bb 本体由后端解析走原生/WSL 兜底。工件依赖第 9 步刚产出的
+# proof/vk（新鲜且与 VK 配对）；工件缺失（第 9 步被跳过）则同口径跳过。
+if [ -f "$ROOT/circuits/target/proof" ] && [ -f "$ROOT/circuits/target/vk" ]; then
+    step "9b/10 bb-verify e2e (S-40, 真证明正/负向)"
+    run "bb-verify e2e" env MERIDIAN_BB_E2E=1 cargo test -p meridian-aggregator --test bb_verify_e2e
+else
+    step "9b/10 bb-verify e2e (S-40)"
+    skip "circuits/target/{proof,vk} 不存在（第 9 步 ZK 被跳过）→ bb-verify e2e 跳过"
+fi
+
 if [ -f "$ROOT/target/Prover.toml.pregate" ] && ! cmp -s "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"; then
     cp "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"
     printf '    \033[1;33m[CLEAN]\033[0m gen-witness/Prover.toml 已还原（nargo --overwrite-return 改写，return 键不进版本库）\n'

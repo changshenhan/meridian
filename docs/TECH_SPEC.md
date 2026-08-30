@@ -344,7 +344,9 @@ expires_at / revocation_root / now）为准（接口已设计成"返回即登记
   `verify` 必须统一 `-t evm-no-zk`（默认 poseidon2 的 UltraFlavor VK 3680B 尺寸不匹配，
   CI run 31933941769 → 修复 31934410549 全绿）。
 - **Rust 侧封装**：聚合器用 `bb_rs` 或 stdlib 封装验证器；目标单验证 < 10ms、批验证摊薄 ≤
-  100μs/笔（§5.5）。真批验证/递归聚合见 §5.4。
+  100μs/笔（§5.5）。真批验证/递归聚合见 §5.4。**S-40 落地口径**：bb CLI 子进程 wrapper
+  （`aggregator/src/bb.rs::BbVerifier`，§6.13），in-process 绑定收益上界 ~15%（S-18 延迟
+  分解）留作后续项；目标单验证 < 10ms 已实测达标（§5.5），100μs/笔仍待递归聚合。
 - **S-09 验收（CI 全绿，run 31934410549）**：正式管线 8 步全通——`gen-witness`（Noir 内
   确定性 eddsa_sign + 撤销树）→ `formal_gen_to_prover.py` 交叉校验 → 正式电路 prove/verify
   /公共输入回读(121)/负向篡改/B2-B4 计时基线/约束门禁(<2^18)/EVM 验证器。TEMPORARY `smoke/`
@@ -876,6 +878,71 @@ S-15 起 monitor 只盯一个 WAL；§1 拓扑的「聚合器实例（多实例�
 **诚实边界**：集群聚合是**副本组视角**，不是分布式共识监控——副本间分歧只报告（degraded
 + lag gauge），不裁决谁是真值（裁决 = 接管 WAL 人工核对，§5 处置）；每副本吞吐仍是刮取
 窗口均值（§4 口径不变）；`--once` 模式下 N 个副本逐个全量重放 WAL，启动耗时随副本数线性。
+
+### 6.13 真实 ZK 验证后端（S-40，bb wrapper，验证侧 TEMPORARY 缝收口）
+
+S-10 起摄取路径验证证明用 `FormatVerifier`（TEMPORARY，proof 非空即过，`aggregator/src/proof.rs`）
+挂账至今。S-09 实测真验证 5.14ms p99（§5.5），本件把**验证侧**换成真电路验证：`BbVerifier`
+（`aggregator/src/bb.rs`）实现同一 `SpendVerifier` 缝，子进程调用 bb CLI 验 UltraHonk 证明。
+上层 API 与摄取闸口次序不变（验证在验签/预算之后、公共输入一致性比对之前）。
+
+**bb verify 契约（S-40 实测，bb 6.0.0-nightly.20260724）**：
+
+- `bb verify -t evm-no-zk -p <proof> -k <vk> -i <public_inputs>`，flavor 必须与 §5.3 写 VK 时
+  一致（`evm-no-zk`，UltraKeccakFlavor，VK 1888B）。
+- proof 文件 = **纯证明**（本电路实测 8128B），**不含**公共输入——实测按 32B 字段对齐逐字段
+  比对排除内嵌/拼头/拼尾三种布局（大端/小端/Montgomery 形式均不匹配）。
+- public_inputs 独立文件：121 字段 × 32B **大端**（§5.3 回读脚本同规范）。`-i` 缺省路径是
+  `<cwd>/target/public_inputs`（cwd 不对即 `Unable to open file`）——**必须显式传 `-i`**。
+- 防篡改实测：改 pi 任一字节 → `Non-canonical public input: value >= field modulus` 拒绝；
+  改 proof 任一字节 → `Deserialized point is not on the curve` 拒绝。公共输入与证明是真密码学绑定。
+
+**公共输入序列化（`serialize_public_inputs`，121 字段 × 32B 大端 = 3872B）**：字段序 = 电路
+§5.1 参数序——`agent_commit[32B]`→32 字段、`delegation_hash[32B]`→32、`recipient[20B]`→20、
+`amount(u64)`→1、`category[32B]`→32、`spend_nonce(u64)`→1、`expires_at(u64)`→1、
+`revocation_root`→1、`now(u64)`→1。编码规则：`[u8; N]` **每字节一个字段**、`u64` 一个字段，
+各按 32B 大端展开；`revocation_root` Rust 侧是 `[u8; 32]` 但电路是 `pub Field` → 按 256-bit
+**大端整数**取一个字段（不是 32 个字节字段）。与 `scripts/formal_readback.py` 的 expected
+构造同一规范（第三实现交叉校验兜底）。
+
+**BbVerifier（`impl SpendVerifier`）**：`proof.proof` 字节直接喂 bb（S-09 CLI 管线产物口径）；
+临时目录 `target/bb-verify/<pid>-<原子计数>/`（并发安全，无新依赖），写 proof/pi/vk 三文件 →
+调 bb → 退出码 0 = 通过并原样返回公共输入、非 0 = `E_PROOF`。**fail-closed**：bb 不可得、
+临时目录建不了、进程 spawn 失败一律 `E_VERIFY_BACKEND`（新错误码）——与密码学拒绝区分
+（运营可见），**绝不静默降级回格式校验**（静默降级 = 安全事故）。
+
+**后端解析（三层，探测逻辑与 §8.3 verify.sh 第 9 步同款）**：① Windows 原生 bb
+（`MERIDIAN_BB_BIN` 覆盖路径）→ ② WSL2 兜底（`MERIDIAN_WSL_DISTRO` 缺省 MeridianUbuntu，
+Windows 路径经 `/mnt/<盘>/` 转换后进 WSL 调 bb）→ ③ 皆无 → **构造期报错**（bin 启动即退，
+不落运行时半可用态）。
+
+**接线**：`meridian-gateway` 环境变量 `MERIDIAN_VERIFY_BACKEND=format|bb`（**缺省 format**，
+生产默认口径本件不动）+ `MERIDIAN_BB_VK`（vk 文件路径，bb 模式必填、无缺省）。bench / perf
+gate 口径不变（FormatVerifier，§8.2 吞吐基线不回填）。
+
+**验收测试**：单测（序列化 golden：121 字段/3872B/字段序/revocation_root 大端整数口径；
+fail-closed 错误码）+ e2e（`aggregator/tests/bb_verify_e2e.rs`）：从 `circuits/Prover.toml`
+**手工重建**公共输入（第三实现，不读 bb 的 public_inputs 文件——防止序列化器抄自己的答案），
+配 `circuits/target/{proof,vk}` 真工件跑四案——真证明接受 / 篡改 proof 拒 / 篡改 pi 拒 /
+pi 与信封不一致拒。e2e 由 `MERIDIAN_BB_E2E=1` 门控：verify.sh 第 9 步 formal_zk 产出新鲜
+工件后第三 run 拉起；CI noir job formal 之后同款（ubuntu 原生 bb，走 Windows 原生分支语义）。
+
+**诚实边界**：
+
+1. **只收口验证侧，prove 侧未收**：SDK 生产路径的 proof 仍来自 `PlaceholderProver`（格式
+   占位）——`MERIDIAN_VERIFY_BACKEND=bb` 开启后这些 proof **会被全拒**（fail-closed 的正确
+   行为，不是 bug）；真 prover（agent 侧 S-09 电路 prove）实现 core `SpendProver` 是独立
+   交付物。e2e 用 CLI 管线真产物实证密码学通路。
+2. **CLI 子进程 wrapper 不是 in-process**：进程开销 ~0.77ms（§5.5 延迟分解占 15.5%），单验证
+   p99 ~5-8ms 仍在 §5.5 的 10ms 预算线内；100μs/笔 摊薄目标需递归聚合（§5.4 Phase 2，S-18
+   实证 BB 原生批验证对本 flavor 不可用）。in-process 封装（`bb_rs`/stdlib 绑定）收益上界
+   ~15%，留作后续项。
+3. **撤销根哈希错配（§4.6 残余诚实缝）本件不动**：BbVerifier 把 `pi.revocation_root` 绑进
+   证明验证，但聚合器账本撤销树（sha256）与电路撤销树（Pedersen）根数值不可比——bb 模式下
+   `revocation_root` 公共输入必须来自与电路同源的树（gen-witness 管线），不可直接喂聚合器
+   账本树根。错配收口随真 ZK 全集成定夺（下一步候选②）。
+4. **每笔验证 = 一次临时目录写盘 + 一次 bb 进程**：吞吐受文件系统与进程 spawn 支配，bb 后端
+   不进 perf gate（吞吐基线口径不变）。
 
 ---
 

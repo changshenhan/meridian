@@ -7,9 +7,11 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
+use meridian_aggregator::bb::BbVerifier;
 use meridian_aggregator::ingest::{Aggregator, IngestConfig};
 use meridian_aggregator::proof::FormatVerifier;
 use meridian_aggregator::wal::Wal;
+use meridian_core::zk::SpendVerifier;
 use meridian_gateway::{Config, Gateway};
 
 fn main() {
@@ -23,14 +25,33 @@ fn main() {
         std::process::exit(2);
     });
 
-    // 聚合器内核（FormatVerifier TEMPORARY 口径；真实 ZK verifier 在此替换接入）。
+    // 聚合器内核：验证后端由 `MERIDIAN_VERIFY_BACKEND` 选择（S-40，TECH_SPEC §6.13）——
+    // 缺省 `format`（FormatVerifier TEMPORARY 口径，生产默认不变）；`bb` 走真 ZK 验证
+    // （BbVerifier，需 `MERIDIAN_BB_VK` + 可得的 bb 工具链；构造失败启动即退 fail-closed）。
+    let verifier: Box<dyn SpendVerifier + Send + Sync> = match std::env::var(
+        "MERIDIAN_VERIFY_BACKEND",
+    )
+    .as_deref()
+    {
+        Ok("bb") => match BbVerifier::from_env() {
+            Ok(v) => {
+                eprintln!(
+                    "verify backend: bb (TECH_SPEC §6.13)——PlaceholderProver 占位 proof 会被全拒"
+                );
+                Box::new(v)
+            }
+            Err(e) => {
+                eprintln!(
+                        "MERIDIAN_VERIFY_BACKEND=bb 但后端不可得（{e}）：需 MERIDIAN_BB_VK + nargo/bb 工具链（Windows 原生或 WSL2 兜底）"
+                    );
+                std::process::exit(2);
+            }
+        },
+        _ => Box::new(FormatVerifier),
+    };
     let wal_path = std::env::var("MERIDIAN_GATEWAY_WAL").unwrap_or_else(|_| "gateway.wal".into());
     let wal = Wal::open(std::path::Path::new(&wal_path), 10_000).expect("open wal");
-    let agg = Arc::new(Aggregator::new(
-        IngestConfig::default(),
-        Box::new(FormatVerifier),
-        wal,
-    ));
+    let agg = Arc::new(Aggregator::new(IngestConfig::default(), verifier, wal));
 
     let listener =
         TcpListener::bind(&cfg.listen).unwrap_or_else(|e| panic!("bind {}: {e}", cfg.listen));
