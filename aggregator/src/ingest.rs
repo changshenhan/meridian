@@ -500,10 +500,12 @@ pub struct Aggregator {
     /// （B8 口径不变）。会话计数不持久化（同 `rejected`），崩溃恢复后从 0 起。
     latency: LatencyHistogram,
     /// 撤销状态根集合（S-44，撤销根绑定闸的接受集）：本账本出现过的全部撤销状态根。
-    /// 撤销集只增 → 状态根随撤销事件单调推进，集合 ≤ 撤销事件数 + 1。**进程内不持久化**
-    /// （TECH_SPEC §4.6 残余③诚实边界）：重启后 = {空根, 当前根}，跨重启 + 跨换代的在途
-    /// 证明以 `E_REV_ROOT` 拒（拒绝是安全方向）。仅在 `enforce_revocation_root = true`
-    /// 时维护（闸关闭 = 占位口径，零额外开销）。
+    /// 撤销集只增 → 状态根随撤销事件单调推进，集合 ≤ 撤销事件数 + 1。**S-49 起随 WAL
+    /// 持久化**（TECH_SPEC §4.6 残余③）：绑定闸开启时的每次 `revoke` 把当刻根作为
+    /// `RevokeRoot` 记录与撤销记录同批落盘，`restore_from_wal` 重放续接接受集（零重算）。
+    /// WAL 缺根记录的撤销（旧格式 WAL / 闸关闭期）其历史根不追溯——恢复后回退
+    /// {空根, 当前根} 口径，在途证明以 `E_REV_ROOT` 拒（拒绝是安全方向）。仅在
+    /// `enforce_revocation_root = true` 时维护（闸关闭 = 占位口径，零额外开销）。
     revocation_roots: RwLock<HashSet<[u8; 32]>>,
     /// 本实例启动时刻（unix 秒；`snapshot()` 健康快照用）。
     started_at: u64,
@@ -621,8 +623,9 @@ impl Aggregator {
     }
 
     /// 撤销状态根集合种子（S-44）：空根（账本 genesis 状态，任何账本都真实出现过）+
-    /// 当刻根（WAL 重放路径由 `restore_from_wal` 在撤销集重建后补种）。仅在绑定闸开启时
-    /// 维护——闸关闭 = 占位口径，零额外开销（`sparse_root()` 与每 epoch 密封同成本级）。
+    /// 当刻根（WAL 重放路径由 `restore_from_wal` 在撤销集重建后补种；S-49 起中间状态根
+    /// 另由 `RevokeRoot` 记录重放续接）。仅在绑定闸开启时维护——闸关闭 = 占位口径，
+    /// 零额外开销（`sparse_root()` 与每 epoch 密封同成本级）。
     fn seed_revocation_roots(&self) {
         if !self.cfg.enforce_revocation_root {
             return;
@@ -660,9 +663,22 @@ impl Aggregator {
                 agg.revocations.insert(*delegation_hash);
             }
         }
-        // 1a'. 撤销状态根集合补种（S-44）：重放后的当刻根进接受集。历史中间状态根不重算
-        // （逐状态重算 = O(撤销数²) 次 MSM 建树，且集合本就进程内不持久化）——跨重启 +
-        // 跨换代的在途证明以 E_REV_ROOT 拒（诚实边界，TECH_SPEC §4.6 残余③）。
+        // 1a'. 撤销状态根集合续接（S-49，§4.6 残余③）：`RevokeRoot` 记录直接进接受集
+        // （零重算——根在 revoke 时本已算过并落盘）。WAL 缺根记录的撤销（旧格式 WAL /
+        // 闸关闭期）其历史根不追溯，回退 {空根, 当刻根} 口径——在途证明以 E_REV_ROOT
+        // 拒（拒绝是安全方向，诚实边界）。
+        if agg.cfg.enforce_revocation_root {
+            let mut roots = agg
+                .revocation_roots
+                .write()
+                .expect("revocation roots poisoned");
+            for rec in &records {
+                if let DecodedRecord::RevokeRoot { revocation_root } = rec {
+                    roots.insert(*revocation_root);
+                }
+            }
+        }
+        // 1a''. 空根 + 重放后当刻根补种（S-44）。
         agg.seed_revocation_roots();
         // 1. 注册表 + provision。
         for rec in &records {
@@ -786,12 +802,18 @@ impl Aggregator {
             .expect("WAL failure (durability backbone)");
         let fresh = self.revocations.insert(delegation_hash);
         // 撤销状态根集合推进（S-44）：新状态根进接受集（撤销集只增 → 根单调变化，重复
-        // 撤销幂等不产生新状态）。仅在绑定闸开启时维护（闸关闭零开销，占位口径）。
+        // 撤销幂等不产生新状态）。S-49：根随撤销落 WAL（`RevokeRoot` 记录，与撤销记录
+        // 同批 fsync），恢复侧重放续接接受集、零重算（§4.6 残余③）。仅在绑定闸开启时
+        // 维护（闸关闭零开销，占位口径——不落根记录，WAL 逐字节不变）。
         if fresh && self.cfg.enforce_revocation_root {
+            let root = self.revocations.sparse_root();
+            self.wal
+                .append_revoke_root(root)
+                .expect("WAL failure (durability backbone)");
             self.revocation_roots
                 .write()
                 .expect("revocation roots poisoned")
-                .insert(self.revocations.sparse_root());
+                .insert(root);
         }
         fresh
     }
@@ -2920,14 +2942,15 @@ mod tests {
     }
 
     #[test]
-    fn revocation_root_gate_history_is_in_process_only() {
-        // 诚实边界（§4.6 残余③）：状态根集合进程内不持久化——重启后 = {空根, 当前根}，
-        // 跨重启 + 跨换代的中间状态 witness 以 E_REV_ROOT 拒（拒绝是安全方向）。
+    fn revocation_root_gate_accept_set_persists_across_restart() {
+        // S-49（§4.6 残余③）：接受集随 WAL 持久化——`RevokeRoot` 记录重放续接，
+        // 重启后跨换代的中间状态 witness 照常接受（不再回退 {空根, 当刻根}）。
         let clock = Arc::new(AtomicU64::new(1_700_000_000));
         let path = tmp_path("revroot-restart");
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let now = clock.load(Ordering::Relaxed);
         let mid_root;
+        let pre_restart_root;
         let dh;
         {
             let agg = test_aggregator_cfg(test_cfg_enforce_root(), &clock, &path);
@@ -2938,6 +2961,7 @@ mod tests {
             assert!(agg.revoke(other));
             mid_root = agg.revocation_root();
             assert!(agg.revoke([0xEE; 32]));
+            pre_restart_root = agg.revocation_root();
             let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
             assert!(agg.submit(&with_revocation_root(&env, mid_root)).accepted);
             agg.wal.flush().unwrap();
@@ -2951,9 +2975,77 @@ mod tests {
         )
         .unwrap();
         assert!(!truncated);
+        assert_eq!(
+            agg2.revocation_root(),
+            pre_restart_root,
+            "重放终点根与重启前一致（S-11c 前提不回归）"
+        );
 
-        // 重启后再换代：重启前的中间状态根（含重启前的当刻根——重放后只补种重放终点）
-        // 出集 → 拒。
+        // 重启后再换代：重启前的两个历史状态根（中间态 + 重启前当刻根）仍在接受集
+        // ——持久化续接，不因换代或重启出集。
+        assert!(agg2.revoke([0xFF; 32]));
+        let env2 = make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 10, 2, now);
+        assert!(
+            agg2.submit(&with_revocation_root(&env2, mid_root)).accepted,
+            "重启前的中间状态根随 WAL 续接"
+        );
+        let env3 = make_env(dh, [1u8; 20], &agent_key, [0xCC; 20], 10, 3, now);
+        assert!(
+            agg2.submit(&with_revocation_root(&env3, pre_restart_root))
+                .accepted,
+            "重启前的当刻根随 WAL 续接"
+        );
+        // 空根（种子）仍在集内；集合外的自选根仍拒（闸本体不松）。
+        let env4 = make_env(dh, [1u8; 20], &agent_key, [0xDD; 20], 10, 4, now);
+        assert!(
+            agg2.submit(&with_revocation_root(
+                &env4,
+                RevocationSet::new().sparse_root()
+            ))
+            .accepted
+        );
+        let env5 = make_env(dh, [1u8; 20], &agent_key, [0xEE; 20], 10, 5, now);
+        assert_eq!(
+            agg2.submit(&with_revocation_root(&env5, [0xCD; 32]))
+                .reject_reason,
+            Some(Error::ERevRoot)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn revocation_root_gate_legacy_wal_without_root_records_falls_back_to_seeds() {
+        // 诚实边界（S-49 收窄后残余）：WAL 缺根记录（旧格式 WAL 的历史 / 绑定闸关闭期
+        // 发生的撤销）→ 中间状态根不追溯，恢复后回退 {空根, 当刻根} 口径——该状态的
+        // 在途 witness 以 E_REV_ROOT 拒（拒绝是安全方向）。
+        // 构造：绑定闸关闭时撤销（不落根记录），再以闸开启恢复。
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("revroot-legacy");
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        let mid_root;
+        let dh;
+        {
+            let agg = test_aggregator_cfg(test_cfg(), &clock, &path);
+            let (d, _) = register_default(&agg, [1u8; 20]);
+            let (other, _) = register_default(&agg, [2u8; 20]);
+            dh = d;
+            assert!(agg.revoke(other));
+            mid_root = agg.revocation_root();
+            assert!(agg.revoke([0xEE; 32]));
+            agg.wal.flush().unwrap();
+        }
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            test_cfg_enforce_root(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+
+        // 无根记录：重启后换代，重启前的中间状态根出集 → 拒（安全方向）。
         assert!(agg2.revoke([0xFF; 32]));
         let env2 = make_env(dh, [1u8; 20], &agent_key, [0xBB; 20], 10, 2, now);
         assert_eq!(

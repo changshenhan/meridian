@@ -50,6 +50,9 @@ pub enum RecordKind {
     Netting = 4,
     /// 撤销委托（S-11）：崩溃后重放重建撤销集 → 下个 epoch 的撤销根精确一致。
     Revoke = 5,
+    /// 撤销状态根（S-49，§4.6 残余③）：撤销根绑定闸接受集随 WAL 持久化——`revoke`
+    /// 在绑定闸开启时把当刻根与撤销记录同批落盘，重放直接进接受集（零重算）。
+    RevokeRoot = 6,
 }
 
 impl RecordKind {
@@ -60,6 +63,7 @@ impl RecordKind {
             3 => RecordKind::EpochSeal,
             4 => RecordKind::Netting,
             5 => RecordKind::Revoke,
+            6 => RecordKind::RevokeRoot,
             _ => return None,
         })
     }
@@ -97,6 +101,9 @@ pub enum DecodedRecord {
     },
     /// 撤销委托（重放重建撤销集）。
     Revoke { delegation_hash: [u8; 32] },
+    /// 撤销状态根（S-49，重放重建绑定闸接受集——§4.6 残余③）。值 = 撤销记录之后
+    /// 当刻撤销集的稀疏根（BE Field 32B，与 §6.3 `sparse_root()` 同口径）。
+    RevokeRoot { revocation_root: [u8; 32] },
 }
 
 struct WalInner {
@@ -268,6 +275,15 @@ impl Wal {
             .append_raw(RecordKind::Revoke, &delegation_hash)
     }
 
+    /// 冷路径：撤销状态根记录（S-49，§4.6 残余③；payload 固定 32B = BE Field 根）。
+    /// 仅绑定闸开启时由 `revoke` 追加——根在该处本已算过，落盘让恢复侧零重算续接接受集。
+    pub fn append_revoke_root(&self, revocation_root: [u8; 32]) -> std::io::Result<()> {
+        self.inner
+            .lock()
+            .expect("wal poisoned")
+            .append_raw(RecordKind::RevokeRoot, &revocation_root)
+    }
+
     /// 批量 fsync 到盘。
     pub fn flush(&self) -> std::io::Result<()> {
         self.inner.lock().expect("wal poisoned").flush_locked()
@@ -379,6 +395,15 @@ impl Wal {
                     }
                     records.push(DecodedRecord::Revoke {
                         delegation_hash: payload.try_into().unwrap(),
+                    });
+                }
+                RecordKind::RevokeRoot => {
+                    if len != 32 {
+                        truncated = true;
+                        break;
+                    }
+                    records.push(DecodedRecord::RevokeRoot {
+                        revocation_root: payload.try_into().unwrap(),
                     });
                 }
             }
@@ -565,6 +590,47 @@ mod tests {
             DecodedRecord::Revoke { delegation_hash } if *delegation_hash == [0xCD; 32]
         ));
         // 旧 WAL（无 Revoke 字节）兼容：kind=5 不存在的场景被 from_u8 判为撕裂 → 截断。
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S-49：RevokeRoot 记录 roundtrip（绑定闸接受集崩溃恢复的前提），且与 Revoke
+    /// 同批交错时按序解码（撤销记录与根记录是两条记录，恢复侧按并集消费、不依赖配对）。
+    #[test]
+    fn revoke_root_record_roundtrip() {
+        let path = tmp_path("revroot");
+        let w = Wal::open(&path, 1000).unwrap();
+        w.append_revoke([0xAB; 32]).unwrap();
+        w.append_revoke_root([0x11; 32]).unwrap();
+        w.append_revoke([0xCD; 32]).unwrap();
+        w.append_revoke_root([0x22; 32]).unwrap();
+        w.flush().unwrap();
+        let (records, valid, truncated) = w.replay().unwrap();
+        assert!(!truncated);
+        assert_eq!(valid, w.file_len().unwrap());
+        assert_eq!(records.len(), 4);
+        assert!(matches!(
+            &records[1],
+            DecodedRecord::RevokeRoot { revocation_root } if *revocation_root == [0x11; 32]
+        ));
+        assert!(matches!(
+            &records[3],
+            DecodedRecord::RevokeRoot { revocation_root } if *revocation_root == [0x22; 32]
+        ));
+        // 长度错（≠32B）判撕裂：与其它固定长度种类同口径（手工构造 kind=6、len=33、
+        // CRC 合法的记录——payload 长度闸必须独立于 CRC 命中）。
+        let _ = std::fs::remove_file(&path);
+        let path = tmp_path("revroot-badlen");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&MAGIC.to_le_bytes());
+        raw.push(VERSION);
+        raw.push(RecordKind::RevokeRoot as u8);
+        raw.extend_from_slice(&33u32.to_le_bytes());
+        raw.extend_from_slice(&crc32fast::hash(&[0u8; 33]).to_le_bytes());
+        raw.extend_from_slice(&[0u8; 33]);
+        std::fs::write(&path, &raw).unwrap();
+        let w = Wal::open(&path, 1000).unwrap();
+        let (_, _, truncated) = w.replay().unwrap();
+        assert!(truncated, "长度失配的根记录必须截断，不得解码垃圾");
         let _ = std::fs::remove_file(&path);
     }
 
