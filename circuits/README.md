@@ -82,10 +82,13 @@ owner 的 secp256k1 ECDSA **电路外验证**（S-09 决策）：链上 `DSA.sol
 **签名对象编码**：`encode_field(intent_hash)` = 低 31 字节 LE 截断 → Field（248-bit <
 BN254 域，单射；断言 9 在电路内钉死完整 intent_hash → 无 mod-p 碰撞可乘）。
 
-**撤销树**：深度 32 稀疏 Merkle，叶子=EMPTY(0)，`index = delegation_hash[0..4] LE`。
+**撤销树**：深度 256 稀疏 Merkle（S-36 全宽化），叶子=EMPTY(0)，索引 = `delegation_hash`
+全 32 字节 LE u256（位 k = `(dh[k/8] >> (k%8)) & 1`，按字节现场派生——索引不落单个 Field，
+BN254 域仅 ~254 bit；与聚合器 `RevocationSet` 同一派生同一位序）。
 `std::merkle` 已移出 Noir 1.0 stdlib → 内联 `compute_merkle_root`（merkle_insert 模式，
 `std::hash::pedersen_hash`）。原型级碰撞属性（两 delegation 同 32-bit 前缀共享叶子→撤销
-共享）标注在 SPEC，真实树 S-11 对接 RevocationRegistry 时再设计。
+共享）两侧均已收口：聚合器 S-34、电路 S-36（回归测试 `full_width_index_collides_prefix_only`
+固化）。
 
 ## 约束数记录（S-05 验收 + S-09 正式门禁）
 
@@ -111,7 +114,7 @@ Noir 1.0 移除了 Field 模运算（`%` 编译报错，eddsa fork 自身测试�
 modulo"），且 `ScalarField` 无算符、`base4_slices` 为 `pub(crate)`——mod-n 归约在 Noir 内
 无法做。该归约是纯整数逻辑（非曲线数学；R8/h/公钥仍在 Noir），与 Rust core 的纯字节逻辑
 同级，端到端由正式电路 `eddsa_verify`（CI prove）把关：s 错则证明失败。Rust core 侧只做
-纯字节逻辑（`zk_intent_hash` / `revocation_index`，共享 hex 向量锁定）。
+纯字节逻辑（`zk_intent_hash`；撤销索引自 S-36 起即 `delegation_hash` 本身，无独立派生）。
 
 `nargo execute --overwrite-return` 把返回值（EdDSA 挑战/pubkey/撤销 root+path/intent_hash）
 写入 `gen-witness/Prover.toml` 的 `return` 键 → `scripts/formal_gen_to_prover.py`

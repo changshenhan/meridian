@@ -10,16 +10,17 @@
 //! `empty_roots[k] = sha256(empty_roots[k-1] ‖ empty_roots[k-1])` 预计算（`OnceLock`），
 //! 插入时逐层上推，复杂度 O(256·|revoked|)——只在密封（每 epoch 一次）调用。
 //!
-//! **S-34 碰撞收口**：S-11 原型版索引只取 `dh[0..4]`（32-bit 前缀，与电路共享派生）——
+//! **S-34 碰撞收口**：S-11 原型版索引只取 `dh[0..4]`（32-bit 前缀，当时与电路共享派生）——
 //! 两委托同前缀共享叶子、后写覆盖先写，锚定根只承诺其一（audit-scope §4 自报项）。改全
-//! 256-bit 索引后 `delegation_hash` 整体即索引，**相异 dh 必相异叶**；depth ≤ 32 时与本
-//! 电路派生 `dsa::revocation_index(dh)`（低 32 位）逐位一致，是它的纯扩位推广。代价是
+//! 256-bit 索引后 `delegation_hash` 整体即索引，**相异 dh 必相异叶**。电路侧已于 S-36
+//! 同步全宽化（Noir 撤销树 depth 256，同一派生同一位序，TECH_SPEC §5.3）。代价是
 //! O(32·|revoked|) → O(256·|revoked|)（稀有事 × 低频路径，见上）。
 //!
-//! **诚实缝（非活跃错配）**：电路侧撤销根是 Pedersen sparse merkle + 32-bit 索引
-//! （main.nr，叶 EMPTY(0)），聚合器侧这里是 sha256 + 256-bit 索引。内核用 `FormatVerifier`
+//! **诚实缝（非活跃错配；S-34 收窄碰撞、S-36 收窄索引）**：电路侧撤销根是 Pedersen 树
+//! （叶 EMPTY(0) Field），本侧是 sha256 树（叶 dh 32B）——索引派生已全等，残余错配是
+//! 哈希函数与叶值/空叶规范，两侧根数值不可比。内核用 `FormatVerifier`
 //! 从不读 `pi.revocation_root`，真正的 E_REVOKED 闸口在 `submit()`（注册表查找后立即查集，
-//! 集合精确查找，不走树）。真对齐（聚合器算 Pedersen 树 + 电路全宽索引）推迟到真 ZK 集成
+//! 集合精确查找，不走树）。完全对齐（同哈希 + 同叶规范）随真 ZK 集成方向定夺后收口
 //! ——本文件 + TECH_SPEC §4.6 记录。
 
 use std::collections::{HashMap, HashSet};

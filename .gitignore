@@ -17,6 +17,7 @@ circuits/target/
 smoke/target/
 smoke/Prover.toml
 gen-witness/target/
+circuits/smoke-gen/target/
 # 正式管线生成：Prover.toml 由 formal_gen_to_prover.py 从 gen-witness return 派生；
 # bench 基线 / EVM 验证器为 CI 产物（upload-artifact 交付，Phase 4 复用）
 circuits/Prover.toml

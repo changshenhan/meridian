@@ -21,7 +21,9 @@ gen-witness 输出）。Noir 1.0 移除了 Field 模运算（`%` 编译报错，
   · agent_commit   = sha256(pub_x_le ‖ pub_y_le)   ← 与电路断言 1 同规范
   · intent_hash    = sha256(agent_commit ‖ delegation_hash ‖ recipient ‖ amount_le ‖
                             category ‖ spend_nonce_le ‖ expires_at_le)   ← 断言 9
-  · revocation_index = delegation_hash[0..4] LE    ← 断言 8 索引
+  · revocation_path 长度 = 256                      ← 断言 8 索引位宽（S-36 全宽化；
+    索引 = delegation_hash 本身（公共输入），无独立 witness 字段可交叉，位序契约由
+    电路/生成器/聚合器三侧同名回归测试固化）
   · 0 <= s < SUBORDER                               ← 断言 2 验签域
 任一失配 → 退出非零，CI 红。
 """
@@ -61,10 +63,12 @@ def le32(v: int) -> bytes:
 
 WITNESS_KEYS = (
     "agent_pub_x", "agent_pub_y", "sig_r", "sig_h", "sig_r8_x", "sig_r8_y",
-    "revocation_root", "revocation_index", "revocation_path", "intent_hash",
+    "revocation_root", "revocation_path", "intent_hash",
 )
-# 扁平返回的顺序 = WitnessOut 字段顺序：8 标量 + 32 path + 32 ih = 72
-FLAT_HEAD = 8  # agent_pub_x..revocation_index 共 8 个标量
+# 扁平返回的顺序 = WitnessOut 字段顺序：7 标量 + 256 path + 32 ih = 295（S-36：
+# revocation_index 字段退役——索引 = delegation_hash 本身，256-bit 落不进单个 Field）
+FLAT_HEAD = 7  # agent_pub_x..revocation_root 共 7 个标量
+PATH_LEN = 256  # REVOCATION_DEPTH（gen-witness / circuits 同值）
 
 
 def parse_fields(fields):
@@ -79,7 +83,6 @@ def parse_fields(fields):
         "sig_r8_x": to_int(fields["sig_r8_x"]),
         "sig_r8_y": to_int(fields["sig_r8_y"]),
         "revocation_root": to_int(fields["revocation_root"]),
-        "revocation_index": to_int(fields["revocation_index"]),
         "revocation_path": [to_int(x) for x in fields["revocation_path"]],
         "intent_hash": bytes(to_int(x) for x in fields["intent_hash"]),
     }
@@ -88,28 +91,29 @@ def parse_fields(fields):
 def read_return(data):
     # nargo --overwrite-return 的序列化形态未在本地可见，三种都解析：
     #   a) `return` 键为表（struct → [return] 嵌套表）
-    #   b) `return` 键为列表（嵌套 9 元素或扁平 71 值）
+    #   b) `return` 键为列表（嵌套 9 元素或扁平 295 值）
     #   c) 整个文件被覆盖成返回值本身（顶层即 WitnessOut 字段）
     ret = data.get("return")
     if isinstance(ret, dict):
         return parse_fields({k: ret.get(k) for k in WITNESS_KEYS})
     if isinstance(ret, list):
-        if len(ret) == 10:
-            # 嵌套形态：[8 标量, path[32], ih[32]]
-            (px, py, r, h, r8x, r8y, root, idx, path, ih) = ret
+        if len(ret) == 9:
+            # 嵌套形态：[7 标量, path[256], ih[32]]
+            (px, py, r, h, r8x, r8y, root, path, ih) = ret
             return parse_fields({"agent_pub_x": px, "agent_pub_y": py, "sig_r": r,
                                  "sig_h": h, "sig_r8_x": r8x, "sig_r8_y": r8y,
-                                 "revocation_root": root, "revocation_index": idx,
+                                 "revocation_root": root,
                                  "revocation_path": path, "intent_hash": ih})
-        if len(ret) == 72:
-            # 扁平形态：字段顺序 8 标量 + 32 path + 32 ih
-            head, path, ih = ret[:FLAT_HEAD], ret[FLAT_HEAD:FLAT_HEAD + 32], ret[FLAT_HEAD + 32:]
+        if len(ret) == FLAT_HEAD + PATH_LEN + 32:
+            # 扁平形态：字段顺序 7 标量 + 256 path + 32 ih
+            head, path, ih = (ret[:FLAT_HEAD], ret[FLAT_HEAD:FLAT_HEAD + PATH_LEN],
+                              ret[FLAT_HEAD + PATH_LEN:])
             return parse_fields({"agent_pub_x": head[0], "agent_pub_y": head[1], "sig_r": head[2],
                                  "sig_h": head[3], "sig_r8_x": head[4], "sig_r8_y": head[5],
-                                 "revocation_root": head[6], "revocation_index": head[7],
+                                 "revocation_root": head[6],
                                  "revocation_path": path, "intent_hash": ih})
-        print(f"ERROR: `return` list length {len(ret)} (expected 10 nested or 72 flat)",
-              file=sys.stderr)
+        print(f"ERROR: `return` list length {len(ret)} "
+              f"(expected 9 nested or {FLAT_HEAD + PATH_LEN + 32} flat)", file=sys.stderr)
         print("--- first 3 values ---", file=sys.stderr)
         print(str(ret[:3])[:500], file=sys.stderr)
         sys.exit(1)
@@ -158,12 +162,6 @@ def main() -> int:
         print(f"  gen  = {w['intent_hash'].hex()}", file=sys.stderr)
         print(f"  want = {want_ih.hex()}", file=sys.stderr)
         return 1
-    want_idx = int.from_bytes(DELEGATION_HASH[0:4], "little")
-    if want_idx != w["revocation_index"]:
-        print("CROSS-CHECK FAIL: revocation_index mismatch", file=sys.stderr)
-        print(f"  gen  = {w['revocation_index']} want = {want_idx}", file=sys.stderr)
-        return 1
-
     # ——— 签名标量 s = (r + h·secret) % SUBORDER（Python 大整数归约）———
     # Noir 1.0 无 Field 模运算 → mod-n 归约在此做（r、h 为 gen-witness 输出）。
     # 端到端由正式电路 eddsa_verify 把关（s 错则 circuits nargo execute 断言失败）。
@@ -173,9 +171,11 @@ def main() -> int:
         print(f"  sig_s = {sig_s}", file=sys.stderr)
         return 1
 
-    if len(w["revocation_path"]) != 32:
-        print(f"CROSS-CHECK FAIL: revocation_path length {len(w['revocation_path'])} != 32",
-              file=sys.stderr)
+    # 断言 8 索引位宽（S-36 全宽化）：path 256 层，索引 = delegation_hash 本身
+    # （无独立 witness 字段可交叉——位序契约由三侧同名回归测试固化）。
+    if len(w["revocation_path"]) != PATH_LEN:
+        print(f"CROSS-CHECK FAIL: revocation_path length {len(w['revocation_path'])} "
+              f"!= {PATH_LEN}", file=sys.stderr)
         return 1
 
     categories = [[0] * 32 for _ in range(MAX_CATEGORIES)]
@@ -208,8 +208,8 @@ def main() -> int:
     print(f"agent_commit     = {agent_commit.hex()}")
     print(f"intent_hash      = {w['intent_hash'].hex()}")
     print(f"revocation_root  = {w['revocation_root']}")
-    print(f"revocation_index = {w['revocation_index']} (want {want_idx})")
-    print(f"revocation_path  = [{len(w['revocation_path'])} fields]")
+    print(f"revocation_path  = [{len(w['revocation_path'])} fields] (full-width index "
+          f"= delegation_hash, S-36)")
     print(f"sig_s            = {sig_s}  (computed: (sig_r + sig_h*{SECRET}) % SUBORDER)")
     print("cross-check OK (Python 3rd implementation matches gen-witness)")
     return 0

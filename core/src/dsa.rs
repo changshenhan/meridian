@@ -204,19 +204,10 @@ pub fn zk_intent_hash(
     sha256(&preimage)
 }
 
-/// 撤销稀疏 Merkle 树索引（**电路侧原型派生**）：`delegation_hash[0..4]` LE 转 u32。
-/// 与电路 `revocation_index` / gen-witness 建树用同一派生（S-09）。
-/// 聚合器侧 `RevocationSet` 自 S-34 起改用全 256-bit 索引（TECH_SPEC §4.6）——本函数
-/// 仅为电路派生保留（交叉实现契约，depth ≤ 32 时是 256-bit 索引的低 32 位）。
-pub fn revocation_index(delegation_hash: [u8; 32]) -> u32 {
-    u32::from_le_bytes([
-        delegation_hash[0],
-        delegation_hash[1],
-        delegation_hash[2],
-        delegation_hash[3],
-    ])
-}
-
+// 撤销稀疏 Merkle 树索引：`delegation_hash` 全 32 字节即索引（LE u256，位 k =
+// `(dh[k/8] >> (k%8)) & 1`）。S-36 起电路侧（Noir）/生成器侧（gen-witness）/聚合器侧
+// （`RevocationSet`，TECH_SPEC §4.6）三侧同一派生——索引就是 delegation_hash 本身，
+// Rust 侧无独立函数（S-09 的低 32 位前缀派生 `revocation_index()` 已随全宽化退役）。
 // ---------------------------------------------------------------------------
 // 签名
 // ---------------------------------------------------------------------------
@@ -552,26 +543,20 @@ mod tests {
     }
 
     #[test]
-    fn revocation_index_is_le_first_four_bytes() {
-        // 与电路派生一致：dh[0] 是最低位（LE）。
-        let dh = [0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB, 0xCC, 0xDD];
-        let full: [u8; 32] = {
-            let mut a = [0u8; 32];
-            a[..8].copy_from_slice(&dh);
-            a
-        };
-        assert_eq!(
-            revocation_index(full),
-            u32::from_le_bytes([0x01, 0x02, 0x03, 0x04])
-        );
-        // 后 28 字节不影响索引（原型级 32-bit 索引，碰撞属性见 SPEC）。
-        assert_eq!(
-            revocation_index(full),
-            revocation_index({
-                let mut a = full;
-                a[8] ^= 1;
-                a
-            })
-        );
+    fn revocation_index_contract_is_documented_delegation_hash() {
+        // S-36 全宽化契约（TECH_SPEC §4.6/§5.3）：索引 = delegation_hash 全 32B LE，
+        // 位 k = (dh[k/8] >> (k%8)) & 1。Rust 侧无独立派生函数（低 32 位前缀版已退役），
+        // 本测试固化三侧共享的位序公式（与 Noir index_bit / RevocationSet 位序一致），
+        // 防止任何一侧悄悄换派生。
+        let mut dh = [0u8; 32];
+        dh[0] = 0x01;
+        dh[1] = 0x80;
+        dh[31] = 0x80;
+        let bit = |b: [u8; 32], k: usize| (b[k / 8] >> (k % 8)) & 1 == 1;
+        assert!(bit(dh, 0));
+        assert!(!bit(dh, 1));
+        assert!(bit(dh, 15));
+        assert!(bit(dh, 255));
+        assert!(!bit(dh, 254));
     }
 }

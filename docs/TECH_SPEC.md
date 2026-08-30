@@ -210,17 +210,21 @@ pub fn check_budget(
 ### 4.6 撤销（Revocation）
 
 - 链上 `RevocationRegistry`：`delegation_hash → revoked`。
-- **电路侧**：撤销非成员证明——`delegation_hash` 对应叶子 = `EMPTY`（非成员），即未撤销。
-  树深 32，索引 = `revocation_index(dh)` = `delegation_hash[0..4]` LE，叶子 = EMPTY(0)
-  （Pedersen sparse merkle，§5.2 断言 8）。
+- **电路侧（S-36 全宽化）**：撤销非成员证明——`delegation_hash` 对应叶子 = `EMPTY`（非成员），
+  即未撤销。树深 256，索引 = `delegation_hash` 全 32 字节的 LE u256，叶子 = EMPTY(0)
+  （Pedersen sparse merkle，§5.2 断言 8）——与聚合器 `RevocationSet`（下）**同一派生、同一位
+  序**。电路内索引不落单个 Field（BN254 域仅 ~254 bit，容不下 256-bit 索引；
+  `Field::to_le_bits::<256>` 直接不可满足，S-36 实测），位由字节现场派生（`compute_merkle_root`
+  直收 `[u8;32]` 索引字节，位 k = `(dh[k/8] >> (k%8)) & 1`），无截断、无 mod-p 碰撞可乘。
 - **聚合器侧（S-11 新增，S-34 收口碰撞）**：`RevocationSet`（`aggregator/src/revocation.rs`）
   收集被撤销委托的 `delegation_hash`，`sparse_root()` 压实成 32B 根（**sha256** sparse merkle，
   叶子 = dh，空子树根表 `empty_roots[k]=sha256(empty_roots[k-1]‖empty_roots[k-1])`）。
   **树深 256，索引 = `dh` 全 32 字节的 LE u256**（位 k = `(dh[k/8] >> (k%8)) & 1`；第 d 层
-  节点索引 = 索引右移 d）——depth ≤ 32 时与电路派生 `revocation_index(dh)`（低 32 位）逐位
-  一致，是它的纯扩位推广，非换派生。**S-11 原型版用 32-bit 前缀索引**（`delegation_hash[0..4]`
+  节点索引 = 索引右移 d）——**S-36 起与电路侧同一派生、逐位全等**（不再是"低 32 位扩位"
+  关系，见上）。**S-11 原型版两侧均用 32-bit 前缀索引**（`delegation_hash[0..4]`
   LE）：两委托同前缀共享叶子、后写覆盖先写，锚定根只承诺其一（audit-scope §4 自报项）。
-  S-34（2026-08-30）改为全 256-bit 索引：`delegation_hash` 整体即索引，**相异 dh 必相异叶**，
+  S-34（2026-08-30）聚合器侧、S-36（2026-08-30）电路侧先后改为全 256-bit 索引：
+  `delegation_hash` 整体即索引，**相异 dh 必相异叶**，
   碰撞面收口（`delegation_hash` 本就是 ecrecover 域内的 256-bit 抗碰摘要）。代价：`sparse_root`
   从 O(32·|revoked|) 变 O(256·|revoked|)——只在密封（每 epoch 一次）调用，撤销又是稀有事件，
   热路径（摄取/submit 闸口）不受影响（闸口是集合精确查找，与树无关）。空根 golden
@@ -230,12 +234,13 @@ pub fn check_budget(
   新意图一律 `E_REVOKED` 拒（最廉价闸口，不耗 nonce/窗口槽）→ 撤销根随**下个密封 epoch**
   的 `ChainPublisher::commit` 上链（S-11 验收：1 epoch 内进入撤销根）。
 - 撤销即时性：聚合器拉取注册表延迟 ≤ 1 个 epoch；对"已撤销仍消费"的窗口期，用债券惩罚运营者（§6.5）。
-- **诚实缝（非活跃错配，S-11 记录在案；S-34 收窄）**：聚合器撤销根是 **sha256 + 256-bit 索引**
-  树，电路根是 **Pedersen + 32-bit 索引** 树——索引派生与哈希函数均不一致，内核用
-  `FormatVerifier` 从不读 `pi.revocation_root`，真正的 `E_REVOKED` 闸口在 `submit()`。
-  S-34 已把聚合器侧的**碰撞属性**收口（256-bit 索引，见上）；两侧真对齐（聚合器算
-  Pedersen 树 + 电路改用全宽索引）仍是 Noir 电路改动，推迟到真 ZK 集成（revocation.rs +
-  本行）。
+- **诚实缝（非活跃错配，S-11 记录在案；S-34 收窄碰撞、S-36 收窄索引）**：聚合器撤销根是
+  **sha256** 树（叶 = dh 32B，空叶 = `sha256("")`），电路根是 **Pedersen** 树（叶 = EMPTY(0)
+  Field，已撤销叶 = `encode_field(dh)`）——**索引派生已全等**（256-bit，见上），残余错配是
+  **哈希函数 + 叶值/空叶规范**，两侧根数值不可比。内核用 `FormatVerifier` 从不读
+  `pi.revocation_root`，真正的 `E_REVOKED` 闸口在 `submit()`。完全对齐（两侧同哈希 + 同叶
+  规范，根数值可比）需定夺改哪侧（聚合器算 Pedersen 树，或电路改 sha256——后者要在电路内
+  再付一路 sha256），随真 ZK 集成方向定夺后收口（revocation.rs + 本行）。
 
 ### 4.7 两种模式映射（实现同一接口）
 
@@ -267,7 +272,7 @@ claim 付原生 ETH；`BatchSettler` v2，见 §7）。**S-28 资产参数化**�
 | **Private** | `agent_pub_x` / `agent_pub_y` | 解承诺，验 agent EdDSA（断言 1） |
 | | `sig_s` / `sig_r8_x` / `sig_r8_y` | agent 对 `encode_field(intent_hash)` 的 EdDSA（断言 2） |
 | | `max_per_spend` / `categories` / `categories_len` / `not_before` | 委托相关字段（预算/白名单/有效期，断言 3-5） |
-| | `revocation_path` | 稀疏 Merkle 非成员证明路径（叶子=EMPTY，深度 32，断言 8） |
+| | `revocation_path` | 稀疏 Merkle 非成员证明路径（叶子=EMPTY，深度 256，断言 8） |
 
 **不存在的输入（S-09 决策）**：`owner_commit` / `owner_pubkey` / `owner_sig` 不进入电路
 （owner ECDSA 电路外，见 §5.2 断言 2）；`intent_hash` 不再是公共输入——断言 9 在电路内
@@ -283,7 +288,8 @@ claim 付原生 ETH；`BatchSettler` v2，见 §7）。**S-28 资产参数化**�
 5. delegation.not_before <= now <= delegation.expires_at    // 有效期
 6. delegation_hash[0] > 0                                   // 公共锚点非零（S-05）
 7. spend_nonce > 0                                          // 防零 nonce 误用
-8. compute_merkle_root(EMPTY, index, path) == revocation_root  // 撤销非成员，叶子=EMPTY
+8. compute_merkle_root(EMPTY, delegation_hash, path) == revocation_root  // 撤销非成员（叶子=EMPTY，
+   // 索引 = delegation_hash 全 256-bit LE，S-36 全宽化；位 k = (dh[k/8]>>(k%8))&1）
 9. intent_hash == sha256(agent_commit ‖ delegation_hash ‖ recipient ‖ amount_le ‖
                           category ‖ spend_nonce_le ‖ expires_at_le)  // 字段级绑定
    // intent_hash 电路内派生（不再作为公共输入），签名对象 = encode_field(intent_hash)。
@@ -313,6 +319,8 @@ expires_at / revocation_root / now）为准（接口已设计成"返回即登记
 - **验证路径**：nargo v1.0.0-beta.26 无法在 Windows 构建（`termion` 仅 unix，无 feature 可关），
   本地 Windows 只做 Rust 侧；电路 compile / test / 约束数 / prove-verify-回读 / 计时 / EVM
   验证器 全部在 CI（ubuntu，`.github/workflows/ci.yml` 的 `noir` job）执行。电路改动以 CI 绿为验收。
+  **S-36 起本机 WSL2（MeridianUbuntu）已装 nargo/bb（root，`~/.nargo/bin`、`~/.bb`），电路
+  改动可本地走 `scripts/formal_zk.sh` 全管线验收，CI 仍为第二道网。**
 - **外部库（git 锁定；Noir 1.0 已把下列移出 stdlib）**：`eddsa` fork tag `v1.0-7e206c9`
   （changshenhan/eddsa，指向 1.0 端口 commit 7e206c9；v0.1.3 仍是 Noir 0.x `u1` API，与 beta.26 不兼容；
   nargo 1.0 git 依赖只认 `tag` → fork+tag 锁定）、`edwards` v0.2.5（测试构造曲线点，替代 `ec`）、
@@ -322,11 +330,13 @@ expires_at / revocation_root / now）为准（接口已设计成"返回即登记
   → `s = (r + h·secret) % SUBORDER` 由 build 脚本（`scripts/formal_gen_to_prover.py`，Python
   大整数）计算；该归约是纯整数逻辑（R8/h/公钥仍在 Noir 内），端到端由正式电路
   `eddsa_verify`（CI prove）把关：s 错则证明失败。
-- **撤销树**：内联 `compute_merkle_root`（`std::merkle` 已移出 Noir 1.0 stdlib，merkle_insert
-  官方模式 + `std::hash::pedersen_hash`），深度 32，叶子=EMPTY(0)，index =
-  `delegation_hash[0..4]` LE。原型级碰撞属性（两 delegation 同 32-bit 前缀共享叶子→撤销共享）
-  ——**电路侧保留此派生**（S-09 锁定工具链不动）；聚合器侧链上锚定根已在 S-34 收口为
-  256-bit 索引（§4.6），电路侧收口（全宽索引 + 重 prove）随真 ZK 集成 Phase 2。
+- **撤销树（S-36 全宽化）**：内联 `compute_merkle_root`（`std::merkle` 已移出 Noir 1.0 stdlib，
+  merkle_insert 官方模式 + `std::hash::pedersen_hash`），深度 256，叶子=EMPTY(0)，索引 =
+  `delegation_hash` 全 32 字节 LE u256，位 k = `(dh[k/8] >> (k%8)) & 1`（按字节现场派生，不落
+  单个 Field——BN254 域容不下 256-bit 索引，`Field::to_le_bits::<256>` 不可满足，S-36 实测）。
+  原型级碰撞属性（两 delegation 同 32-bit 前缀共享叶子→撤销共享）**两侧均已收口**：聚合器侧
+  S-34（§4.6）、电路侧 S-36——同一 delegation_hash 在两侧派生同一索引，同前缀异哈希的委托
+  在电路上也走不同叶（回归测试固化）。
 - **EVM 验证器（Phase 4 复用）**：`bb write_solidity_verifier -t evm-no-zk -k vk -o UltraVerifier.sol`
   编译 Solidity 验证器（CI 产物 `circuits/artifacts/UltraVerifier.sol`）。**Flavor 一致性
   约束**：bb 6.0.0-nightly 的 `CircuitWriteSolidityVerifier` 硬编码 `UltraKeccakFlavor::
@@ -366,17 +376,19 @@ expires_at / revocation_root / now）为准（接口已设计成"返回即登记
 
 ### 5.5 约束预算（目标 + S-09 实测）
 
-| 项 | 目标 | S-09 实测（CI run 31934410549） |
+| 项 | 目标 | S-36 实测（2026-08-30，本机 WSL2 nargo 1.0.0-beta.26 / bb 6.0.0-nightly.20260724） |
 |---|---|---|
-| 电路约束数 | < 2^18 | **66736**（`bb gates` circuit_size；含 sha256 intent_hash + pedersen Merkle + Jubjub EdDSA） |
+| 电路约束数 | < 2^18 | **82742**（`bb gates` circuit_size；含 sha256 intent_hash + pedersen Merkle depth 256 + Jubjub EdDSA；S-09 depth-32 版为 66736，全宽化边际 +16k 门 ≈ 71 门/层） |
 | 证明生成（agent 侧，桌面级） | p50 < 1s | **0.325s**（S-18 参考机 32 核 WSL2 本机实测；CI 2 核共享 runner 1.8457s） |
 | 单证明验证（聚合器） | < 10ms | **5.14ms p99 PASS**（参考机 32 核 WSL2；延迟分解：CLI 开销 0.77ms p50 / 15.5%，纯数学 ≈4.21ms 主导；CI 2 核 7.62ms） |
 | 验证摊薄（≥256 笔/批） | ≤ 100μs / 笔（**S-18 诚实修订**，见 §8.2） | 参考机实测单验证 CLI 上界 **4983.8μs/笔**（32 核）；BB 原生批验证对 UltraHonk 不可用（实证，`docs/zk-batch-verify-eval.md` §5）；**100μs 需递归聚合**（Phase 2/4） |
 
 **S-05 基线**（run 31926682045）：最小版 = 6880 ACIR opcodes + 1289 Brillig opcodes。
-**S-09 完整版**（run 31934410549）：circuit_size = **66736**，ACIR opcodes = 9044（`bb gates`
+**S-09 完整版**（run 31934410549，撤销树 depth 32）：circuit_size = 66736，ACIR opcodes = 9044。
+**S-36 全宽化**（撤销树 depth 256）：circuit_size = **82742**，ACIR opcodes = 15819（`bb gates`
 输出）——owner ECDSA 移出电路（§5.2 断言 2）省下 ~2^18 级预算，其余（intent_hash sha256 +
-撤销 Merkle + Jubjub EdDSA）仍在 2^18 预算内，为后续安全增强（如字段级类别解析）留有余量。
+撤销 Merkle + Jubjub EdDSA）仍在 2^18 预算内（余量 ~69%），为后续安全增强（如字段级类别解析）
+留有余量。
 证明/验证时延见 `circuits/bench/baseline_s09.json`（CI upload-artifact 交付）。
 
 ---
@@ -1091,7 +1103,7 @@ contract BatchSettler {
 
 | PoC | 内容 | 结果 | 证据 |
 |---|---|---|---|
-| ① ZK 授权凭证 | `spend_authorization` 完整版（§5.2 九断言 + 正/负向 + 双钥绑定 + 撤销非成员 + intent_hash 字段级绑定） | **PASS**（约束 66736 < 2^18，回填 §5.5） | CI run 31934410549；§5.5 |
+| ① ZK 授权凭证 | `spend_authorization` 完整版（§5.2 九断言 + 正/负向 + 双钥绑定 + 撤销非成员 + intent_hash 字段级绑定） | **PASS**（约束 82742 < 2^18，S-36 全宽化后复测，回填 §5.5） | S-09: CI run 31934410549；S-36: 本机 formal_zk.sh 8/8；§5.5 |
 | ② 聚合器吞吐 | 验签→nonce 去重→预算记账，固定输入满核 | **PASS** 488,738 笔/s（目标 ≥10 万） | `docs/poc/poc-02-aggregator-throughput.md` |
 | ③ 交付证明 | TLSNotary 2-party MPC-TLS 选择性披露见证交付 | **PASS** 四条断言 | `docs/poc/poc-03-delivery-proof.md` |
 

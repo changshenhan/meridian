@@ -18,17 +18,21 @@
 //!   5. delegation.not_before <= now <= delegation.expires_at  // 有效期
 //!   6. delegation_hash[0] > 0                             // 公共锚点非零（S-05）
 //!   7. spend_nonce > 0                                    // 防零 nonce 误用（由断言 9 绑定）
-//!   8. compute_merkle_root(EMPTY, index, path) == revocation_root  // 撤销非成员，叶子=EMPTY
+//!   8. compute_merkle_root(EMPTY, delegation_hash, path) == revocation_root
+//!      // 撤销非成员，叶子=EMPTY；索引 = delegation_hash 全 256-bit LE（S-36 全宽化）
 //!   9. intent_hash == sha256(agent_commit ‖ delegation_hash ‖ recipient ‖ amount_le ‖
 //!      category ‖ spend_nonce_le ‖ expires_at_le)         // 字段级绑定（签名对象 = 该哈希）
 //!
 //! 签名对象：encode_field(intent_hash)（31 字节 LE 截断 → Field，248-bit < BN254 域，
 //! 单射；intent_hash 由断言 9 在电路内完全钉死，无 mod-p 碰撞可乘）。
 //!
-//! 撤销树：深度 32 稀疏 Merkle，叶子=EMPTY(0)，index = delegation_hash[0..4] LE。
-//! std::merkle 已在 Noir 1.0 移出 stdlib → 内联 compute_merkle_root（merkle_insert 模式，
-//! std::hash::pedersen_hash）。原型级碰撞属性（两 delegation 同 32-bit 前缀共享叶子→撤销
-//! 共享）在 SPEC 标注，真实树 S-11 对接 RevocationRegistry 时再设计。
+//! 撤销树：深度 256 稀疏 Merkle，叶子=EMPTY(0)，索引 = delegation_hash 全 32 字节 LE u256
+//! （S-36 全宽化，TECH_SPEC §4.6/§5.3：与聚合器 RevocationSet 同一派生、同一位序）。位 k =
+//! (dh[k/8] >> (k%8)) & 1，按字节现场派生——索引不落单个 Field（BN254 域仅 ~254 bit，容不下
+//! 256-bit 索引；Field::to_le_bits::<256> 直接不可满足，S-36 实测）。std::merkle 已在 Noir 1.0
+//! 移出 stdlib → 内联 compute_merkle_root（merkle_insert 模式，std::hash::pedersen_hash）。
+//! 原型级碰撞属性（两 delegation 同 32-bit 前缀共享叶子→撤销共享）两侧均已收口：
+//! 聚合器 S-34、电路 S-36（回归测试 full_width_index_collides_prefix_only 固化）。
 
 use eddsa::eddsa_verify;
 use poseidon::poseidon::PoseidonHasher;
@@ -39,8 +43,9 @@ use sha256;
 /// 数组长度/数值泛型统一用 `u32`（CI run 31905033362 实测）。
 global MAX_CATEGORIES: u32 = 8;
 
-/// 撤销稀疏 Merkle 树深度（原型；真实树设计见 S-11）。
-global REVOCATION_DEPTH: u32 = 32;
+/// 撤销稀疏 Merkle 树深度 = 撤销索引位数（S-36：全 256-bit，delegation_hash 整体即索引，
+/// 与聚合器 RevocationSet::SPARSE_DEPTH 同值同派生）。
+global REVOCATION_DEPTH: u32 = 256;
 
 /// 断言 3+4+5：预算与有效期约束（拆出以便黑箱测试覆盖正/负两态）。
 fn budget_and_window_ok(
@@ -148,11 +153,16 @@ fn agent_sig_ok(
 
 /// 内联 compute_merkle_root（std::merkle 已移出 Noir 1.0 stdlib；merkle_insert 官方测试
 /// 同款实现，pedersen_hash 为 blackbox 内建）。
-fn compute_merkle_root<let N: u32>(leaf: Field, index: Field, hash_path: [Field; N]) -> Field {
-    let index_bits: [bool; N] = index.to_le_bits();
+/// 索引按字节传入（S-36 全宽化）：位 k = (index[k/8] >> (k%8)) & 1，与聚合器
+/// RevocationSet 同一派生同一位序（LE u256）。索引不落单个 Field——BN254 域仅 ~254 bit，
+/// Field::to_le_bits::<256> 不可满足（S-36 实测），按位现场派生无截断。
+/// N < 256 时只用索引低 N 位（保留泛型以覆盖测试/未来子树场景）。
+fn compute_merkle_root<let N: u32>(leaf: Field, index: [u8; 32], hash_path: [Field; N]) -> Field {
     let mut current = leaf;
     for i in 0..N {
-        let path_bit = index_bits[i];
+        // Noir 移位量与被移对象必须同位宽（u8 >> u32 报 "Integers must have the same
+        // bit width"，S-36 实测）→ 移位量 cast u8（i%8 ≤ 7 无损）。
+        let path_bit = ((index[i / 8] >> ((i % 8) as u8)) & 1) == 1;
         let (hash_left, hash_right) = if path_bit {
             (hash_path[i], current)
         } else {
@@ -163,23 +173,14 @@ fn compute_merkle_root<let N: u32>(leaf: Field, index: Field, hash_path: [Field;
     current
 }
 
-/// 撤销树索引：delegation_hash[0..4] LE 转 u32 → Field。与 gen-witness / core 派生一致。
-fn revocation_index(delegation_hash: [u8; 32]) -> Field {
-    let lo = delegation_hash[0] as u32;
-    let b1 = delegation_hash[1] as u32;
-    let b2 = delegation_hash[2] as u32;
-    let hi = delegation_hash[3] as u32;
-    (lo | (b1 << 8) | (b2 << 16) | (hi << 24)) as Field
-}
-
 /// 断言 8：撤销非成员。delegation_hash 未撤销 ⇔ 其索引处叶子为 EMPTY(0)。
+/// 索引 = delegation_hash 整体（256-bit LE），相异 dh 必走相异叶（S-36 全宽化）。
 fn revocation_ok(
     delegation_hash: [u8; 32],
     revocation_root: Field,
     revocation_path: [Field; REVOCATION_DEPTH],
 ) -> bool {
-    let index = revocation_index(delegation_hash);
-    compute_merkle_root(0, index, revocation_path) == revocation_root
+    compute_merkle_root(0, delegation_hash, revocation_path) == revocation_root
 }
 
 pub fn main(
@@ -254,7 +255,7 @@ pub fn main(
 mod tests {
     use crate::{
         agent_commit_ok, agent_sig_ok, budget_and_window_ok, compute_intent_hash, compute_merkle_root,
-        encode_field, revocation_index, revocation_ok, MAX_CATEGORIES, REVOCATION_DEPTH,
+        encode_field, revocation_ok, MAX_CATEGORIES, REVOCATION_DEPTH,
     };
     use edwards::{bjj::BabyJubJub, Curve, CurveTrait, ScalarField};
     use eddsa::eddsa_to_pub;
@@ -407,20 +408,81 @@ mod tests {
     #[test]
     fn revocation_accepts_built_root_and_rejects_mismatch() {
         let dh = fixture_delegation_hash();
-        let index = revocation_index(dh);
-        // 构造性 root：任意 path + compute_merkle_root 自算 root → revocation_ok 必过
+        // 构造性 root：任意 path + compute_merkle_root 自算 root（索引 = dh 整体）→ 必过
         let mut path = [0; REVOCATION_DEPTH];
         for i in 0..REVOCATION_DEPTH {
             path[i] = (i as Field) * 7 + 1;
         }
-        let root = compute_merkle_root(0, index, path);
+        let root = compute_merkle_root(0, dh, path);
         assert(revocation_ok(dh, root, path));
         // 负例 1：root 被篡改 → false
         assert(!revocation_ok(dh, root + 1, path));
-        // 负例 2：换了 index 的 delegation_hash（同一 root/path）→ false
+        // 负例 2：换了索引的 delegation_hash（同一 root/path）→ false
         let mut other = dh;
         other[0] ^= 0x01;
         assert(!revocation_ok(other, root, path));
+    }
+
+    #[test]
+    fn revocation_index_is_full_le_u256() {
+        // 锁定全宽派生（S-36）：位 k = (dh[k/8] >> (k%8)) & 1，LE 字节序、字节内 LSB 在前。
+        // 每字节只置 1 个位，逐位核对——与聚合器 RevocationSet 位序契约（TECH_SPEC §4.6）。
+        let mut dh = [0u8; 32];
+        for byte_idx in 0..32 {
+            dh[byte_idx] = 0x01;
+        }
+        let mut path = [0; REVOCATION_DEPTH];
+        for i in 0..REVOCATION_DEPTH {
+            path[i] = (i as Field) * 13 + 5;
+        }
+        let root_all_ones = compute_merkle_root(0, dh, path);
+        // 翻转任一字节的位 → 索引变 → 同 path 下根必变（256 位全部参与派生）
+        for byte_idx in 0..32u32 {
+            let mut flipped = [0u8; 32];
+            for b in 0..32u32 {
+                flipped[b] = if b == byte_idx { 0x02 } else { 0x01 };
+            }
+            assert(compute_merkle_root(0, flipped, path) != root_all_ones);
+        }
+        // 位序钉死：bit0 = dh[0] 的 LSB。dh[0] = 0x01（bit0 置位）与 dh[0] = 0x02（bit1 置位）
+        // 在 depth 2 的子树上左右互换 → 根不同。
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        a[0] = 0x01;
+        b[0] = 0x02;
+        assert(compute_merkle_root(0, a, path) != compute_merkle_root(0, b, path));
+    }
+
+    #[test]
+    fn full_width_index_collides_prefix_only() {
+        // S-34 聚合器侧碰撞回归的电路侧镜像（TECH_SPEC §5.3）：两 delegation_hash 同低
+        // 32 位前缀（S-11 原型索引共享叶子）但高位相异——全宽索引下必须走相异叶，
+        // 同一 path 上各自算出的非成员根必须不同（撤销互不串扰）。
+        let mut low_a = [0u8; 32];
+        let mut low_b = [0u8; 32];
+        low_a[0] = 0xAA;
+        low_a[1] = 0xBB;
+        low_a[2] = 0xCC;
+        low_a[3] = 0xDD;
+        low_b[0] = 0xAA;
+        low_b[1] = 0xBB;
+        low_b[2] = 0xCC;
+        low_b[3] = 0xDD;
+        // 高位（第 20 字节）相异：低 32 位索引完全一致
+        low_a[20] = 0x11;
+        low_b[20] = 0x22;
+        let mut path = [0; REVOCATION_DEPTH];
+        for i in 0..REVOCATION_DEPTH {
+            path[i] = (i as Field) * 7 + 1;
+        }
+        // 索引相异（同 path 不同根），且根与各自的 revocation_ok 接线一致
+        let root_a = compute_merkle_root(0, low_a, path);
+        let root_b = compute_merkle_root(0, low_b, path);
+        assert(root_a != root_b);
+        assert(revocation_ok(low_a, root_a, path));
+        assert(revocation_ok(low_b, root_b, path));
+        // 交叉负例：a 的根/路径不能为 b 出具未撤销证明
+        assert(!revocation_ok(low_b, root_a, path));
     }
 
     #[test]

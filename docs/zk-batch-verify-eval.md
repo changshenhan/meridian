@@ -63,7 +63,8 @@ UltraPlonk/UltraHonk 单证明验证成本结构（按量级）：
   （曾评估借 neuralzoo Linux 服务器，老板拍板不部署生产服务器、只用本机。）
 - **门禁真跑**：`smoke_zk.sh` 5/5（prove 98.66MiB → verify ultra_honk 32 线程 →
   公共输入回读 97 fields → 负向篡改正确拒绝）+ `formal_zk.sh` 8/8（gen-witness →
-  prove/verify/公共输入回读(121)/负向篡改/B2/B3/B4 计时 + 约束门禁 66736 < 2^18 →
+  prove/verify/公共输入回读(121)/负向篡改/B2/B3/B4 计时 + 约束门禁 66736 < 2^18（S-09
+  时点；S-36 撤销树全宽化后为 82742 < 2^18，见 TECH_SPEC §5.5）→
   `write_solidity_verifier` UltraKeccakFlavor EVM 验证器）。
 - **B2/B3/B4 参考机实测**（`circuits/bench/baseline_s09.json`，本机不入库）：
 
