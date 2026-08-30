@@ -173,6 +173,18 @@ else
     skip "circuits/target/{proof,vk} 不存在（第 9 步 ZK 被跳过）→ bb-verify e2e 跳过"
 fi
 
+# S-43：真 prover e2e（TECH_SPEC §6.14，prove 侧 TEMPORARY 缝收口）。SDK 委托/意图 +
+# 聚合器撤销集非成员 witness（S-42）→ NoirProver 真电路证明 → BbVerifier 密码学接受。
+# 依赖第 9 步刚产出的 circuits/target/{spend_authorization.json,vk}（bb 字节码 + VK）；
+# 缺失（第 9 步被跳过）则同口径跳过。MERIDIAN_ZK_PROVER_E2E 门控测试本体。
+if [ -f "$ROOT/circuits/target/spend_authorization.json" ] && [ -f "$ROOT/circuits/target/vk" ]; then
+    step "9c/10 noir-prover e2e (S-43, 真证明全链正/负向)"
+    run "noir-prover e2e" env MERIDIAN_ZK_PROVER_E2E=1 cargo test -p meridian-sdk --test noir_prover_e2e
+else
+    step "9c/10 noir-prover e2e (S-43)"
+    skip "circuits/target/{spend_authorization.json,vk} 不存在（第 9 步 ZK 被跳过）→ noir-prover e2e 跳过"
+fi
+
 if [ -f "$ROOT/target/Prover.toml.pregate" ] && ! cmp -s "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"; then
     cp "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"
     printf '    \033[1;33m[CLEAN]\033[0m gen-witness/Prover.toml 已还原（nargo --overwrite-return 改写，return 键不进版本库）\n'

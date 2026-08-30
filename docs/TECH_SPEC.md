@@ -272,9 +272,10 @@ pub fn check_budget(
   `empty_roots[d]`）；目标 dh 已在撤销集时返回 `None`（fail-closed，撤销叶的路径是成员证明、
   不是本接口的语义）。与 `sparse_root()` 同根（同一缓存、同一确定性压实），Rust 侧锚：路径
   重算根（EMPTY 叶 + 逐层兄弟，左/右由索引位定）与 `sparse_root()` 逐例相等、与独立朴素递归
-  建树（目标作为空叶插入）一致；**电路消费交叉锚（Noir `compute_merkle_root` 吃 Rust 产路径
-  重算 == 公共输入根）随真 prover 落地**（下一步候选①，届时 nargo execute 即电路自校验）。
-  prover 侧消费聚合器树出 witness 属候选①「真 prover」范围；③ 根随 epoch 上链与证明生成
+  建树（目标作为空叶插入）一致；**电路消费交叉锚 S-43 已落地**（§6.14 真 prover 步 6：
+  Noir `compute_merkle_root` 吃聚合器产路径重算 == 公共输入根，`nargo execute` 断言 8
+  自校验，e2e 实证）；prover 侧消费聚合器树出 witness 随 §6.14 兑现。
+  残余③：根随 epoch 上链与证明生成
   之间的一致性（SDK 对哪个根出证明、锚定根换代时
   在途证明如何处理）待真 ZK 全集成时定夺。
 
@@ -571,9 +572,9 @@ pub trait Ingest {
 单进程嵌入用）；网络传输是 S-13 框架分发层的接缝。
 
 **诚实边界**：
-- 证明 = `PlaceholderProver`（proof 非空 + 公共输入与信封一致），与聚合器内置
-  `FormatVerifier`（TEMPORARY）配套；真实 S-09 电路 prover 实现 core `SpendProver`
-  经 `SdkClient::with_prover` 接入，`pay()` 重试逻辑不变。
+- 证明 = `PlaceholderProver`（proof 非空 + 公共输入与信封一致，**默认装配**），与聚合器内置
+  `FormatVerifier`（TEMPORARY）配套；真实 S-09 电路 prover = `NoirProver`（S-43，§6.14，
+  实现 core `SpendProver`）经 `SdkClient::with_prover` 显式接入，`pay()` 重试逻辑不变。
 - `NonceManager` 为进程内单调计数，崩溃后不持久化。**跨重启恢复（S-31）**：重启后
   经 `SdkClient::sync_nonce(delegation_hash)` 查询聚合器（§6.7 `GET /v1/nonce`）把本地
   计数推进到 `max(已消耗) + 1` 后再继续支付——否则重启后的新支付从 nonce 0 重发，与
@@ -965,10 +966,11 @@ pi 与信封不一致拒。e2e 由 `MERIDIAN_BB_E2E=1` 门控：verify.sh 第 9 
 
 **诚实边界**：
 
-1. **只收口验证侧，prove 侧未收**：SDK 生产路径的 proof 仍来自 `PlaceholderProver`（格式
-   占位）——`MERIDIAN_VERIFY_BACKEND=bb` 开启后这些 proof **会被全拒**（fail-closed 的正确
-   行为，不是 bug）；真 prover（agent 侧 S-09 电路 prove）实现 core `SpendProver` 是独立
-   交付物。e2e 用 CLI 管线真产物实证密码学通路。
+1. **只收口验证侧，prove 侧 S-43 收口（§6.14）**：SDK 生产路径的 proof 仍来自
+   `PlaceholderProver`（格式占位）——`MERIDIAN_VERIFY_BACKEND=bb` 开启后这些 proof
+   **会被全拒**（fail-closed 的正确行为，不是 bug）；真 prover（agent 侧 S-09 电路 prove）
+   实现 core `SpendProver`（`NoirProver`，§6.14），**默认装配仍为占位后端**（两侧真后端都
+   经显式配置开启才算全链真 ZK）。e2e 用 CLI 管线真产物实证密码学通路。
 2. **CLI 子进程 wrapper 不是 in-process**：进程开销 ~0.77ms（§5.5 延迟分解占 15.5%），单验证
    p99 ~5-8ms 仍在 §5.5 的 10ms 预算线内；100μs/笔 摊薄目标需递归聚合（§5.4 Phase 2，S-18
    实证 BB 原生批验证对本 flavor 不可用）。in-process 封装（`bb_rs`/stdlib 绑定）收益上界
@@ -980,6 +982,84 @@ pi 与信封不一致拒。e2e 由 `MERIDIAN_BB_E2E=1` 门控：verify.sh 第 9 
    账本树根。残余：聚合器尚不产出非成员路径，prover 侧消费聚合器树属下一步候选②。
 4. **每笔验证 = 一次临时目录写盘 + 一次 bb 进程**：吞吐受文件系统与进程 spawn 支配，bb 后端
    不进 perf gate（吞吐基线口径不变）。
+
+### 6.14 真 prover（S-43，agent 侧 `NoirProver`，prove 侧 TEMPORARY 缝收口）
+
+§6.13 诚实边界 1 兑现：SDK 侧真电路证明生成。`meridian-sdk::prover::NoirProver` 实现
+core `SpendProver`，六步链路——Rust 只做纯字节逻辑与进程编排，**一切曲线数学（BJJ 标量乘、
+Poseidon）留在 Noir**（S-05 教训守住）。
+
+**契约变更（core/src/zk.rs）**：
+
+- `SpendProofRequest` 新增 `attestation_secret: [u8; 32]`——BabyJubJub/EdDSA 私钥标量
+  （LE 32B）。Rust 侧当**不透明字节**：只进 Noir oracle 入参与大整数归约，不进任何曲线
+  运算（与 gen-witness `secret: Field` 同一语义）。
+- `revocation_root: [u8; 32]` 升格为 `revocation: RevocationWitness { root, path }`——
+  S-42 聚合器 `RevocationSet::non_membership_witness` 直出，root 与 path **单一来源**
+  （同一棵确定性树），防「根与路径各拿一份」漂移。
+- 新错误码 `E_PROVER`：证明生成失败（工具链不可得 / witness 求解失败 / 交叉校验失配 /
+  撤销 witness 不自洽）。fail-closed，**绝不降级回占位证明**（对齐 §6.13 的
+  `E_VERIFY_BACKEND` 口径）。
+- `attestation_secret` 值域闸：必须是合法 EdDSA 私钥标量（数值 < 子群阶 SUBORDER）——
+  越界值进 oracle 会被 nargo 按 BN254 域模拒绝（Field 反序列化失败），prove 入口前置
+  同一闸给出同一错误码（e2e 实证：`[0x42; 32]` 即越界）。
+
+**prove 链路（六步）**：
+
+1. Rust 算 `zk_intent_hash`（`core::dsa` 纯字节逻辑，第二实现）。
+2. **Noir oracle**：gen-witness 复用为曲线 oracle——`nargo execute oracle
+   --prover-name ProverSDK --overwrite-return`（`--prover-name` 读写包目录下独立的
+   `ProverSDK.toml`，**不碰**正式管线 `Prover.toml`，S-37 的备份还原逻辑不在此依赖；
+   witness 显式命名 `oracle.gz` 不覆盖正式工件）。入参 `revoked_a/b` 填零 = 空撤销集
+   （叶 `encode_field(0) = 0 = EMPTY`），树输出**弃用**——撤销 witness 一律来自聚合器
+   （见步 5）。取 `agent_pub_x/y`、`sig_r/h`、`sig_r8_x/y`。
+3. **Rust 交叉校验**（第三实现锚，镜像 `formal_gen_to_prover.py`）：
+   `agent_commit = sha256(x_le ‖ y_le)`、`intent_hash` 重算 == oracle 输出；任一失配
+   `E_PROVER`。
+4. **签名标量归约**（`sdk/src/prover/scalar.rs`，Rust 大整数、零新依赖）：
+   `s = (r + h·secret) mod SUBORDER`（SUBORDER 254-bit；u64 limb 乘法 + 二进制长除
+   归约）。golden 锚 = `formal_gen_to_prover.py` fixture 的 s（Python 第三实现锁定）。
+   Noir 1.0 无 Field 模运算，归约必须在电路线外做（§6.13 同源决策记录）。
+5. **撤销 witness 自洽**（fail-closed）：`path.len() == 256`（占位口径在步 0 前置闸
+   即拒，不进任何重操作）；用聚合器
+   `noir_pedersen`（pub 导出）从 path + EMPTY 叶重算根 == `revocation.root`（方向约定 =
+   电路 `compute_merkle_root`：索引位 0 → `H(当前 ‖ path[d])`）。已撤销目标在 S-42 接口
+   即返回 `None`，prove 侧不提供绕过路径。
+6. 拼 `circuits/ProverSDK.toml`（公共 + 私有 witness 全量，字段序 = §5.1）→
+   `nargo execute sdkproof`（**电路自校验**：断言 1-9 全过才有 witness——§4.6 残余②尾
+   的「电路消费交叉锚」在此兑现：Noir `compute_merkle_root` 吃聚合器产路径重算，与公共
+   输入 `revocation_root` 对账）→ `bb prove -t evm-no-zk -b target/spend_authorization.json
+   -w target/sdkproof.gz -o target/sdkout`（flavor 与 §6.13 验证侧一致，UltraKeccakFlavor）→
+   proof（8128B）读出 + bb 产 `public_inputs` 与 Rust `serialize_public_inputs` 逐字节
+   比对 → `SpendProof`。
+
+**工程口径**：prove 全程进程级互斥（`Mutex`）——`ProverSDK.toml` 落在包目录，并发证明
+串行化（证明是重操作，可接受）；工具链解析复用 §6.13 三层探测语义（`MERIDIAN_BB_BIN` /
+`MERIDIAN_NARGO_BIN` → PATH → WSL2 兜底 `MERIDIAN_WSL_DISTRO`，Windows 路径经 `/mnt/<盘>/`
+转换），皆不可得 `E_PROVER`。
+
+**验收测试**：单测（scalar golden + 边界、十进制互转、Prover.toml 组装形状、路径重算根）
++ e2e（`sdk/tests/noir_prover_e2e.rs`，`MERIDIAN_ZK_PROVER_E2E=1` 门控）：真实场景
+（SDK 建委托/意图 + 聚合器 `RevocationSet` 含真实撤销条目 → `non_membership_witness`）→
+`NoirProver.prove` → `BbVerifier.verify` **密码学接受**（prove × verify 两侧真后端首次
+闭环）；负向：篡改 proof 拒 / 篡改公共输入拒。接线：verify.sh 第 9 步后挂 **9c**
+（工件依赖 9b 同款：第 9 步产出编译产物与 vk）；CI noir job formal 之后同款。
+
+**诚实边界**：
+
+1. **SDK 默认 prover 不切换**：`SdkClient::new` 仍装配 `PlaceholderProver`，`NoirProver`
+   经 `SdkClient::with_prover` 显式接入（与 §6.13 `MERIDIAN_VERIFY_BACKEND` 缺省 format
+   同口径——生产默认不动，两侧真后端都开才算全链真 ZK）。每笔证明 = 三次子进程
+   （oracle execute + 电路 execute + bb prove，B2 ~0.43s 量级），成本口径见 §5.5；
+   100μs/笔 目标仍归递归聚合（§5.4 Phase 2）。
+2. **attestation 注册流一致性**：`attest()` / `registerDelegation` 仍用外部供给的
+   `AttestationPubKey`；证明公共输入 `agent_commit` 由 oracle 从 `attestation_secret`
+   派生——两处同源（同一 secret）由调用方保证，聚合器登记以公共输入为准（§9）。Rust 侧
+   Jubjub 密钥生成仍是接缝（本件不生成密钥，只消费标量）。
+3. **撤销根换代**：prove 请求的 witness 是聚合器当刻树快照；根随 epoch 上链（§4.6 残余③）
+   与在途证明的一致性处理不在本件。
+4. gen-witness 的 `MAX_REVOKED = 2` 固定撤销集仍只服务正式管线 fixture；真撤销 witness
+   一律来自聚合器 `RevocationSet`（S-42），oracle 的撤销树输出弃用。
 
 ---
 

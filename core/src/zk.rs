@@ -39,6 +39,18 @@ pub struct SpendPublicInputs {
     pub now: u64,
 }
 
+/// 撤销非成员 witness（S-43，TECH_SPEC §6.14）：聚合器 `RevocationSet::
+/// non_membership_witness` 直出，root 与 path 单一来源（同一棵确定性树）。
+///
+/// `path[d]` = 深度 d 层目标索引的兄弟子树根（BE Field 32B，电路 `revocation_path`
+/// witness 同口径）。占位 prover 不消费 `path`（可为空）；真实后端要求
+/// `path.len() == 256` 且能重算出 `root`（§6.14 步 5，fail-closed）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationWitness {
+    pub root: [u8; 32],
+    pub path: Vec<[u8; 32]>,
+}
+
 /// 证明请求（prove 侧入参；聚合器不构造，agent 侧 SDK 用）。
 #[derive(Debug, Clone)]
 pub struct SpendProofRequest<'a> {
@@ -46,7 +58,11 @@ pub struct SpendProofRequest<'a> {
     pub intent: &'a SpendIntent,
     /// agent 签名密钥（possess 证明；真实后端用 attestation 密钥对）。
     pub agent_key: &'a AgentSigningKey,
-    pub revocation_root: [u8; 32],
+    /// attestation 私钥标量（S-43：BabyJubJub/EdDSA，LE 32B）。Rust 侧当不透明字节——
+    /// 只进 Noir oracle 入参与签名标量归约，不进任何曲线运算（TECH_SPEC §6.14）。
+    pub attestation_secret: [u8; 32],
+    /// 撤销非成员 witness（聚合器 S-42 直出）。
+    pub revocation: RevocationWitness,
     pub now: u64,
 }
 

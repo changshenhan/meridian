@@ -53,9 +53,11 @@ let cred = client.attest(&transport_pubkey)?;   // 双钥绑定凭据
 
 ### 诚实边界
 
-- **证明占位**：`PlaceholderProver` + 聚合器 `FormatVerifier`（TEMPORARY）。真实 S-09
-  电路 prover 实现 core `SpendProver`，经 `SdkClient::with_prover` 接入——`pay()` 与
-  重试逻辑不用改。
+- **证明占位（默认装配）**：`PlaceholderProver` + 聚合器 `FormatVerifier`（TEMPORARY）。
+  真实 S-09 电路 prover = `NoirProver`（S-43，`sdk/src/prover.rs`，TECH_SPEC §6.14），
+  实现 core `SpendProver`，经 `SdkClient::with_prover` 接入——`pay()` 与
+  重试逻辑不用改。需本机（或 WSL 兜底）nargo/bb 工具链与仓库 circuits/、gen-witness/
+  工件；后端不可得即 `E_PROVER`（fail-closed，不降级）。
 - **NonceManager 不持久化**：进程崩溃后跨重启的 nonce 恢复经 `SdkClient::sync_nonce`
   （S-31：查询网关 `GET /v1/nonce/{delegation_hash}`，把本地计数推进到 `max(已接受) + 1`
   安全下界）再继续支付；不恢复直接 `pay()` 撞已消耗 nonce（`E_NONCE` 拒绝——不双花，

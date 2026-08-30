@@ -32,6 +32,7 @@ pub mod authorize;
 pub mod error;
 pub mod identity;
 pub mod pay;
+pub mod prover;
 pub mod transport;
 pub mod transport_http;
 pub mod x402;
@@ -54,7 +55,7 @@ use std::sync::RwLock;
 
 use meridian_core::attestation::AttestationPubKey;
 use meridian_core::dsa::{Did, SignedDelegation};
-use meridian_core::zk::SpendProver;
+use meridian_core::zk::{RevocationWitness, SpendProver};
 
 use crate::attest::AttestationCredential;
 use crate::authorize::AuthorizeReceipt;
@@ -72,6 +73,10 @@ pub struct SdkClient {
     /// agent DID 供 pay 构造 intent（`intent.agent == delegation.agent` 绑定）；
     /// SignedDelegation 供 prover 引用（S-09 电路入参）。
     authorized: RwLock<HashMap<[u8; 32], (Did, SignedDelegation)>>,
+    /// attestation 私钥标量（S-43，真 prover 用；占位口径全零不消费）。
+    attestation_secret: [u8; 32],
+    /// 撤销非成员 witness（S-43；None = 占位口径，真 prover 会以 E_PROVER 拒绝）。
+    revocation: Option<RevocationWitness>,
     /// 重试策略（仅传输错误触发）。
     retry: RetryPolicy,
 }
@@ -95,8 +100,21 @@ impl SdkClient {
             nonces: NonceManager::new(),
             delegation_nonce: AtomicU64::new(1),
             authorized: RwLock::new(HashMap::new()),
+            attestation_secret: [0u8; 32],
+            revocation: None,
             retry: RetryPolicy::default(),
         }
+    }
+
+    /// 配置 attestation 私钥标量（S-43：真 prover 的曲线身份来源；Rust 侧不透明字节）。
+    pub fn set_attestation_secret(&mut self, secret: [u8; 32]) {
+        self.attestation_secret = secret;
+    }
+
+    /// 配置撤销非成员 witness（S-43：聚合器 `RevocationSet::non_membership_witness`
+    /// 直出）。新鲜度与根换代的一致性见 TECH_SPEC §6.14 诚实边界 3 / §4.6 残余③。
+    pub fn set_revocation_witness(&mut self, w: RevocationWitness) {
+        self.revocation = Some(w);
     }
 
     /// 覆盖重试策略。
@@ -157,6 +175,19 @@ impl SdkClient {
 
     pub(crate) fn prover(&self) -> &(dyn SpendProver + Send + Sync) {
         &*self.prover
+    }
+
+    pub(crate) fn attestation_secret(&self) -> [u8; 32] {
+        self.attestation_secret
+    }
+
+    /// 撤销 witness（S-43）：None = 占位口径（`root` 全零 + 空 path），只够
+    /// `PlaceholderProver` 用——真 prover 会以 `E_PROVER` 拒绝（fail-closed）。
+    pub(crate) fn revocation_witness(&self) -> RevocationWitness {
+        self.revocation.clone().unwrap_or(RevocationWitness {
+            root: [0u8; 32],
+            path: Vec::new(),
+        })
     }
 
     pub(crate) fn retry(&self) -> &RetryPolicy {

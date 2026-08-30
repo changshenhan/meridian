@@ -110,6 +110,14 @@ jobs:
           export PATH="$HOME/.bb:$PATH"
           MERIDIAN_BB_E2E=1 cargo test -p meridian-aggregator --test bb_verify_e2e
 
+      # S-43（TECH_SPEC §6.14）：真 prover e2e——SDK 侧 NoirProver 出真证明（Noir
+      # oracle + 电路断言 1-9 自校验 + bb prove）× BbVerifier 密码学验证。与本地
+      # verify.sh 步 9c 同一测试；nargo 走 ubuntu 原生 PATH。
+      - name: noir-prover e2e (S-43)
+        run: |
+          export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"
+          MERIDIAN_ZK_PROVER_E2E=1 cargo test -p meridian-sdk --test noir_prover_e2e
+
       - name: upload ZK artifacts (baseline report + EVM verifier)
         uses: actions/upload-artifact@v4
         with:

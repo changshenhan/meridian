@@ -128,7 +128,7 @@ impl SpendProver for PlaceholderProver {
                 category: intent.category,
                 spend_nonce: intent.spend_nonce,
                 expires_at: intent.expires_at,
-                revocation_root: req.revocation_root,
+                revocation_root: req.revocation.root,
                 now: req.now,
             },
         })
@@ -166,7 +166,8 @@ pub(crate) fn pay(client: &SdkClient, params: &PayParams) -> Result<PayReceipt, 
             sd: &sd,
             intent: &intent,
             agent_key: &client.wallet().agent_key,
-            revocation_root: [0u8; 32],
+            attestation_secret: client.attestation_secret(),
+            revocation: client.revocation_witness(),
             now,
         })
         .map_err(SdkError::Meridian)?;
@@ -252,7 +253,11 @@ mod tests {
             sd: &sd,
             intent: &intent,
             agent_key: &wallet.agent_key,
-            revocation_root: [0u8; 32],
+            attestation_secret: [0u8; 32],
+            revocation: meridian_core::zk::RevocationWitness {
+                root: [0u8; 32],
+                path: Vec::new(),
+            },
             now: 1_700_000_000,
         };
         let proof = PlaceholderProver.prove(&req).unwrap();

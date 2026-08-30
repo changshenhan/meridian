@@ -143,6 +143,17 @@ pub struct NonMembershipWitness {
     pub path: Vec<[u8; 32]>,
 }
 
+/// S-43：聚合器产出 → prover 请求消费的契约类型转换（TECH_SPEC §6.14）。
+/// 字段同构（root + BE Field 32B 路径），单一转换点防两处口径漂移。
+impl From<NonMembershipWitness> for meridian_core::zk::RevocationWitness {
+    fn from(w: NonMembershipWitness) -> Self {
+        meridian_core::zk::RevocationWitness {
+            root: w.root,
+            path: w.path,
+        }
+    }
+}
+
 /// 压实树的部分节点缓存：`(深度 d, 该深度节点索引) → 子树根`（d 从 0 叶层到 depth 根层）。
 /// `sparse_root` 与 `non_membership_witness` 共用——保证根与路径出自同一棵确定性树。
 struct NodeCache {

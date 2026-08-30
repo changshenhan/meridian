@@ -25,6 +25,9 @@ pub enum Error {
     /// 真验证后端不可用（S-40：bb 缺失 / 临时目录 / 进程 spawn 失败）——与 EProof 的
     /// 密码学拒绝区分，fail-closed，绝不静默降级回格式校验（TECH_SPEC §6.13）。
     EVerifyBackend,
+    /// 证明生成失败（S-43：nargo/bb 缺失、witness 求解失败、交叉校验失配、撤销 witness
+    /// 不自洽）——fail-closed，绝不降级回占位证明（TECH_SPEC §6.14）。
+    EProver,
 }
 
 impl Error {
@@ -48,6 +51,7 @@ impl Error {
             Error::EAttestBind => "E_ATTEST_BIND",
             Error::EDelegUnknown => "E_DELEG_UNKNOWN",
             Error::EVerifyBackend => "E_VERIFY_BACKEND",
+            Error::EProver => "E_PROVER",
         }
     }
 
@@ -71,6 +75,7 @@ impl Error {
             "E_ATTEST_BIND" => Error::EAttestBind,
             "E_DELEG_UNKNOWN" => Error::EDelegUnknown,
             "E_VERIFY_BACKEND" => Error::EVerifyBackend,
+            "E_PROVER" => Error::EProver,
             _ => return None,
         })
     }
