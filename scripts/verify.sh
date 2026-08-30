@@ -80,6 +80,10 @@ if want monitor; then
     run "monitor build" cargo build -p meridian-monitor --bin meridian-monitor
     W="$(mktemp -u "$ROOT/target/monitor-smoke-XXXXXX.wal")"
     run "monitor --once" cargo run -q -p meridian-monitor --bin meridian-monitor -- --wal "$W" --once
+    # S-39 多副本集群烟测：两个空 WAL 副本 → 集群收敛 ok → exit 0（覆盖集群 CLI/渲染路径）。
+    W1="$(mktemp -u "$ROOT/target/monitor-smoke-XXXXXX.wal")"
+    W2="$(mktemp -u "$ROOT/target/monitor-smoke-XXXXXX.wal")"
+    run "monitor cluster --once" cargo run -q -p meridian-monitor --bin meridian-monitor -- --wal "$W1" --wal "$W2" --once
 else
     skip "monitor"
 fi

@@ -12,11 +12,16 @@
 //! 诚实边界：`rejected` 是会话计数（崩溃恢复后从 0 起）；吞吐为最近一次刮取间隔的均值，
 //! 不是 p99；直方图 p99 是 log2 桶**上界**近似（精确分位数用 `_bucket` 跑
 //! `histogram_quantile`），同样会话口径、不持久化。
+//!
+//! 多实例（S-39）：`cluster.rs` 聚合 N 个热备 WAL 副本（同一逻辑账本取 max，副本分歧
+//! 报 degraded）——口径见 TECH_SPEC §6.12。
 
+pub mod cluster;
 pub mod health;
 pub mod metrics;
 pub mod server;
 
+pub use cluster::{cluster_samples, evaluate_cluster, render_cluster_metrics, ClusterView};
 pub use health::{evaluate, HealthCheck, HealthReport};
 pub use metrics::{render_prometheus, PromSample};
 pub use server::{serve, Report, Reporter};

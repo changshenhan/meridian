@@ -831,6 +831,52 @@ Grafana 侧对 `_bucket` 跑 `histogram_quantile`）。`le` 值以秒记（`2^i 
 **性能账（B5/B6/B8 复测口径）**：埋点代价 = 每次 `submit` 两次 `Instant::now()` +
 1 次 `fetch_add(Relaxed)`，无分支外的新分配。实测影响见 §8.2 B5 注（S-35 回填）。
 
+### 6.12 多实例集群指标聚合（S-39，ops.md §6 挂账项收口）
+
+S-15 起 monitor 只盯一个 WAL；§1 拓扑的「聚合器实例（多实例，热备）+ WAL 副本」部署形态
+缺一个聚合视图。本节兑现：`meridian-monitor --wal <path>` **可重复传**（N ≥ 1），单进程
+逐副本 `restore_from_wal`，一个 `/metrics` + `/healthz` 端点服务整个副本组。
+
+**口径决策（记录在案）**：本件聚合的语义是**热备副本组**——N 个 WAL 是同一逻辑账本的
+副本（§1 拓扑「WAL 副本/多实例」），不是独立分片。因此集群账本类指标取 **max**（最新
+推进副本）而非 sum（sum 会把备份副本双计）；独立分片多实例（每实例独立账本）不属于本
+件口径，各自跑单实例 monitor + Prometheus 侧聚合即可，需求明确后再议。
+
+**健康（`monitor/src/cluster.rs::evaluate_cluster`）**：
+
+- 逐副本跑既有三检查（§3，口径不变），N > 1 时每条 `detail` 前缀
+  `replica=<名字> ` 定位到副本；N = 1 时输出与单实例模式**逐字节一致**（S-39 是加法，
+  不动既有单实例 JSON）。
+- 新增集群级检查 `replicas_converged`（仅 N > 1）：全副本
+  `(accepted_count, revoked_len, revocation_root)` 三元组逐一相等（账本推进 + 撤销承诺
+  都收敛），否则 degraded。**无「可调滞后阈值」**——相等即滞后 0，容忍「落后 N 笔」会把
+  账本分歧常态化（fail-closed）；异步副本复制（跨机）部署的滞后告警走
+  `meridian_cluster_replica_lag` gauge 阈值（§8.3 口径：告警阈值属运营配置，健康判定不放宽）。
+
+**指标（`monitor/src/cluster.rs::cluster_samples`，集群 gauge 不带 `instance` label）**：
+
+| 指标 | 口径 |
+|---|---|
+| `meridian_cluster_instances` | 被监控副本数（`--wal` 个数） |
+| `meridian_cluster_accepted_total` | 副本间 accepted_count **max**（热备组同一逻辑账本，最新推进副本；求和会双计） |
+| `meridian_cluster_replica_lag` | 副本间 accepted_count max−min（备份滞后笔数，0 = 收敛） |
+| `meridian_cluster_pending_sealed` | 副本间最差结算滞后（max，取最差副本） |
+
+**实例标签（诚实边界）**：N > 1 时每副本样本的 `instance` label = **WAL 文件名（stem）**
+——快照里的 `instance_id` 是 `meridian-<monitor 进程 pid>`（§4.1 口径），同一 monitor 进程
+恢复 N 个副本会同值，Prometheus 序列会撞。N = 1 时保持 `instance = <instance_id>` 既有
+行为（Grafana 面板 `label_values(meridian_instance_info, instance)` 不变）。多副本模式要求
+各 WAL 文件名互异（启动即报错退出，不猜）。
+
+**实现（`monitor/src/bin/main.rs`）**：`ReplicaScrape`（每副本聚合器 + 独立 WAL Intent
+计数 + 独立刮取窗口状态）× N + `ClusterReporter` 实现 `Reporter`（`server.rs` 接口不变）；
+`--once` 输出集群 health JSON + 全量 metrics 文本，退出码沿用 0/3（任一副本 degraded 即
+3）。吞吐速率逐副本独立按各自窗口增量推算。
+
+**诚实边界**：集群聚合是**副本组视角**，不是分布式共识监控——副本间分歧只报告（degraded
++ lag gauge），不裁决谁是真值（裁决 = 接管 WAL 人工核对，§5 处置）；每副本吞吐仍是刮取
+窗口均值（§4 口径不变）；`--once` 模式下 N 个副本逐个全量重放 WAL，启动耗时随副本数线性。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）

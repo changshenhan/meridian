@@ -51,12 +51,19 @@ pub fn rate_from_delta(delta_accepted: u64, elapsed_secs: f64) -> f64 {
 
 /// 把一次健康快照渲染成 Prometheus 文本。
 pub fn render_prometheus(s: &HealthSnapshot, ingest_rate: f64) -> String {
-    let info_label = s.instance_id.clone();
+    render_prometheus_labeled(s, ingest_rate, s.instance_id.clone())
+}
+
+/// 多副本模式（S-39）入口：实例标签由调用方给（WAL 文件名 stem）——快照里的
+/// `instance_id` 是 monitor 进程自身 pid（`meridian-<pid>`），同一进程恢复 N 个副本
+/// 会同值撞序列，无法区分。单副本模式走 `render_prometheus`（行为不变）。
+pub fn render_prometheus_labeled(s: &HealthSnapshot, ingest_rate: f64, instance: String) -> String {
+    let info_label = instance.clone();
     let mut out = String::new();
-    for sample in samples(s, ingest_rate, info_label) {
+    for sample in samples(s, ingest_rate, instance) {
         out.push_str(&sample.render());
     }
-    out.push_str(&render_submit_duration(&s.submit_latency, &s.instance_id));
+    out.push_str(&render_submit_duration(&s.submit_latency, &info_label));
     out
 }
 
