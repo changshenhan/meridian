@@ -355,6 +355,307 @@ fn config_roundtrip_and_tenant_loading() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. S-54 租户表热更新（POST /v1/admin/tenants，§6.7 管理面）
+// ---------------------------------------------------------------------------
+
+/// 管理端点 body：租户表全量 JSON（整表替换语义）。
+fn tenants_body(pairs: &[(&str, &str, u64)]) -> Vec<u8> {
+    let items: Vec<String> = pairs
+        .iter()
+        .map(|(k, t, rpm)| format!(r#""{k}":{{"tenant":"{t}","rpm":{rpm}}}"#))
+        .collect();
+    format!("{{{}}}", items.join(",")).into_bytes()
+}
+
+/// 带 admin key 的网关（其余走脚手架缺省）。
+fn admin_gateway(tag: &str, admin: &str, rpm: u64) -> (PathBuf, Gateway) {
+    let (path, agg) = aggregator(tag);
+    let gw = Gateway::with_tenants(agg, tenants_one("k1", "t1", rpm), 64 * 1024)
+        .with_admin_key(Some(admin.to_string()));
+    (path, gw)
+}
+
+/// S-54 主链：接入（401 → 可用）→ 撤销（立即 401）→ 整表替换摘要。
+#[test]
+fn admin_reload_adds_and_revokes_tenant_keys() {
+    let (_p, gw) = admin_gateway("admin-add-revoke", "adm", 1_000);
+
+    // 初始表只有 k1：k2 被 401 挡下。
+    assert_eq!(
+        gw.handle("POST", "/v1/intents", Some("k2"), b"not-json")
+            .status,
+        401
+    );
+
+    // 整表替换：k1 + k2 → 摘要 tenants=2；k2 立即可用（过闸到 JSON 解析 400）。
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/tenants",
+        Some("adm"),
+        &tenants_body(&[("k1", "t1", 1_000), ("k2", "t2", 500)]),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, r#"{"reloaded":true,"tenants":2}"#);
+    let r = gw.handle("POST", "/v1/intents", Some("k2"), b"not-json");
+    assert_eq!(r.status, 400);
+    assert!(r.body.contains(E_MALFORMED));
+
+    // 撤销：新表删掉 k2 → 后续请求立即 401（旧 key 不追溯在途，只管新请求）。
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/tenants",
+        Some("adm"),
+        &tenants_body(&[("k1", "t1", 1_000)]),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, r#"{"reloaded":true,"tenants":1}"#);
+    let r = gw.handle("POST", "/v1/intents", Some("k2"), b"not-json");
+    assert_eq!(r.status, 401);
+    assert!(r.body.contains(E_AUTH));
+    // k1 未动，照常可用。
+    assert_eq!(
+        gw.handle("POST", "/v1/intents", Some("k1"), b"not-json")
+            .status,
+        400
+    );
+}
+
+/// S-54 管理面隔离：admin_key 未配置 = 端点不存在（404 同未路由路径，不泄露管理面）；
+/// key 不符 → 401 E_AUTH；GET 方法 → 404；坏 body → 400；超限 → 413。
+#[test]
+fn admin_endpoint_absent_guarded_and_validated() {
+    // 未配置 admin_key：与 tenant key 相同也不开管理面（两面由构造隔离）。
+    let (_p, agg) = aggregator("admin-off");
+    let gw = Gateway::with_tenants(agg, tenants_one("k1", "t1", 1_000), 64 * 1024);
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/tenants",
+        Some("k1"),
+        &tenants_body(&[("k1", "t1", 1_000)]),
+    );
+    assert_eq!(r.status, 404);
+    assert_eq!(r.body, gw.handle("POST", "/nope", None, b"").body);
+
+    // 配置了 admin_key 的负向面。
+    let (_p, gw) = admin_gateway("admin-neg", "adm", 1_000);
+    // 错 key / 缺 key → 401。
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/tenants",
+        Some("k1"),
+        &tenants_body(&[("k1", "t1", 1_000)]),
+    );
+    assert_eq!(r.status, 401);
+    assert!(r.body.contains(E_AUTH));
+    assert_eq!(
+        gw.handle("POST", "/v1/admin/tenants", None, b"{}").status,
+        401
+    );
+    // GET 方法不路由（404），不是 405 也不是 200。
+    assert_eq!(
+        gw.handle("GET", "/v1/admin/tenants", Some("adm"), b"")
+            .status,
+        404
+    );
+    // 坏 JSON → 400 E_MALFORMED（表未被动）。
+    let r = gw.handle("POST", "/v1/admin/tenants", Some("adm"), b"{not json");
+    assert_eq!(r.status, 400);
+    assert!(r.body.contains(E_MALFORMED));
+    // 字段非法（rpm 缺失）→ 400。
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/tenants",
+        Some("adm"),
+        br#"{"k1":{"tenant":"t1"}}"#,
+    );
+    assert_eq!(r.status, 400);
+    assert!(r.body.contains(E_MALFORMED));
+    // 表仍是初始一张（坏请求不动表）。
+    assert_eq!(
+        gw.handle("POST", "/v1/intents", Some("k1"), b"not-json")
+            .status,
+        400
+    );
+    assert_eq!(
+        gw.handle("POST", "/v1/intents", Some("k2"), b"not-json")
+            .status,
+        401
+    );
+    // body 超限 → 413（max_body=64；用 70 字符的 key 把 body 顶过上限）。
+    let (_p2, gw2) = {
+        let (path, agg) = aggregator("admin-bodycap");
+        (
+            path,
+            Gateway::with_tenants(agg, TenantTable::from_conf(&Default::default()), 64)
+                .with_admin_key(Some("adm".into())),
+        )
+    };
+    let big_body = format!(r#"{{"{}":{{"tenant":"t1","rpm":1}}}}"#, "x".repeat(70)).into_bytes();
+    assert_eq!(
+        gw2.handle("POST", "/v1/admin/tenants", Some("adm"), &big_body)
+            .status,
+        413
+    );
+}
+
+/// S-54 轮换语义：同 tenant id 换 key，**令牌桶不重置**（限流针对租户额度而非密钥
+/// 身份）；换 tenant id 才是新桶。
+#[test]
+fn admin_reload_rotation_keeps_tenant_bucket() {
+    let (_p, gw) = admin_gateway("admin-rotate", "adm", 2);
+
+    // 打空 t1 的桶（rpm=2：两发过闸到 400，第三发 429）。
+    for _ in 0..2 {
+        assert_eq!(
+            gw.handle("POST", "/v1/intents", Some("k1"), b"not-json")
+                .status,
+            400
+        );
+    }
+    assert_eq!(
+        gw.handle("POST", "/v1/intents", Some("k1"), b"not-json")
+            .status,
+        429
+    );
+
+    // 轮换：同 tenant t1 换 key k1 → k2。新 key 过认证后撞的还是 t1 的桶 → 429。
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/tenants",
+        Some("adm"),
+        &tenants_body(&[("k2", "t1", 2)]),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        gw.handle("POST", "/v1/intents", Some("k2"), b"not-json")
+            .status,
+        429,
+        "同租户轮换不重置令牌桶"
+    );
+
+    // 换 tenant id（t2）才是新桶 → 400（过闸进 JSON 解析）。
+    let r = gw.handle(
+        "POST",
+        "/v1/admin/tenants",
+        Some("adm"),
+        &tenants_body(&[("k3", "t2", 2)]),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        gw.handle("POST", "/v1/intents", Some("k3"), b"not-json")
+            .status,
+        400
+    );
+}
+
+/// S-54 并发语义：整表替换原子——热更进行中打到网关的每个请求要么见旧表要么见新表
+/// （400/429 = 认证过，401 = 已被新表撤销），绝不出现 5xx / 撕裂态。
+#[test]
+fn admin_reload_is_atomic_under_concurrent_traffic() {
+    let (_p, agg) = aggregator("admin-concurrent");
+    let gw = Arc::new(
+        Gateway::with_tenants(
+            Arc::clone(&agg),
+            tenants_one("k1", "t1", u64::MAX),
+            64 * 1024,
+        )
+        .with_admin_key(Some("adm".into())),
+    );
+
+    let stop = Arc::new(AtomicU32::new(0));
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let gw = Arc::clone(&gw);
+        let stop = Arc::clone(&stop);
+        workers.push(std::thread::spawn(move || {
+            let mut seen = (0u32, 0u32, 0u32); // (400, 401, 429)
+            while stop.load(Ordering::Relaxed) == 0 {
+                let s = gw
+                    .handle("POST", "/v1/intents", Some("k1"), b"not-json")
+                    .status;
+                match s {
+                    400 => seen.0 += 1,
+                    401 => seen.1 += 1,
+                    429 => seen.2 += 1,
+                    other => panic!("撕裂态：热更期间出现非预期状态 {other}"),
+                }
+            }
+            seen
+        }));
+    }
+
+    // 主线程反复整表替换（撤销 k1 / 接回 k1 交替）；每窗口留 1ms 保证慢机上工作者
+    // 一定能观察到两种表的视图（撤销窗口不是亚毫秒级擦肩）。
+    let add = tenants_body(&[("k1", "t1", u64::MAX)]);
+    let drop = tenants_body(&[("k2", "t2", u64::MAX)]);
+    for i in 0..64 {
+        let body = if i % 2 == 0 { &drop } else { &add };
+        let r = gw.handle("POST", "/v1/admin/tenants", Some("adm"), body);
+        assert_eq!(r.status, 200);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    stop.store(1, Ordering::Relaxed);
+    let mut total_401 = 0;
+    for w in workers {
+        let (ok, revoked, limited) = w.join().expect("worker join");
+        total_401 += revoked;
+        assert!(ok > 0 || revoked > 0 || limited > 0);
+    }
+    // 交替撤销/接回下必然观察到两种表的视图（不是只命中其中一张）。
+    assert!(total_401 > 0, "撤销窗口应被观测到");
+    // 收尾接回 k1，幂等收场。
+    let r = gw.handle("POST", "/v1/admin/tenants", Some("adm"), &add);
+    assert_eq!(r.status, 200);
+}
+
+/// S-54 真 socket 面：管理端点走完整 HTTP 线（POST + body），热更后 SDK 侧新 key 立即
+/// 生效、被撤销 key 401。
+#[test]
+fn admin_reload_over_real_socket() {
+    let (_wal, agg) = aggregator("admin-socket");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let gw = Arc::new(
+        Gateway::with_tenants(
+            Arc::clone(&agg),
+            tenants_one("k1", "t1", u64::MAX),
+            64 * 1024,
+        )
+        .with_admin_key(Some("adm".into())),
+    );
+    std::thread::spawn(move || {
+        let _ = serve(gw, listener, 256, Duration::from_secs(5));
+    });
+
+    // socket 上整表替换：接入 k2。
+    let (status, body) = raw_post(
+        &addr,
+        "/v1/admin/tenants",
+        Some("adm"),
+        &tenants_body(&[("k1", "t1", u64::MAX), ("k2", "t2", u64::MAX)]),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"reloaded":true,"tenants":2}"#);
+
+    // k2 立即可用（走真 HTTP 闸到 JSON 解析 400）。
+    let (status, body) = raw_post(&addr, "/v1/intents", Some("k2"), b"not-json");
+    assert_eq!(status, 400);
+    assert!(body.contains(E_MALFORMED));
+
+    // 撤销 k2 → 401。
+    let (status, _) = raw_post(
+        &addr,
+        "/v1/admin/tenants",
+        Some("adm"),
+        &tenants_body(&[("k1", "t1", u64::MAX)]),
+    );
+    assert_eq!(status, 200);
+    let (status, body) = raw_post(&addr, "/v1/intents", Some("k2"), b"not-json");
+    assert_eq!(status, 401);
+    assert!(body.contains(E_AUTH));
+}
+
+// ---------------------------------------------------------------------------
 // 2. 真 socket e2e：serve + HttpTransport + SdkClient 全链路
 // ---------------------------------------------------------------------------
 

@@ -658,6 +658,7 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
 | GET | `/v1/receipts/{intent_hash}` | 只读回执查询（S-30a，x402 merchant 验证面） | `Aggregator::receipt` |
 | GET | `/v1/nonce/{delegation_hash}` | 只读下一 nonce 查询（S-31，SDK 跨重启恢复） | `Aggregator::next_nonce` |
 | GET | `/v1/revocation-witness/{delegation_hash}` | 只读撤销非成员 witness 查询（S-45，§6.14 SDK 半边） | `Aggregator::revocation_witness` |
+| POST | `/v1/admin/tenants` | 租户表整表热更（撤销/接入/轮换，S-54，admin_key 独立认证） | `Gateway::reload_tenants` |
 | GET | `/healthz` | 网关存活（含内核 `accepted_count` 快照） | — |
 
 **请求/响应（wire，JSON）**：
@@ -744,12 +745,39 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
 **认证与多租户**：
 
 - `Authorization: Bearer <key>`；租户表 = JSON 配置文件（`{"<key>": {"tenant": "<id>",
-  "rpm": <上限>}}`），网关启动时加载。诚实边界：v1 无租户热更新/撤销 UI（重启生效），
-  无密钥轮换端点。
+  "rpm": <上限>}}`），网关启动时加载。运行期可经管理端点整表热更（下节）；配置文件
+  仍是事实源（部署流程 = 改文件 → 调管理端点推送同内容）。
 - **每租户令牌桶**（容量=burst，速率=rpm/60）：std 原子实现，`Mutex<桶态>` 按 tenant
   分桶。超限 → `429 E_RATE_LIMITED`（该请求**未进内核**，无 seq、无记账，可安全重试）。
 - 无/错 key → `401 E_AUTH`。`E_AUTH`/`E_RATE_LIMITED`/`E_MALFORMED` 是**传输层错误码**
   （§11 补充表），不进 core `Error` 内核枚举——内核语义零改动。
+
+**租户表热更新（S-54，`POST /v1/admin/tenants`，管理面）**：
+
+- `Config.admin_key: Option<String>`（serde default，缺省不配置）——**管理面 bearer key，
+  独立于租户表**：不进 `tenants` map，不能作为租户 key 使用（租户闸只查租户表，
+  两面由构造隔离）。缺省不配置时端点**不存在**（404 unknown route，与其它未路由路径
+  同响应——不泄露管理面存在性）。
+- `POST /v1/admin/tenants`，`Authorization: Bearer <admin_key>`，body = 租户表**全量**
+  JSON（`{"<key>": {"tenant": "<id>", "rpm": <n>}}`），语义是**整表替换**（声明式、
+  幂等；不是增量 patch）：
+
+  - 撤销 = 新表删去该 key → 替换后新请求立即 `401 E_AUTH`（在途已认证请求不追溯）；
+  - 接入 = 新表加入新 key；轮换 = 同 tenant id 换 key（**令牌桶按 tenant id 分桶，
+    轮换不重置限流状态**——限流针对租户额度而非密钥身份）；
+  - 热更新 / 撤销 / 轮换是同一操作面（整表替换自然覆盖三者），不设三个端点。
+- 响应 `200 {"reloaded": true, "tenants": <n>}`（`n` = 替换后租户 key 数）。
+  错误映射：body 非法 JSON / 字段缺失 → `400 E_MALFORMED`；body > `max_body_bytes`
+  → `413`；admin key 不符 / 缺失 → `401 E_AUTH`。管理请求**不走租户限流**（admin key
+  不在租户表，本就无从限流；管理面信任边界 = 持有 admin key 者）。
+- **并发语义**：`TenantTable` 由 std `RwLock` 保护——`gate()` 取读锁（读多写少，锁成本
+  相对 JSON 解析可忽略；B8 口径是内核热路径，网关层本就不在约束内，`try_commit` 内核
+  零改动）。替换 = **锁内整体换表**：并发请求要么看到旧表要么看到新表，无中间态
+  （不会出现「认证用旧表、限流用新表」的撕裂读）。
+- **诚实边界**：无管理 UI（端点即全部接口面）；配置文件无自动 watch（推送式——文件
+  变更在调端点前不生效）；admin key 明文传输（§6.7 明文 HTTP 缝未动，管理操作必须在
+  TLS 终结点之后，见部署口径）；空表替换允许（显式「撤销全部租户」，admin key 独立
+  存在故仍可再推恢复）。
 
 **HTTP 状态映射**：
 

@@ -65,9 +65,10 @@ fn main() {
     let listener =
         TcpListener::bind(&cfg.listen).unwrap_or_else(|e| panic!("bind {}: {e}", cfg.listen));
     let tenants = cfg.tenants.len();
+    let admin = if cfg.admin_key.is_some() { "on" } else { "off" };
     let gw = Arc::new(Gateway::new(agg, &cfg));
     eprintln!(
-        "meridian-gateway listening on {} (tenants: {tenants}, max_conn: {})",
+        "meridian-gateway listening on {} (tenants: {tenants}, max_conn: {}, admin: {admin})",
         cfg.listen, cfg.max_connections
     );
     meridian_gateway::http::serve(
