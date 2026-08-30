@@ -99,5 +99,96 @@ WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪�
   max；独立分片多实例不属此口径，各自单实例 monitor + Prometheus 侧聚合）。
 - `deploy --live` 上链（Base Sepolia → 主网）需要真实操作者密钥与 gas，属**外向动作**，
   代码已就绪（dry-run 默认），实际执行等明确指示。
-- `deploy --live` 上链（Base Sepolia → 主网）需要真实操作者密钥与 gas，属**外向动作**，
-  代码已就绪（dry-run 默认），实际执行等明确指示。
+
+## 7. TLS 反代部署（S-56，TECH_SPEC §6.7 部署拓扑节）
+
+网关**恒明文 HTTP**（std-only，无 TLS 栈），生产必须由反代终结 TLS。拓扑：
+
+```text
+公网 :443 (TLS) ──► 反代（终结 TLS）──► 127.0.0.1:9400 meridian-gateway（明文）
+                                      └► 127.0.0.1:9100 meridian-monitor（不进公共反代）
+```
+
+- 网关 `listen` 只绑回环；`0.0.0.0` 直暴露 = 无 TLS、无反代超时缓冲，属部署事故。
+- 反代 → 网关的明文跳必须同机回环或专用内网（同一信任域）。
+- **反代不是认证边界**：网关只认 `Authorization: Bearer`，不读 `X-Forwarded-For` 等
+  代理注入头（伪造不改变判定，gateway 测试钉死）。反代侧按源 IP 限流可加，是额外
+  防护层而非网关语义。
+
+### 7.1 Caddy（最短路径，证书自动管理）
+
+```caddy
+gw.example.com {
+    # 网关只讲 HTTP/1.1 且不支持 chunked 请求——原样透传，不做请求体改写
+    reverse_proxy 127.0.0.1:9400 {
+        flush_interval -1
+        transport http {
+            versions h1
+        }
+    }
+    # 管理面纵深：即使 admin key 泄露，公网也摸不到端点
+    @admin path /v1/admin/tenants
+    respond @admin 403
+}
+# 管理操作走内网专用 listener（运维跳板机）：
+# http://10.0.0.5:9441 { reverse_proxy 127.0.0.1:9400 }
+```
+
+### 7.2 nginx
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name gw.example.com;
+    ssl_certificate     /etc/nginx/certs/gw.crt;
+    ssl_certificate_key /etc/nginx/certs/gw.key;
+
+    # ≥ 网关 max_body_bytes(64 KiB) + 头部余量；代理先 413 抢答是常见误配
+    client_max_body_size 128k;
+    # > 网关 read_timeout_ms(5s)：bb 模式 /v1/intents 含真证明验证，代理先超时
+    # 会把网关还在算的请求断成 5xx
+    proxy_read_timeout   30s;
+    proxy_connect_timeout 5s;
+
+    location / {
+        proxy_pass http://127.0.0.1:9400;
+        proxy_http_version 1.1;              # 网关无 HTTP/2
+        proxy_set_header Connection "";      # 让网关决定 keep-alive
+        # 不要 proxy_request_buffering off / chunked 改写——网关拒 chunked 请求
+    }
+
+    # 管理面 ACL（纵深防御，非认证替代）
+    location /v1/admin/tenants {
+        allow 10.0.0.0/8;
+        deny all;
+        proxy_pass http://127.0.0.1:9400;
+        proxy_http_version 1.1;
+    }
+}
+```
+
+### 7.3 部署清单（首次上线逐项勾）
+
+1. 网关配置 `listen` 确认回环；`admin_key` 已配置（不配置 = 管理端点不存在，S-54）。
+2. 反代证书/域名就绪；网关经**域名**冒烟：`GET /healthz` 200。
+3. 反代 body 上限 ≥ 网关 `max_body_bytes`；读超时 > 网关 `read_timeout_ms`。
+4. `POST /v1/intents` 关闭代理层透明重试（nginx 无此行为；其它代理需确认）。
+5. `/v1/admin/tenants` 反代层 ACL 生效：公网侧打该路径应 403/404，内网跳板可通。
+6. monitor 只回环，Prometheus 从内网刮取 `127.0.0.1:9100/metrics`（或独立内网反代）。
+7. 用真实租户 key 走一次完整 `authorize → pay`（quickstart 链路）确认 TLS 链路不破坏
+   线格式（bearer 头原样到达网关）。
+
+### 7.4 排错映射（症状 → 病灶）
+
+| 症状 | 病灶 |
+|---|---|
+| 合法信封拿 413 但网关日志无记录 | 反代 body 上限 < 64 KiB，代理先 413 抢答 |
+| `POST /v1/intents` 偶发 5xx/504，网关侧无对应错误码 | 代理读超时 < 网关处理时长（bb 模式真证明验证），先断连接 |
+| 请求被 400 `E_MALFORMED`、消息含 chunked | 反代把请求改写成 chunked（网关不支持） |
+| 429 频度远超单租户配额 | 代理层对非幂等 POST 做了重试放大打点，或多 SDK 共用同 key |
+| 公网可打 `/v1/admin/tenants` | 反代 ACL 缺失——admin key 是唯一凭据时纵深为 0 |
+| SDK 报连接断开但网关无错 | 反代 `Connection` 头改写与网关 keep-alive 判定冲突（nginx 需 `proxy_set_header Connection ""`） |
+
+**诚实边界**：本节示例未经参考机实跑验证（本机无 nginx/Caddy）——逐条对照的是网关
+已实测语义（body 上限 / 读超时 / chunked 拒绝 / keep-alive / 代理头非信任，均有测试
+锚定）；首次上线按 §7.3 清单在目标环境实测。无 mTLS；网关不校验 `Host` 头。

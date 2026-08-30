@@ -656,6 +656,99 @@ fn admin_reload_over_real_socket() {
 }
 
 // ---------------------------------------------------------------------------
+// 1c. S-56 反代面：TLS 反代部署口径（TECH_SPEC §6.7 部署拓扑节 / ops.md §7）的测试锚
+//     —— 反代可注入的头部不是信任锚、chunked 请求恒拒。钉的是文档口径里的
+//     「已实测语义」，不是某个具体反代的配置。
+// ---------------------------------------------------------------------------
+
+/// 原始请求发送（不经 raw_post 的固定头模板，伪造代理头 / 非常规分帧用）。
+fn raw_send(addr: &str, req: &str) -> (u16, String) {
+    let mut s = std::net::TcpStream::connect(addr).expect("connect");
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    let status = resp
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse::<u16>().ok())
+        .expect("status line");
+    let body = resp
+        .rsplit_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+#[test]
+fn socket_proxy_headers_are_not_trust_anchors() {
+    let (_p, agg) = aggregator("proxy-hdr");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let gw = Arc::new(
+        Gateway::with_tenants(Arc::clone(&agg), tenants_one("k1", "t1", 2), 64 * 1024)
+            .with_admin_key(Some("adm-secret".to_string())),
+    );
+    std::thread::spawn(move || {
+        let _ = serve(gw, listener, 256, Duration::from_secs(5));
+    });
+
+    // 反代头全给上（伪装回环源 + X-Admin 标记、无 bearer）——管理端点存在但照样 401，
+    // 网络位置/header 不构成凭据（§6.7 部署拓扑节：反代不是认证边界）。
+    let (status, body) = raw_send(
+        &addr,
+        "POST /v1/admin/tenants HTTP/1.1\r\nHost: admin.internal\r\n\
+         X-Forwarded-For: 127.0.0.1\r\nX-Real-IP: 127.0.0.1\r\nX-Admin: yes\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert_eq!(status, 401, "spoofed proxy headers must not grant admin");
+    assert!(body.contains(E_AUTH));
+
+    // 限流按租户 key 分桶，与来源 IP 无关：三个不同 XFF 仍打同一个桶（rpm=2）。
+    for (i, ip) in ["10.0.0.1", "10.0.0.2", "10.0.0.3"].iter().enumerate() {
+        let req = format!(
+            "POST /v1/intents HTTP/1.1\r\nHost: gw.internal\r\n\
+             Authorization: Bearer k1\r\nX-Forwarded-For: {ip}\r\n\
+             Content-Length: 8\r\nConnection: close\r\n\r\nnot-json"
+        );
+        let (status, body) = raw_send(&addr, &req);
+        if i < 2 {
+            assert_eq!(status, 400, "distinct XFF must not bypass tenant bucket");
+            assert!(body.contains(E_MALFORMED));
+        } else {
+            assert_eq!(status, 429, "same tenant key, different XFF = same bucket");
+            assert!(body.contains(E_RATE_LIMITED));
+        }
+    }
+}
+
+#[test]
+fn socket_rejects_chunked_request() {
+    let (_p, _agg) = aggregator("chunked");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let gw = Arc::new(Gateway::with_tenants(
+        Arc::clone(&_agg),
+        tenants_one("k1", "t1", 1_000),
+        64 * 1024,
+    ));
+    std::thread::spawn(move || {
+        let _ = serve(gw, listener, 256, Duration::from_secs(5));
+    });
+
+    // 反代不得把请求改写成 chunked（§6.7 部署拓扑节）——网关 400 后断开，
+    // 反代侧症状 = 400 E_MALFORMED 且消息含 chunked（ops.md §7.4 排错表第 3 行）。
+    let (status, body) = raw_send(
+        &addr,
+        "POST /v1/intents HTTP/1.1\r\nHost: gw.internal\r\n\
+         Authorization: Bearer k1\r\nTransfer-Encoding: chunked\r\n\
+         Connection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    );
+    assert_eq!(status, 400);
+    assert!(body.contains(E_MALFORMED));
+    assert!(body.contains("chunked"));
+}
+
+// ---------------------------------------------------------------------------
 // 2. 真 socket e2e：serve + HttpTransport + SdkClient 全链路
 // ---------------------------------------------------------------------------
 
