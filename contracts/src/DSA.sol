@@ -11,11 +11,23 @@ pragma solidity ^0.8.24;
 ///      登记 delegation_hash → owner 绑定。委托的预算/类别/有效期语义校验在电路
 ///      （S-05）与聚合器（S-10）侧；本合约只锚定哈希→owner，供 RevocationRegistry
 ///      做 onlyOwner 校验。
+/// @dev S-62（TECH_SPEC §6.19）委托→运营者绑定面（P2-2，决策 A/B）：dh → operator
+///      独立映射，**不进 delegation_hash preimage**（改哈希派生会级联炸穿撤销索引
+///      S-34/S-36、SDK 签名语义、电路公共输入与差分 fuzz S-57 全部锚点）。写入只认
+///      owner 私钥（`msg.sender == owners[dh]`）而非注册入参——注册是「任何持有 owner
+///      签名者可发」的许可面，让该签名携带 operator 等于允许第三方替 owner 选分片
+///      运营者（支付路由劫持）。一次性固化：无解绑/改绑路径（TECH_SPEC §6.17.4
+///      不可改绑——改绑窗口内旧账本在途消费不可回滚 = 双花面；迁移 = 撤销 + 重注册）。
 contract DSA {
     event DelegationRegistered(bytes32 indexed delegationHash, address indexed owner);
+    event OperatorBound(bytes32 indexed delegationHash, address indexed owner, address indexed operator);
 
     /// 已注册委托：delegation_hash -> owner。
     mapping(bytes32 => address) public owners;
+
+    /// 运营者绑定（S-62）：delegation_hash -> operator。零地址 = 未绑定（聚合器
+    /// 摄取绑定闸 fail-open 的链上事实源，TECH_SPEC §6.19.2）。
+    mapping(bytes32 => address) public operators;
 
     /// secp256k1 群阶的一半（低位 s 判据，OpenZeppelin ECDSA 同款常量）。
     uint256 private constant SECP256K1N_HALF =
@@ -25,6 +37,10 @@ contract DSA {
     error BadOwnerSignature();
     error HighS();
     error MalformedABI();
+    error NotRegistered(bytes32 delegationHash);
+    error NotDelegationOwner();
+    error AlreadyBound(bytes32 delegationHash);
+    error ZeroOperator();
 
     /// @param delegationABI meridian-core `canonical_delegation` 的原样字节
     ///        （前缀 "DSAv1\0" 6 + agent 20 + owner 20 + 其余字段，owner 定位于 [26:46]）
@@ -65,5 +81,25 @@ contract DSA {
     /// TECH_SPEC §7：委托是否已注册。
     function isRegistered(bytes32 delegationHash) external view returns (bool) {
         return owners[delegationHash] != address(0);
+    }
+
+    /// S-62（§6.19.1）：owner 把已注册委托绑定到分片运营者。一次性固化，调用者必须是
+    /// 委托 owner 本尊（`msg.sender` 判定，非签名转发——选型权钉在 owner 私钥上）。
+    /// 存量委托（绑定面之前注册）由 owner 补绑即可受闸保护，不必重注册（§6.19.1 理由 3）。
+    function bindOperator(bytes32 delegationHash, address operator) external {
+        address owner = owners[delegationHash];
+        if (owner == address(0)) revert NotRegistered(delegationHash);
+        if (msg.sender != owner) revert NotDelegationOwner();
+        // 零地址在本读协议里 = 「未绑定」：绑定为零会把 fail-open 放行语义伪装成已受闸。
+        if (operator == address(0)) revert ZeroOperator();
+        if (operators[delegationHash] != address(0)) revert AlreadyBound(delegationHash);
+
+        operators[delegationHash] = operator;
+        emit OperatorBound(delegationHash, owner, operator);
+    }
+
+    /// 运营者绑定读面（S-62 聚合器摄取闸的 RPC 读目标）：零地址 = 未绑定。
+    function operatorOf(bytes32 delegationHash) external view returns (address) {
+        return operators[delegationHash];
     }
 }

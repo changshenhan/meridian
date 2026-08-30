@@ -487,8 +487,18 @@ pub trait Ingest {
 }
 ```
 
-- 摄入管线：验签（Ed25519 快路径）→ 验证明（§5）→ 预算检查（§4.5）→ 记账 → 入窗口队列。
+- 摄入管线：验签（Ed25519 快路径）→ **运营者绑定闸（S-62，步 4b，§6.19）** → 验证明
+  （§5）→ 预算检查（§4.5）→ 记账 → 入窗口队列。
 - 拒绝原因必须进 `Receipt`，供 agent 端幂等重试（nonce 不允许复用）。
+- **运营者绑定闸（S-62，§6.19.2，Phase 2 P2-2）**：验签之后、验证明之前——意图委托的
+  链上绑定（DSA `operatorOf(dh)`，§6.19.1）**已绑定且 ≠ 本账本运营者** → `E_OPERATOR`
+  拒；**未绑定放行**（决策 B fail-open）；**绑定读面不可得 → `E_BIND_BACKEND` 拒**
+  （fail-closed，绝不静默降级）。绑定不可改 ⇒ 读数进程内永久缓存（每委托一次冷 RPC，
+  热路径一次哈希查找；读失败不进缓存，瞬态下一笔重试）。被拒不耗 nonce / 窗口槽
+  （闸在 `try_commit` 之前），同意图重发走全新校验不被幂等闸缓存的原拒绝命中。位置在
+  验签后：未认证流量不得触发绑定冷读（RPC DoS 放大面收口）。**装配显式**：
+  `Aggregator::with_operator_binding(source, self_operator)`，不装配 = 无闸（缺省口径
+  逐字节不变）；网关 bin 三个环境变量同给同不给（§6.19.3）。
 - **幂等重发（S-12，管线最前闸口）**：同一 `spend_nonce` + 同一 `intent_hash` 的重发
   **在过期检查之前**直接返回既有结果——accepted → 原 `seq`（不重复分配、不重复记账）；
   rejected → 原错误码（不透传成成功）。此闸口在过期检查之前，因此**已过期但曾被接受的
@@ -1538,7 +1548,7 @@ P2-3 定夺**（与跨分片 kind 共享包含验证骨架，边际成本低，�
 | 砖 | 内容 | 依赖 | 规模 |
 |---|---|---|---|
 | **P2-1** | 验证者挑战演练：独立账本复算检出 commit≠settle → 欺诈证明提交工具链，本地 anvil 全链演练（人为错账 → 第三方检出 → challenge → voided + 罚没）。**已落地（S-61，2026-08-31，§6.18）** | 决策 C，**零合约改动** | 小 |
-| **P2-2** | DSA 委托→运营者绑定面（独立映射不进哈希，owner 注册期写入）+ 聚合器摄取绑定闸（Contract 模式 RPC 读）+ 存量委托 fail-open 口径 | 决策 A/B | 中 |
+| **P2-2** | DSA 委托→运营者绑定面（独立映射不进哈希，owner 注册期写入）+ 聚合器摄取绑定闸（Contract 模式 RPC 读）+ 存量委托 fail-open 口径。**已落地（S-62，2026-08-31，§6.19）**——写入形态定夺收窄为「owner 私钥一次性交易 `bindOperator`」（§6.19.1），存量委托由 owner 补绑收窄 fail-open 残余 | 决策 A/B | 中 |
 | **P2-3** | BatchSettler「跨分片消费」欺诈证明 kind +（P2-3 开工时定夺）「过时撤销根」kind | P2-2 | 中 |
 | **P2-4** | OperatorRegistry（append-only 金额调度 + 运营者名册）+ 多实例部署流程与文档 | 决策 D | 中 |
 | **P2-5** | 声誉派生（monitor 面只读指标） | 决策 E | 小 |
@@ -1552,8 +1562,10 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 
 #### 6.17.4 诚实边界
 
-- **P2-1 已落地**（S-61，§6.18）：Rust 验证面 `fraud.rs` + anvil 三幕演练有测试锚定；
-  P2-2..5 仍为设计轮产出，未实现任何合约面。
+- **P2-1 已落地**（S-61，§6.18）：Rust 验证面 `fraud.rs` + anvil 三幕演练有测试锚定。
+- **P2-2 已落地**（S-62，§6.19）：链上绑定面 + 摄取绑定闸 + JSON-RPC 读装配有测试锚定；
+  P2-3..5 仍为设计轮产出，未实现——**跨分片双花的密码学封堵（P2-3 事后 kind）未上线**，
+  绑定闸只挡「绑他方的后续意图」，存量未绑定委托 fail-open 如故（§6.19.5）。
 - **不可改绑**（v1 口径，P2-2 落地时钉进合约）：改绑窗口内旧账本在途意图的预算消费
   不可回滚 = 双花面。迁移路径 = owner 撤销旧委托 + 注册新委托（预算重置的代价由
   owner 承担，链上全程可见）。
@@ -1649,21 +1661,129 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
   `needless_question_mark` / `needless_late_init`）对齐清零（`common.rs` / `bin/deploy.rs`
   顺手修正）。
 
+### 6.19 P2-2 DSA 委托→运营者绑定面（实施，2026-08-31）
+
+**定位**：§6.17 决策 A/B 的实施砖（砖单 P2-2）——分片多运营者的事前强制层。委托在链上
+锚定其唯一运营者，聚合器摄取面拒绝「绑定到其他运营者」的意图，把跨分片双花从
+「事后欺诈证明（P2-3）」前移到「事前不发生」。P2-3 的跨分片欺诈 kind 消费本节绑定映射。
+
+#### 6.19.1 链上绑定面（DSA.sol，定夺记录在案）
+
+- **独立映射，不进哈希 preimage**（决策 B 硬约束）：`DSA.operators: dh → operator` 与
+  `owners` 并列。`dh = sha256(delegationABI)` 派生、SDK 签名语义（owner 对 dh 签名）、
+  电路公共输入、撤销索引（S-34/S-36）、差分 fuzz（S-57）锚点全部不动。
+- **写入定夺：独立一次性 owner 交易，而非扩展 `registerDelegation` 入参**。设计轮原文
+  「owner 在注册期写入」收窄为：`bindOperator(dh, operator)`，`msg.sender == owners[dh]`
+  才可写、写入即固化（无解绑/改绑函数）。三条理由（记录在案）：
+  1. **owner 签名语义逐字节不动**——扩展注册入参需要 owner 对 `(dh, operator)` 联合
+     签名，动 core 签名派生 → 级联 SDK / 电路 / 差分 fuzz 全锚点，违背决策 B 本意；
+  2. **抗抢跑**：`registerDelegation` 是「任何持有 owner 签名者可发」的许可面（签名
+     可离线转发），注册入参带 operator 等于允许持有该签名的任意第三方替 owner 选
+     分片运营者（支付路由劫持面）；`msg.sender == owner` 把选型权钉在 owner 私钥上；
+  3. **存量委托可事后补绑**——注册 ABI 不变，绑定面上线前已注册的委托由 owner 直接
+     补绑即可受闸保护，**不必撤销 + 重注册**（决策 B 的「缓解 = owner 重注册」收窄为
+     「owner 补绑」，预算不重置）。
+- **不可改绑保留**（§6.17.4）：无任何改绑路径。事后**首绑**一张已被其他账本 fail-open
+  服务过的委托，其补绑前的在途意图仍是他分片账本上的既成消费——这是存量 fail-open
+  残余的窄化（窗口从「委托整个剩余有效期」缩到「补绑前」），不是消灭；补绑前的双花
+  面与未绑定态等价，P2-3 的跨分片 kind 对补绑前的消费同样不成立。改绑（换运营者）
+  的迁移路径仍是 owner 撤销旧委托 + 注册新委托 + 绑定。
+- **`operator == address(0)` 构造性禁止**：读协议以零地址表示「未绑定」，绑定为零地址
+  会制造「已绑定却读作未绑定」的谎言面（闸 fail-open 放行语义被伪造）。`ZeroOperator`
+  revert。
+- 读面：`operatorOf(dh) → address`（零地址 = 未绑定，fail-open 语义的链上事实源）。
+  事件 `OperatorBound(dh, owner, operator)` 供监听方增量建表。
+
+#### 6.19.2 聚合器摄取绑定闸（定夺记录在案）
+
+- **事实源与策略分离**：`aggregator/src/binding.rs` 的 `OperatorBinding` trait 只回答
+  链上事实「`operatorOf(dh)` 读数」（`Some` = 已绑定 / `None` = 未绑定，读失败 = Err）；
+  策略（未绑定放行 / 绑他人拒绝 / 读失败 fail-closed）集中在聚合器侧 `BindingGate`，
+  测试一次锚定，不随实现形态漂移。
+- **三态判定（唯一策略点）**：
+  - 未绑定（`None`）→ 放行（决策 B fail-open，有意取舍：fail-closed = 闸上线当天冻结
+    全部存量委托）；
+  - 绑定到其他运营者 → `E_OPERATOR` 拒；
+  - **绑定读面不可得 → `E_BIND_BACKEND` 拒（fail-closed）**——看不到绑定面不等于绑定
+    不存在，与 §6.13 `E_VERIFY_BACKEND`「绝不静默降级」同一纪律。传输错误**不进缓存**
+    （瞬态），下一笔重试读。
+- **不可变绑定读缓存**：绑定一经写入永不改变（6.19.1 无改绑路径）⇒ 读数可永久缓存
+  （`Mutex<HashMap<dh, Option<operator>>>`），每委托只付一次 RPC 冷读，热路径 =
+  一次哈希查找（与「绑定面上线后摄取面每笔多一次链上 RPC」的吞吐灾难划清界限；
+  B8 内核 `try_commit` 零改动）。缓存是**进程内**的：重启后冷缓存，首笔重读——
+  链上事实源不持久化进 WAL（WAL 冻结面纪律，§6.17.3）。
+- **管线位置 = 步 4b（验签后、验证明前）**：绑定冷读是一次网络往返，放在 Ed25519
+  快路径验签**之后**，未认证流量不得触发 RPC 读（DoS 放大面收口）；放在验证器之前，
+  被拒不付真验证成本。被拒不耗 nonce / 窗口槽（与步 2b / 6b 同口径），同意图重发
+  不撞幂等闸缓存的原拒绝（reject 不入 nonce 记录）。
+- **闸的装配是显式的**：`Aggregator::with_operator_binding(source, self_operator)`
+  builder——不装配 = 无闸（缺省口径逐字节不变，占位 / 单运营者形态零改动）；
+  `self_operator` 是本账本运营者地址（20B），装配方（bin / 演练）负责与链上身份一致。
+  测试替身 = `StaticBinding`（进程内映射，无网络）。
+
+#### 6.19.3 网关装配面（JSON-RPC 读实现）
+
+- `gateway/src/binding.rs`：std-only JSON-RPC `eth_call` 客户端（TcpStream 单次 HTTP/1.1，
+  S-59 fanout 客户端同款形态；serde_json 编解码），读 `DSA.operatorOf(bytes32)`——
+  calldata = `selector + 32B dh`，返回 32B ABI 编码取低 20B。RPC error / 短返回 /
+  非 32B 返回一律 Err（fail-closed 上抛成 `E_BIND_BACKEND`）。
+- bin 装配 fail-fast：`MERIDIAN_RPC_URL` + `MERIDIAN_DSA_ADDRESS` +
+  `MERIDIAN_SELF_OPERATOR` **三者同给同不给**——只给其一启动即退（半装配 = 闸语义
+  不明的静默降级面）。url 只收 `http://host:port`（std-only 无 TLS，§6.7 口径）；
+  地址收 `0x` + 20B hex。启动日志 `operator binding: on(<addr>)|off`。
+- **诚实边界**：绑定的实时性 = RPC 节点的事实（读的是最新已确认状态，无最终性/
+  重组防护）——绑定面是授权期一次性写入且不可改，重组窗口内读到未确认值的最坏
+  影响是闸的判定落后一笔，不构成放行已绑定他方的持续路径（缓存固化的是错值时，
+  该委托属配置攻击面 = owner 私钥面，非协议面）。
+
+#### 6.19.4 工件与测试
+
+- `contracts/src/DSA.sol`：`operators` 映射 + `bindOperator` + `operatorOf` + 事件
+  （+4 error / 1 event）；forge 用例：绑定成功 + 事件、四类 revert（未注册 / 非 owner /
+  重绑 / 零地址）、`operatorOf` 读数、不可改绑（绑定后无路径变更）。
+- `aggregator/src/binding.rs`：trait + `BindingGate`（缓存 + 三态）+ `StaticBinding`
+  替身，单测：三态各一、读失败 fail-closed 且不进缓存、缓存命中后源端故障不再读
+  （不可变语义）、被拒不耗 nonce（同意图重发同码）。
+- `gateway/src/binding.rs` + bin 装配 + 本地 fake JSON-RPC socket e2e（绑他人拒 /
+  未绑定放行 / RPC 不可得 `E_BIND_BACKEND`）。
+- core `error.rs` 两新码 `E_OPERATOR` / `E_BIND_BACKEND`（§11 表同步；wire roundtrip
+  全枚举镜像测试补齐）。
+
+#### 6.19.5 诚实边界
+
+- **绑定合谋不在防御内**（决策 B 原文保留）：绑定由 owner 写 ⇒ owner 故意绑错分片
+  （或与运营者合谋）是 §10 授权滥用面，靠 Sybil/声誉（决策 E、L4）缓解，本闸不防。
+- **存量 fail-open 是有意取舍**：未绑定委托不受闸约束（决策 B）；补绑收窄但不消灭
+  （6.19.1）。跨分片双花的密码学封堵 = P2-3 事后 kind（对已绑定委托成立）。
+- 闸只挡「绑他人」，不验证「绑的就是我声称的运营者」之外的事实——运营者身份与
+  BatchSettler 实例的一致性是部署面职责（P2-4 OperatorRegistry 前以配置纪律承担）。
+- **`E_BIND_BACKEND` 的重试面在调用方**：SDK 业务拒绝不自动重试（仅 `E_REV_ROOT` 触发
+  witness 刷新重出）——但被本闸拒的意图 nonce 未消耗、幂等闸不缓存业务拒绝，同意图
+  原样重发是安全的（读面恢复后即过闸）；运维按 ops.md §1 的 RPC 可用性清单部署。
+- 读面无最终性保障（6.19.3）；缓存进程内不持久化（重启冷读，可用性自伤方向安全）。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）
 
 五个合约在 `contracts/src/`（S-11 增 `IntentHelper.sol` / `Merkle.sol` 交叉实现；
-forge test **53 用例**全绿，见 `contracts/README.md`）。签名与语义以代码为准，此处为契约要点。
+forge test **97 用例**全绿，见 `contracts/README.md`）。签名与语义以代码为准，此处为契约要点。
 
 ```solidity
-// DSA.sol —— 委托注册（Contract 模式 + 撤销锚点来源）
+// DSA.sol —— 委托注册（Contract 模式 + 撤销锚点来源）+ 运营者绑定面（S-62，§6.19）
 contract DSA {
     event DelegationRegistered(bytes32 indexed delegationHash, address indexed owner);
+    event OperatorBound(bytes32 indexed delegationHash, address indexed owner, address indexed operator);
     function registerDelegation(bytes calldata delegationABI, bytes calldata ownerSig) external;
+    /// 委托→运营者绑定（§6.19.1）：仅委托 owner 的私钥可写（msg.sender == owners[dh]），
+    /// 一次性固化、不可改绑；operator == 0 拒（零地址 = 未绑定的读协议语义）。
+    function bindOperator(bytes32 delegationHash, address operator) external;
     function ownerOf(bytes32 delegationHash) external view returns (address);
     function isRegistered(bytes32 delegationHash) external view returns (bool);
+    /// 绑定读面：零地址 = 未绑定（聚合器摄取闸 fail-open 语义的事实源）。
+    function operatorOf(bytes32 delegationHash) external view returns (address);
     error AlreadyRegistered(); error BadOwnerSignature(); error HighS(); error MalformedABI();
+    error NotRegistered(); error NotDelegationOwner(); error AlreadyBound(); error ZeroOperator();
 }
 
 // RevocationRegistry.sol —— 独立撤销表（仅 owner 可撤销）
@@ -1967,6 +2087,8 @@ contract BatchSettler {
 | `E_VERIFY_BACKEND` | 真验证后端不可得（S-40，fail-closed 不降级） |
 | `E_PROVER` | 证明生成失败（S-43，fail-closed 不降级） |
 | `E_REV_ROOT` | 证明公共输入 `revocation_root` 不在聚合器撤销状态根集合（S-44 绑定闸，§6.2；仅 `enforce_revocation_root = true` 时触发） |
+| `E_OPERATOR` | 意图委托的链上绑定指向其他运营者（S-62 运营者绑定闸，§6.19.2；未绑定 fail-open 放行） |
+| `E_BIND_BACKEND` | 运营者绑定读面不可得（RPC 失败 / 短返回，S-62，§6.19.2）——fail-closed，绝不按未绑定放行 |
 | `E_BUDGET_PER_SPEND` | 超过单笔上限 |
 | `E_BUDGET_RATE` | 超过窗口速率 |
 | `E_BUDGET_TOTAL` | 超过累计总上限 |

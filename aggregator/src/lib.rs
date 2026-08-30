@@ -14,6 +14,7 @@
 //! - 自写追加式 WAL（`wal.rs`），零重型 DB。
 
 pub mod bb;
+pub mod binding;
 pub mod fraud;
 pub mod health;
 pub mod hist;

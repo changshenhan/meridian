@@ -76,3 +76,81 @@ contract DSATest is Test {
         dsa.registerDelegation(abiBytes, hex"1234");
     }
 }
+
+/// S-62（TECH_SPEC §6.19）：委托→运营者绑定面——owner 私钥一次性写入、不可改绑、
+/// 零地址构造性禁止。聚合器摄取绑定闸（§6.19.2）的链上事实源。
+contract DSABindingTest is Test {
+    DSA internal dsa;
+    uint256 internal ownerPk;
+    address internal owner;
+    bytes internal abiBytes;
+    bytes32 internal dh;
+    address internal operator = makeAddr("operator");
+    address internal other = makeAddr("other");
+
+    function setUp() public {
+        dsa = new DSA();
+        ownerPk = 0xA11CE;
+        owner = vm.addr(ownerPk);
+        (abiBytes, dh) = DelegationHelper.buildDelegation(owner);
+        dsa.registerDelegation(abiBytes, signOwner(dh));
+    }
+
+    function signOwner(bytes32 hash) internal view returns (bytes memory) {
+        (, bytes32 r, bytes32 s) = vm.sign(ownerPk, hash);
+        return abi.encodePacked(r, s);
+    }
+
+    function test_bind_success_and_readback() public {
+        vm.expectEmit();
+        emit DSA.OperatorBound(dh, owner, operator);
+        vm.prank(owner);
+        dsa.bindOperator(dh, operator);
+        assertEq(dsa.operatorOf(dh), operator);
+        // owner 登记不受绑定影响（两映射并列，S-62 独立映射不进哈希 preimage）。
+        assertEq(dsa.ownerOf(dh), owner);
+        assertTrue(dsa.isRegistered(dh));
+    }
+
+    function test_bind_unbound_reads_zero() public {
+        // 未绑定的已注册委托读数 = 零地址（fail-open 语义的事实源，§6.19.2）。
+        assertEq(dsa.operatorOf(dh), address(0));
+    }
+
+    function test_bind_unknown_delegation_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(DSA.NotRegistered.selector, bytes32(uint256(1))));
+        vm.prank(owner);
+        dsa.bindOperator(bytes32(uint256(1)), operator);
+    }
+
+    function test_bind_non_owner_reverts() public {
+        // 注册是许可面（任何持有 owner 签名者可发），绑定不是——选型权钉在 owner 私钥。
+        vm.expectRevert(DSA.NotDelegationOwner.selector);
+        vm.prank(other);
+        dsa.bindOperator(dh, operator);
+    }
+
+    function test_bind_zero_operator_reverts() public {
+        // 零地址 = 读协议的「未绑定」：绑定为零会伪装 fail-open 放行语义（§6.19.1）。
+        vm.expectRevert(DSA.ZeroOperator.selector);
+        vm.prank(owner);
+        dsa.bindOperator(dh, address(0));
+    }
+
+    function test_rebind_reverts() public {
+        vm.startPrank(owner);
+        dsa.bindOperator(dh, operator);
+        vm.expectRevert(abi.encodeWithSelector(DSA.AlreadyBound.selector, dh));
+        dsa.bindOperator(dh, makeAddr("operator2"));
+        vm.stopPrank();
+        // 不可改绑（§6.17.4）：失败路径后读数仍是首绑运营者。
+        assertEq(dsa.operatorOf(dh), operator);
+    }
+
+    function test_bind_owner_self_is_allowed() public {
+        // owner 可绑定自身（单实体形态合法：owner 兼运营者，v1 形态）。
+        vm.prank(owner);
+        dsa.bindOperator(dh, owner);
+        assertEq(dsa.operatorOf(dh), owner);
+    }
+}

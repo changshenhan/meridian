@@ -2,7 +2,9 @@
 //!
 //! 聚合器内核参数沿用默认（IngestConfig::default；bb 验证后端时撤销根绑定闸同步
 //! 开启，S-48 装配面配对闸）+ WAL 路径来自配置 `wal_path`
-//! （缺省 `./gateway.wal`）。生产部署：明文 HTTP，前置反代终结 TLS（§6.7 诚实边界）。
+//! （缺省 `./gateway.wal`）。运营者绑定闸（S-62，§6.19.3）：`MERIDIAN_RPC_URL` +
+//! `MERIDIAN_DSA_ADDRESS` + `MERIDIAN_SELF_OPERATOR` 三者同给同不给（半装配启动即退）。
+//! 生产部署：明文 HTTP，前置反代终结 TLS（§6.7 诚实边界）。
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -60,7 +62,27 @@ fn main() {
     }
     let wal_path = std::env::var("MERIDIAN_GATEWAY_WAL").unwrap_or_else(|_| "gateway.wal".into());
     let wal = Wal::open(std::path::Path::new(&wal_path), 10_000).expect("open wal");
-    let agg = Arc::new(Aggregator::new(ingest_cfg, verifier, wal));
+    let mut agg = Aggregator::new(ingest_cfg, verifier, wal);
+
+    // 运营者绑定闸（S-62，§6.19.3，Phase 2 P2-2）：三环境变量同给同不给——半装配
+    // （只给其一）启动即退 fail-fast，绝不落「闸语义不明」的静默态。未配置 = 无闸
+    // （缺省口径逐字节不变，单运营者形态）。
+    let binding_state = meridian_gateway::binding::parse_binding_env(
+        std::env::var("MERIDIAN_RPC_URL").ok(),
+        std::env::var("MERIDIAN_DSA_ADDRESS").ok(),
+        std::env::var("MERIDIAN_SELF_OPERATOR").ok(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    let binding_on = if let Some((source, self_operator)) = binding_state {
+        agg = agg.with_operator_binding(source, self_operator);
+        true
+    } else {
+        false
+    };
+    let agg = Arc::new(agg);
 
     let listener =
         TcpListener::bind(&cfg.listen).unwrap_or_else(|e| panic!("bind {}: {e}", cfg.listen));
@@ -75,8 +97,10 @@ fn main() {
     }
     let gw = Arc::new(Gateway::new(agg, &cfg));
     eprintln!(
-        "meridian-gateway listening on {} (tenants: {tenants}, max_conn: {}, admin: {admin}, revocation_peers: {peers})",
-        cfg.listen, cfg.max_connections
+        "meridian-gateway listening on {} (tenants: {tenants}, max_conn: {}, admin: {admin}, revocation_peers: {peers}, operator binding: {})",
+        cfg.listen,
+        cfg.max_connections,
+        if binding_on { "on" } else { "off" }
     );
     meridian_gateway::http::serve(
         gw,

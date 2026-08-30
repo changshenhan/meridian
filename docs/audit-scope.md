@@ -12,7 +12,7 @@
 |---|---|---|
 | `BatchSettler.sol` | 持有结算资金（原生 ETH 或 USDC/ERC-20）+ 运营者债券 | **高** |
 | `IntentHelper.sol` / `Merkle.sol` | 欺诈证明的 sha256 Merkle 交叉实现 | 高（安全性依赖与 Rust 侧逐字节一致） |
-| `DSA.sol` | 委托登记（不持资产，但登记错误 → 下游错付） | 中 |
+| `DSA.sol` | 委托登记 + 运营者绑定面（S-62：`dh → operator` 独立映射，owner 私钥一次性写入不可改绑；登记/绑定错误 → 支付路由错分片或闸被伪装绕过） | 中 |
 | `RevocationRegistry.sol` | 撤销锚点 | 中 |
 
 链下交叉一致性（第二审计对象）：
@@ -39,6 +39,13 @@
    退款/claim 付的资产与 `asset` 一致；债券恒原生 ETH 不受 asset 影响。
 6. **重放/延展性**：`registerDelegation` 低位 s 强制；delegation_hash 碰撞面；
    意图跨 epoch 不重复入账。
+9. **运营者绑定面（S-62，TECH_SPEC §6.19）**：`bindOperator` 只认委托 owner 的
+   `msg.sender`（非签名转发——注册是许可面，绑定不是）；一次性固化，无任何改绑/解绑
+   路径；`operator == 0` 构造性禁止（零地址 = 读协议「未绑定」，绑定为零 = 伪装
+   fail-open 放行语义）；绑定不进 `delegation_hash` preimage（改哈希派生会级联炸穿
+   撤销索引/SDK/电路/差分 fuzz 全锚点）。聚合器侧三态判定唯一策略点：未绑定
+   fail-open（决策 B 有意取舍）、绑他方 `E_OPERATOR`、读面不可得 `E_BIND_BACKEND`
+   fail-closed（绝不按未绑定放行）；读失败不进缓存，成功读数永久缓存（不可变语义）。
 7. **算术**：净额求和溢出（uint256）、`msg.value ≥ Σnet` 边界、费用为 0/1 wei 的
    极端净额。
 8. **挑战押金（S-38/S-50）**：押金金额为部署期构造参数 `challengeBond`（immutable，构造期
@@ -85,15 +92,24 @@
   引入 admin/governor 信任面，抬价 = 审查欺诈证明、降零 = 复活垃圾挑战，比金额过时严重
   得多——记录在案，见 TECH_SPEC §6.5）。残余自报：金额不随 gas 价格运行时自适应，随
   Phase 2 多运营者治理结构一起定夺。
+- 运营者绑定面（S-62，TECH_SPEC §6.19）**诚实边界自报**：① 绑定合谋不在防御内——
+  绑定由 owner 写，owner 故意绑错分片（与运营者合谋）是授权滥用面，靠 Sybil/声誉
+  （L4）缓解，本闸不防；② **存量未绑定委托 fail-open**（决策 B 有意取舍）：绑定面上线前
+  已注册的委托不受摄取闸约束，事后**首绑**可收窄残余（不必重注册，预算不重置）但补绑
+  前的在途消费不回溯；③ 聚合器绑定读数缓存**进程内不持久化**且不可变语义（补绑对本
+  进程不可见直至重启——链上是事实源，方向安全）；④ 跨分片双花的密码学封堵
+  （P2-3 事后欺诈 kind）未上线，绑定闸只挡「绑他方的后续意图」。
 
 ## 5. 测试与证据基线（S-58 对齐至 2026-08-31，commit 见 git log）
 
 **合约面（forge）**：
 
-- forge **90/90**（S-38 押金制负向组改 `_challengeRejected` 断言；S-50 押金参数化 2 例；
+- forge **97/97**（S-38 押金制负向组改 `_challengeRejected` 断言；S-50 押金参数化 2 例；
   S-58 覆盖缺口 6 例：claim push 失败回滚可重试 / 挑战者拒收赔付整笔回滚 / kind1 多意图
   → BadFraudKind / kind2 目标行越界 / kind2 混入伪造意图 → BadInclusionProof /
-  withdrawRefund push 失败可重试；USDC 套件含 false 返回与 revert 冒泡两种 token 失败语义）。
+  withdrawRefund push 失败可重试；S-62 绑定面 7 例：成功 + 事件 / 未注册 / 非 owner /
+  重绑 / 零地址 / 未绑定读数零地址 / owner 自绑；USDC 套件含 false 返回与 revert 冒泡
+  两种 token 失败语义）。
 - **invariant fuzz**（2026-08-31，四步路径 ②）：`test/BatchSettlerInvariant.t.sol`
   64 runs × depth 256，三条全局不变量（资金守恒 ghost 记账 / 状态机单调 / voided 后
   claim 必拒），handler 覆盖 commit/settle 三模式/窗口内双路挑战/warp 过窗 claim。
@@ -116,6 +132,10 @@
   （verify.sh 步 10；CI 同款 alloy smoke）+ verifier_drill 三幕验证者挑战演练
   （S-61，镜像复算检出 → challenge 全链：诚实静默 / kind1 漏单 / kind2 低付；
   零合约改动，对账口径见 TECH_SPEC §6.18.6）。
+- 运营者绑定闸（S-62）：聚合器三态判定单测（绑他拒 / 未绑定与自绑放行 / 读失败
+  fail-closed 不进缓存 / 不可变读缓存 / 缺省无闸口径不变）+ gateway 侧 fake JSON-RPC
+  socket e2e（真实 HTTP/1.1 往返：三态 × 短返回 × RPC error × 连接不可得，selector
+  对 `cast sig` 独立锚定，装配三环境变量全或无 fail-fast）。
 
 **ZK/装配面（范围外声明的对照证据）**：
 

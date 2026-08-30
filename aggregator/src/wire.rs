@@ -246,6 +246,8 @@ mod tests {
             Error::EVerifyBackend,
             Error::EProver,
             Error::ERevRoot,
+            Error::EOperator,
+            Error::EBindBackend,
         ] {
             assert_eq!(Error::from_code(e.as_code()), Some(e));
         }

@@ -31,6 +31,12 @@ pub enum Error {
     /// 证明公共输入 `revocation_root` 不在聚合器撤销状态根集合（S-44 撤销根绑定闸，
     /// TECH_SPEC §6.2 / §4.6 残余③）——自选根的装饰性 ZK 拒绝，不耗 nonce / 窗口槽。
     ERevRoot,
+    /// 意图委托的链上绑定指向其他运营者（S-62 运营者绑定闸，TECH_SPEC §6.19.2）——
+    /// 分片多运营者的事前强制层；未绑定委托 fail-open 放行（决策 B 有意取舍）。
+    EOperator,
+    /// 运营者绑定读面不可得（S-62：RPC 失败 / 短返回，TECH_SPEC §6.19.2）——
+    /// fail-closed，绝不按「未绑定」放行（与 E_VERIFY_BACKEND 同一纪律）。
+    EBindBackend,
 }
 
 impl Error {
@@ -56,6 +62,8 @@ impl Error {
             Error::EVerifyBackend => "E_VERIFY_BACKEND",
             Error::EProver => "E_PROVER",
             Error::ERevRoot => "E_REV_ROOT",
+            Error::EOperator => "E_OPERATOR",
+            Error::EBindBackend => "E_BIND_BACKEND",
         }
     }
 
@@ -81,6 +89,8 @@ impl Error {
             "E_VERIFY_BACKEND" => Error::EVerifyBackend,
             "E_PROVER" => Error::EProver,
             "E_REV_ROOT" => Error::ERevRoot,
+            "E_OPERATOR" => Error::EOperator,
+            "E_BIND_BACKEND" => Error::EBindBackend,
             _ => return None,
         })
     }

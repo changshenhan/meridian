@@ -4,7 +4,8 @@
 //! 幂等重发（S-12：同意图同 nonce 已被接受 → 直接返回既有 seq，**最先**——重发时信封可能
 //! 已过期，过期意图仍是已接受意图，不能诱发 SDK 用新 nonce 重发 → 双花）→ 意图有效期 →
 //! 委托查表（未注册拒 `E_DELEG_UNKNOWN`）→ agent 绑定 → Ed25519 验签（证明前的廉价 DoS
-//! 闸门）→ 验证明（`SpendVerifier`，登记以返回值为准）→ 公共输入与信封一致性 → 预留窗口槽
+//! 闸门）→ **运营者绑定闸（S-62 步 4b，§6.19.2：绑他方拒 `E_OPERATOR` / 未绑定放行 /
+//! 读面不可得 `E_BIND_BACKEND`，不可变绑定读缓存）** → 验证明（`SpendVerifier`，登记以返回值为准）→ 公共输入与信封一致性 → 预留窗口槽
 //! → nonce 去重 + 幂等 + 预算检查记账（分片锁内**分配 seq**）→ 定稿（accepted 才入承诺）→
 //! WAL 追加 → 满窗即封。已封 epoch 由 `process_pending` 结算（`lattice::build_epoch`：
 //! 承诺根/净额/净额根 + WAL EpochSeal/Netting 记录 + 上链 seam）。
@@ -507,6 +508,10 @@ pub struct Aggregator {
     /// {空根, 当前根} 口径，在途证明以 `E_REV_ROOT` 拒（拒绝是安全方向）。仅在
     /// `enforce_revocation_root = true` 时维护（闸关闭 = 占位口径，零额外开销）。
     revocation_roots: RwLock<HashSet<[u8; 32]>>,
+    /// 运营者绑定闸（S-62，§6.19.2）：`Some` = 装配了绑定事实源（管线步 4b 生效）；
+    /// `None` = 无闸（缺省口径，单运营者 / 占位形态逐字节不变）。绑定读数缓存在闸内
+    /// （不可变语义），进程内不持久化（WAL 冻结面纪律，链上是事实源）。
+    binding: Option<Arc<crate::binding::BindingGate>>,
     /// 本实例启动时刻（unix 秒；`snapshot()` 健康快照用）。
     started_at: u64,
     /// 实例标识（`meridian-<pid>`；S-15 多实例时每实例一 metrics endpoint）。
@@ -614,12 +619,30 @@ impl Aggregator {
             rejected: AtomicU64::new(0),
             latency: LatencyHistogram::new(),
             revocation_roots: RwLock::new(HashSet::new()),
+            binding: None,
             started_at: now,
             instance_id: format!("meridian-{}", std::process::id()),
             now_fn,
         };
         agg.seed_revocation_roots();
         agg
+    }
+
+    /// 装配运营者绑定闸（S-62，§6.19.2，Phase 2 P2-2）：`source` 是链上绑定事实源
+    /// （进程内 `StaticBinding` / gateway JSON-RPC 实现），`self_operator` 是本账本
+    /// 运营者地址。装配后管线步 4b 生效：绑他方拒 `E_OPERATOR`、未绑定 fail-open、
+    /// 读面不可得 `E_BIND_BACKEND`（fail-closed）。**显式装配**——不调用 = 无闸，
+    /// 缺省口径逐字节不变（单运营者 / 占位形态零改动）。
+    pub fn with_operator_binding(
+        mut self,
+        source: Arc<dyn crate::binding::OperatorBinding + Send + Sync>,
+        self_operator: crate::binding::OperatorAddress,
+    ) -> Self {
+        self.binding = Some(Arc::new(crate::binding::BindingGate::new(
+            source,
+            self_operator,
+        )));
+        self
     }
 
     /// 撤销状态根集合种子（S-44）：空根（账本 genesis 状态，任何账本都真实出现过）+
@@ -889,6 +912,18 @@ impl Aggregator {
         // 4. Ed25519 快路径验签（证明前的廉价 DoS 闸门）。
         if let Err(e) = verify_intent(intent, &env.agent_sig, &reg.agent_pub) {
             return self.reject(ih, e);
+        }
+        // 4b. 运营者绑定闸（S-62，§6.19.2）：分片多运营者的事前强制——预算在账本侧
+        //     ⇒ 分片间超支任何单账本都看不见，封堵锚点是链上绑定映射（DSA operatorOf，
+        //     §6.19.1）。绑他方 → E_OPERATOR；未绑定 → fail-open（决策 B 有意取舍）；
+        //     读面不可得 → E_BIND_BACKEND（fail-closed，绝不按未绑定放行）。位置在验签
+        //     之后：未认证流量不得触发绑定冷读（RPC DoS 放大面收口）；在验证器之前：
+        //     被拒不付真验证成本。闸在 try_commit 之前：被拒不耗 nonce / 窗口槽，同意图
+        //     重发走全新校验（幂等闸不缓存 reject）。绑定不可改 ⇒ 闸内永久缓存冷读数。
+        if let Some(gate) = &self.binding {
+            if let Err(e) = gate.check(&intent.delegation_hash) {
+                return self.reject(ih, e);
+            }
         }
         // 5. 验证明（登记以验证器返回值为准）。
         let pi = match self.verifier.verify(&env.proof) {
@@ -3067,6 +3102,132 @@ mod tests {
             ))
             .accepted
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // S-62：运营者绑定闸（§6.19，Phase 2 P2-2）
+    // -----------------------------------------------------------------------
+
+    /// 读面故障注入替身：`fail` 置真 = 读面不可得（Err）。
+    struct FlakyBinding {
+        inner: crate::binding::StaticBinding,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl FlakyBinding {
+        fn new() -> Self {
+            FlakyBinding {
+                inner: crate::binding::StaticBinding::new(),
+                fail: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl crate::binding::OperatorBinding for FlakyBinding {
+        fn operator_of(&self, dh: &[u8; 32]) -> Result<Option<[u8; 20]>, String> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err("rpc down (injected)".into());
+            }
+            Ok(self.inner.binding_of(dh))
+        }
+    }
+
+    type DynBinding = Arc<dyn crate::binding::OperatorBinding + Send + Sync>;
+
+    fn gate_aggregator(clock: &Arc<AtomicU64>, path: &Path, source: DynBinding) -> Aggregator {
+        // 绑定闸与撤销根绑定闸相互独立：本节用例只关心绑定面，撤销根闸保持缺省。
+        test_aggregator_cfg(test_cfg(), clock, path).with_operator_binding(source, [0xAA; 20])
+    }
+
+    #[test]
+    fn operator_gate_rejects_delegation_bound_to_other_operator() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("opgate-other");
+        let src = Arc::new(FlakyBinding::new());
+        let agg = gate_aggregator(&clock, &path, Arc::clone(&src) as DynBinding);
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        src.inner.bind(dh, [0xBB; 20]); // 他分片运营者
+
+        let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+        let r = agg.submit(&env);
+        assert!(!r.accepted);
+        assert_eq!(r.reject_reason, Some(Error::EOperator));
+        assert_eq!(agg.accepted_count(), 0);
+
+        // 闸在 try_commit 之前：nonce 未消耗 → owner 补绑到本运营者（不可改绑语义下的
+        // 首绑，§6.19.1）后同一意图重交即可接受——幂等闸不缓存 reject。
+        src.inner.bind(dh, [0xAA; 20]);
+        // 缓存已固化旧读数（不可变语义）→ 本进程仍拒：这正是「补绑不回溯本进程」的
+        // 缓存影子（§6.19.5）；绑定必须在委托首次被本账本消费前完成。
+        assert_eq!(agg.submit(&env).reject_reason, Some(Error::EOperator));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_gate_accepts_unbound_and_self_bound_delegations() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("opgate-pass");
+        let src = Arc::new(FlakyBinding::new());
+        let agg = gate_aggregator(&clock, &path, Arc::clone(&src) as DynBinding);
+        let (dh_unbound, _) = register_default(&agg, [1u8; 20]);
+        let (dh_self, _) = register_default(&agg, [2u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        src.inner.bind(dh_self, [0xAA; 20]); // 本运营者自己的委托
+
+        let r1 = agg.submit(&make_env(
+            dh_unbound, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now,
+        ));
+        assert!(r1.accepted, "未绑定委托 fail-open（决策 B 有意取舍）");
+        let r2 = agg.submit(&make_env(
+            dh_self, [2u8; 20], &agent_key, [0xBB; 20], 10, 1, now,
+        ));
+        assert!(r2.accepted, "绑定到本运营者的委托放行");
+        assert_eq!(agg.accepted_count(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_gate_read_failure_is_fail_closed_without_consuming_nonce() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("opgate-fail");
+        let src = Arc::new(FlakyBinding::new());
+        let agg = gate_aggregator(&clock, &path, Arc::clone(&src) as DynBinding);
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+
+        src.fail.store(true, Ordering::Relaxed);
+        let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
+        assert_eq!(agg.submit(&env).reject_reason, Some(Error::EBindBackend));
+        assert_eq!(agg.accepted_count(), 0);
+
+        // 读面恢复（瞬态故障不进缓存，下一笔重试）→ 同意图重交接受；nonce 未被消耗。
+        src.fail.store(false, Ordering::Relaxed);
+        let r = agg.submit(&env);
+        assert!(r.accepted, "读面恢复后同意图重交接受（nonce 未消耗）");
+        assert_eq!(r.seq, 0);
+        assert_eq!(agg.next_nonce(&dh), Some(2));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_gate_absent_keeps_default_semantics() {
+        // 不装配 = 无闸（缺省口径逐字节不变）：即便链上（此处 StaticBinding）已绑他方，
+        // 意图照常接受——单运营者 / 占位形态零改动（S-62 不动生产默认）。
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("opgate-absent");
+        let agg = test_aggregator(&clock, &path);
+        let src = Arc::new(FlakyBinding::new());
+        let (dh, _) = register_default(&agg, [1u8; 20]);
+        src.inner.bind(dh, [0xBB; 20]);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let now = clock.load(Ordering::Relaxed);
+        let r = agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now));
+        assert!(r.accepted, "无闸装配：绑定面不参与判定");
         let _ = std::fs::remove_file(&path);
     }
 }

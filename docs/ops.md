@@ -26,6 +26,16 @@ agent 进程 / 框架         聚合器实例（多实例，热备）          �
   它读到的是 WAL 最后一个持久点，不是实时内存——这是诚实的口径，不是缺陷。
 - **链上**：`DSA` / `RevocationRegistry` / `BatchSettler` 由 `contracts/rust-smoke` 的
   `deploy` 二进制部署（dry-run 兜底 → `--live` 需 `MERIDIAN_OPERATOR_KEY`）。
+- **运营者绑定闸（S-62，TECH_SPEC §6.19）**：网关 bin 三个环境变量**同给同不给**（半装配
+  启动即退）：`MERIDIAN_RPC_URL`（`http://host:port`，std-only 不收 https）+
+  `MERIDIAN_DSA_ADDRESS`（DSA 合约 `0x` + 40 hex）+ `MERIDIAN_SELF_OPERATOR`（本账本
+  运营者地址，须与 BatchSettler 实例的 operator 一致——部署面职责）。绑定写面 =
+  owner 对 `DSA.bindOperator(dh, operator)` 发一次性交易（不可改绑；存量委托由 owner
+  补绑收窄 fail-open 残余，见 §6.19.5）。绑定读数每委托一次冷 RPC 后进程内缓存
+  （不可变语义）；RPC 抖动 = 该笔 `E_BIND_BACKEND` 拒（fail-closed，不进缓存）——
+  **同意图重发是安全的**（闸在 `try_commit` 之前，nonce 未消耗、幂等闸不缓存业务拒绝），
+  重试属调用方/SDK 装配侧职责（SDK 业务拒绝不自动重试，仅 `E_REV_ROOT` 触发刷新重出）；
+  RPC 端点要进部署可用性清单。
 
 ## 2. meridian-monitor 用法
 

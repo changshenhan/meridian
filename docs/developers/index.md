@@ -70,6 +70,14 @@ Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互
   演练，TECH_SPEC §6.18）。诚实边界：验证者**不解决写者单点**（审查/停机/绑合谋），
   只提升「承诺与结算不符」的发现率；纯「承诺根错账」不可挑战（P2-3 撤销根与治理面接管）；
   演练为进程内双实体，不宣称已部署独立验证者网络。
+- **绑定面（P2-2，S-62）**：分片多运营者的事前强制层已落地——DSA `dh → operator`
+  独立绑定映射（owner 私钥一次性写入不可改绑，不进 delegation_hash preimage）+
+  聚合器摄取绑定闸（绑他方 `E_OPERATOR` / 未绑定 fail-open / 读面不可得
+  `E_BIND_BACKEND` fail-closed，读数永久缓存）+ 网关 JSON-RPC 读装配
+  （`MERIDIAN_RPC_URL` + `MERIDIAN_DSA_ADDRESS` + `MERIDIAN_SELF_OPERATOR` 三者同给
+  同不给，TECH_SPEC §6.19）。诚实边界：**存量未绑定委托 fail-open**（决策 B 有意取舍，
+  owner 补绑收窄残余）；绑定合谋（owner 故意绑错分片）不在防御内；跨分片双花的密码学
+  封堵挂 P2-3 事后欺诈 kind——绑定闸只挡「绑他方的后续意图」，不假装已封闭。
 
 ## 仓库结构
 

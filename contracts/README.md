@@ -11,7 +11,8 @@ token / void 退款退 token，债券恒为原生 ETH（TECH_SPEC §7）。
 
 ```
 src/
-  DSA.sol              委托注册（Contract 模式 + 撤销锚点来源）
+  DSA.sol              委托注册（Contract 模式 + 撤销锚点来源）+ 运营者绑定面
+                       （S-62：dh → operator 独立映射，owner 私钥一次性写入不可改绑）
   RevocationRegistry.sol  撤销注册表（仅 owner 可撤销）
   BatchSettler.sol     乐观批量结算 v2（operator 守卫 / commit 锚定撤销根 / settle 存
                        net[]+结算资金 / 延迟 claim / challenge 完整验证 + 罚没；
@@ -21,13 +22,17 @@ src/
 test/
   DelegationHelper.sol   与 meridian-core 逐字节一致的 canonical 编码（测试库）
   InternalHarnesses.sol  外部包装合约，让 vm.expectRevert 能捕获内部库 revert
-  DSA.t.sol              7 个用例
+  DSA.t.sol              14 个用例（注册 7 + S-62 运营者绑定 7：owner 私钥一次性写入/
+                         不可改绑/零地址禁/未绑定读数零地址）
   RevocationRegistry.t.sol 3 个用例
-  BatchSettler.t.sol     31 个用例（挑战正反/去重/跨收款人/窗口/罚没账/void 后 claim）
+  BatchSettler.t.sol     45 个用例（挑战正反/去重/跨收款人/窗口/罚没账/void 后 claim）
   MockUSDC.sol           S-28 测试替身（最小 ERC-20，6 decimals + 黑名单，失败返回 false）
-  BatchSettlerUsdc.t.sol 10 个用例（token 模式 settle 拉款/ETH 禁入/claim/双资产退款/黑名单）
+  BatchSettlerUsdc.t.sol 12 个用例（token 模式 settle 拉款/ETH 禁入/claim/双资产退款/黑名单）
   IntentHelper.t.sol     5 个用例（golden vector 对 Rust 计算值）
   Merkle.t.sol           7 个用例（已知向量对 Rust merkle_root）
+  Differential.t.sol     8 个用例（S-57 跨实现差分：140 golden vectors 四契约镜像）
+  BatchSettlerInvariant.t.sol 3 条全局不变量（S-58 四步路径②：资金守恒/状态机单调/
+                         voided 后 claim 必拒）
 rust-smoke/            alloy Anvil 端到端（S-11d：聚合器 + BatchSettler v2 全链路，三条场景）
 foundry.toml           solc 0.8.24 / cancun / via_ir
 foundry.lock           forge-std v1.9.6（rev 3b20d60）
@@ -62,7 +67,8 @@ S-11 新增两处交叉实现：
 ```bash
 cd contracts
 forge build
-forge test          # 63 用例全绿（31 ETH + 10 USDC + 22 其余）
+forge test          # 97 用例全绿（S-62：注册 7 + 绑定 7 + Revocation 3 + Settler 45
+                    #   + USDC 12 + IntentHelper 5 + Merkle 7 + Differential 8 + Invariant 3）
 cd rust-smoke && cargo run   # anvil 部署 + 全链路（需先 forge build 产出 out/）
 ```
 

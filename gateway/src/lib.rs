@@ -18,6 +18,7 @@
 //! - 部署拓扑（S-56）：TLS 由反代终结（§6.7 部署拓扑节 / ops.md §7）——网关恒明文 +
 //!   回环绑定，反代是信任边界但**不是认证边界**（代理注入头不是信任锚，测试钉死）。
 
+pub mod binding;
 pub mod http;
 
 use std::collections::HashMap;
