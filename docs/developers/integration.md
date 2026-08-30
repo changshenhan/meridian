@@ -28,7 +28,7 @@ use meridian_sdk::{SdkClient, PayParams};
 let mut client = SdkClient::in_process(owner_key, agent_key, limits)?;
 client.authorize()?;                       // 注册 DSA（本地限额校验，错误码透传）
 let receipt = client.pay(&PayParams { recipient, amount, category, spend_nonce, .. })?;
-let cred = client.attest(&transport_pubkey)?;   // 双钥绑定凭据
+let cred = client.attest_identity()?;   // 双钥绑定凭据（NoirProver keyring 同源派生，S-46）
 ```
 
 ### 幂等重试契约（"断线重试不产生双花"）

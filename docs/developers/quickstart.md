@@ -75,8 +75,11 @@ let receipt = client.pay(&PayParams {
 })?;
 // receipt.seq —— 这笔在全网账本里的序号（可作"支付凭证"）
 
-// 3) 双钥绑定凭据：agent 传输身份 ↔ 电路签名公钥
-let cred = client.attest(&transport_pubkey)?;
+// 3) 双钥绑定凭据：agent 传输身份 ↔ 电路签名公钥。真 prover 路径（SdkClient::with_noir
+//    装配 NoirProver）用 attest_identity()：公钥从 attestation_secret 经 Noir 曲线 oracle
+//    派生，与 pay() 证明的 agent_commit 同一来源（S-46 同源自洽）。离线/外部注册流才显式
+//    传公钥：attest(&attestation_pubkey)
+let cred = client.attest_identity()?;
 ```
 
 不需要 Rust？agent 框架走 MCP（第 3 步）即可，5 个工具覆盖 authorize / pay / balance /

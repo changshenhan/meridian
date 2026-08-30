@@ -218,7 +218,7 @@ fn e2e_402_pay_replay_x402_wire() {
     assert!(json.contains(&format!("\"resource\":\"{RESOURCE}\"")));
     assert!(json.contains("\"intentHash\":\"0x"));
     assert!(json.contains("\"seq\":0"));
-    assert!(json.contains("\"spendNonce\":0"));
+    assert!(json.contains("\"spendNonce\":1"));
 
     // 真实记账：恰一笔、金额 = maxAmountRequired、nonce 消耗 1。
     assert_eq!(agg.accepted_count(), 1);
@@ -227,7 +227,7 @@ fn e2e_402_pay_replay_x402_wire() {
 
     // proof ↔ 网关回执（S-30a merchant 验证面）：同一意图、同一 seq。
     assert_eq!(proof.seq, 0);
-    assert_eq!(proof.spend_nonce, 0);
+    assert_eq!(proof.spend_nonce, 1);
     let receipt = agg.receipt(&proof.intent_hash).expect("回执必须可查");
     assert_eq!(receipt.intent_hash, proof.intent_hash);
     assert_eq!(receipt.seq, proof.seq);

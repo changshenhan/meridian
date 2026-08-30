@@ -22,8 +22,11 @@
 //!
 //! # 诚实边界
 //!
-//! - 证明 = [`PlaceholderProver`]（proof 非空 + 公共输入与信封一致），与聚合器内置的
-//!   `FormatVerifier`（TEMPORARY）配套。真实 S-09 电路 prover 实现 `SpendProver` 接入。
+//! - 证明缺省 = [`PlaceholderProver`]（proof 非空 + 公共输入与信封一致），与聚合器内置的
+//!   `FormatVerifier`（TEMPORARY）配套；真电路后端 [`crate::prover::NoirProver`] 经
+//!   [`SdkClient::with_noir`] 显式接入——同一实例兼作 attestation keyring，
+//!   [`SdkClient::attest_identity`] 的凭据承诺与 `pay()` 证明的 agent_commit 同一 secret
+//!   单一来源（S-46 同源自洽，曲线数学仍全在 Noir）。
 //! - `NonceManager` 为进程内单调计数；进程崩溃后不持久化——重启后经 [`SdkClient::sync_nonce`]
 //!   （S-31，聚合器 `GET /v1/nonce` 查询，§6.7）恢复计数再继续支付。
 
@@ -51,7 +54,7 @@ pub use x402::{
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use meridian_core::attestation::AttestationPubKey;
 use meridian_core::dsa::{Did, SignedDelegation};
@@ -64,7 +67,11 @@ use crate::authorize::AuthorizeReceipt;
 pub struct SdkClient {
     wallet: AgentWallet,
     transport: Box<dyn Transport>,
-    prover: Box<dyn SpendProver + Send + Sync>,
+    prover: Arc<dyn SpendProver + Send + Sync>,
+    /// attestation keyring（S-46 同源自洽）：[`crate::prover::NoirProver`] 的 keygen 侧
+    /// （公钥派生）。与 `prover` 同一实例（单 `Arc`，进程级互斥共用）→ `attest_identity()`
+    /// 派生公钥与 `pay()` 证明的 agent_commit 必然同一 secret（§6.14 诚实边界 2）。
+    keyring: Option<Arc<crate::prover::NoirProver>>,
     /// 每委托的单调 nonce（仅定局后推进）。
     nonces: NonceManager,
     /// 委托授权计数（delegation.nonce，防重放）。
@@ -75,6 +82,8 @@ pub struct SdkClient {
     authorized: RwLock<HashMap<[u8; 32], (Did, SignedDelegation)>>,
     /// attestation 私钥标量（S-43，真 prover 用；占位口径全零不消费）。
     attestation_secret: [u8; 32],
+    /// 派生公钥缓存（S-46）：按 secret 键控（secret 变更自动重派生），省重复 oracle 进程。
+    attested_pk: RwLock<Option<([u8; 32], AttestationPubKey)>>,
     /// 撤销非成员 witness（S-43 手动装配 / S-45 自动现取），按 delegation_hash 分桶
     /// ——witness 是 **per-dh 事实**（路径由目标索引决定），跨委托复用会被电路断言 8
     /// 重算根失配拒。无缓存的委托 = 占位口径（真 prover 以 E_PROVER 拒）。
@@ -84,6 +93,28 @@ pub struct SdkClient {
 }
 
 impl SdkClient {
+    fn from_parts(
+        wallet: AgentWallet,
+        transport: Box<dyn Transport>,
+        prover: Arc<dyn SpendProver + Send + Sync>,
+        keyring: Option<Arc<crate::prover::NoirProver>>,
+        attestation_secret: [u8; 32],
+    ) -> Self {
+        SdkClient {
+            wallet,
+            transport,
+            prover,
+            keyring,
+            nonces: NonceManager::new(),
+            delegation_nonce: AtomicU64::new(1),
+            authorized: RwLock::new(HashMap::new()),
+            attestation_secret,
+            attested_pk: RwLock::new(None),
+            revocations: RwLock::new(HashMap::new()),
+            retry: RetryPolicy::default(),
+        }
+    }
+
     /// 默认占位 prover（与聚合器 `FormatVerifier` 配套）。
     pub fn new(wallet: AgentWallet, transport: Box<dyn Transport>) -> Self {
         Self::with_prover(wallet, transport, Box::new(crate::pay::PlaceholderProver))
@@ -95,17 +126,27 @@ impl SdkClient {
         transport: Box<dyn Transport>,
         prover: Box<dyn SpendProver + Send + Sync>,
     ) -> Self {
-        SdkClient {
+        Self::from_parts(wallet, transport, Arc::from(prover), None, [0u8; 32])
+    }
+
+    /// 真 prover 自洽装配（S-46，§6.14 诚实边界 2）：同一 [`crate::prover::NoirProver`]
+    /// 实例同时作为 prove 后端与 attestation keyring（单 `Arc`，进程级互斥共用），
+    /// `attestation_secret` 一并落位——`attest_identity()` 派生公钥与 `pay()` 证明的
+    /// `agent_commit` **同一 secret 单一来源**（调用方不再手工对齐两处身份）。
+    pub fn with_noir(
+        wallet: AgentWallet,
+        transport: Box<dyn Transport>,
+        prover: crate::prover::NoirProver,
+        attestation_secret: [u8; 32],
+    ) -> Self {
+        let prover = Arc::new(prover);
+        Self::from_parts(
             wallet,
             transport,
-            prover,
-            nonces: NonceManager::new(),
-            delegation_nonce: AtomicU64::new(1),
-            authorized: RwLock::new(HashMap::new()),
-            attestation_secret: [0u8; 32],
-            revocations: RwLock::new(HashMap::new()),
-            retry: RetryPolicy::default(),
-        }
+            prover.clone(),
+            Some(prover),
+            attestation_secret,
+        )
     }
 
     /// 配置 attestation 私钥标量（S-43：真 prover 的曲线身份来源；Rust 侧不透明字节）。
@@ -166,8 +207,48 @@ impl SdkClient {
 
     /// 双钥绑定凭据（S-05）：钱包 Ed25519 对 attestation 公钥的绑定签名 + `agent_commit`。
     /// 产出后自校验（防构造错误）；注册进电路是 ZK 集成（S-13+）的接缝。
+    ///
+    /// 显式公钥口径：离线 / 外部注册流（如 mcp-server）传入外部持有的
+    /// `AttestationPubKey`。真 prover 路径请用 [`Self::attest_identity`]——公钥从
+    /// `attestation_secret` 经 Noir 曲线 oracle 派生，与 `pay()` 证明的 agent_commit
+    /// 同一来源（S-46 同源自洽）。
     pub fn attest(&self, pk: &AttestationPubKey) -> Result<AttestationCredential, SdkError> {
         crate::attest::attest(&self.wallet, pk)
+    }
+
+    /// attestation 公钥（S-46 同源派生）：从 `attestation_secret` 经 Noir 曲线 oracle
+    /// 派生（keygen，`NoirProver::attestation_pubkey`，§6.14 诚实边界 2 收口）。keyring
+    /// 未装配（[`Self::new`] / [`Self::with_prover`]）→ `SdkError::Local`；派生结果按
+    /// secret 键控缓存（`set_attestation_secret` 变更后自动重派生，不回陈旧公钥）。
+    pub fn attestation_pubkey(&self) -> Result<AttestationPubKey, SdkError> {
+        let keyring = self.keyring.as_ref().ok_or_else(|| {
+            SdkError::Local(
+                "attestation keyring 未装配：用 SdkClient::with_noir 装配 NoirProver，\
+                 或显式 attest(&pk)"
+                    .into(),
+            )
+        })?;
+        let secret = self.attestation_secret;
+        if let Some((s, pk)) = self.attested_pk.read().expect("attested poisoned").as_ref() {
+            if *s == secret {
+                return Ok(*pk);
+            }
+        }
+        let pk = keyring
+            .attestation_pubkey(secret)
+            .map_err(SdkError::Meridian)?;
+        *self.attested_pk.write().expect("attested poisoned") = Some((secret, pk));
+        Ok(pk)
+    }
+
+    /// 双钥绑定凭据（S-46 同源自洽，§6.14 诚实边界 2 收口）：attestation 公钥从
+    /// `attestation_secret` 经 Noir 曲线 oracle 派生（keygen），绑定签名与承诺出自同一把
+    /// 电路签名身份——`pay()` 经真 prover 产出的证明公共输入 `agent_commit` 与本凭据
+    /// **同一 secret 单一来源**（本件之前该同源性由调用方手工保证）。keyring 未装配 →
+    /// `SdkError::Local`（离线 / 外部注册流用显式 [`Self::attest`]）。
+    pub fn attest_identity(&self) -> Result<AttestationCredential, SdkError> {
+        let pk = self.attestation_pubkey()?;
+        crate::attest::attest(&self.wallet, &pk)
     }
 
     /// 已授权委托数（观测 / 测试）。
@@ -244,7 +325,7 @@ impl SdkClient {
 
     /// S-31 跨重启 nonce 恢复（§6.6）：查询聚合器（`GET /v1/nonce`，§6.7）并把本地
     /// [`NonceManager`] 推进到 `max(本地, 网关值)`，返回生效值。重启后**先调用本方法再
-    /// 继续 `pay()`**——否则新支付从 nonce 0 起，与已消耗集冲突（§6.2 `E_NONCE` 拒绝，
+    /// 继续 `pay()`**——否则新支付从 nonce 1 起，与已消耗集冲突（§6.2 `E_NONCE` 拒绝，
     /// 不双花但不可用）。
     ///
     /// 单进程不重启场景无需调用（`pay()` 语义不变）。本地领先时网关值被忽略——并发

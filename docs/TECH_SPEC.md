@@ -587,6 +587,10 @@ pub trait Ingest {
 **幂等重试契约（"断线重试不产生双花"）**：
 1. 每笔逻辑支付取**固定 `spend_nonce`**，整个重试周期不复用、不推进；只有聚合器返回
    定局（accepted 或永久拒绝）后，下一笔才取新 nonce（`NonceManager`，每委托单调）。
+   **从 1 起（S-46 全链发现）**：电路断言 7 `spend_nonce > 0`（§5.1 防零 nonce 误用）
+   ——0 起使每张委托的**首笔支付在真 prover 下必然 `E_PROVER`**（占位 prover 不消费
+   nonce、聚合器不要求连续，缺口只在全链路暴露）。聚合器只禁复用（§6.2），1 起与
+   已消耗集零冲突。
 2. **仅传输错误**（`SdkError::Transport`）触发重试；聚合器的业务拒绝（`SdkError::Meridian`，
    错误码透传）**永不重试**。
 3. 聚合器侧幂等（§6.2 幂等重发闸口）兜底重发：断线重发返回先前结果 → 不会把同一笔意图
@@ -602,8 +606,10 @@ pub trait Ingest {
   实现 core `SpendProver`）经 `SdkClient::with_prover` 显式接入，`pay()` 重试逻辑不变。
 - `NonceManager` 为进程内单调计数，崩溃后不持久化。**跨重启恢复（S-31）**：重启后
   经 `SdkClient::sync_nonce(delegation_hash)` 查询聚合器（§6.7 `GET /v1/nonce`）把本地
-  计数推进到 `max(已消耗) + 1` 后再继续支付——否则重启后的新支付从 nonce 0 重发，与
+  计数推进到 `max(已消耗) + 1` 后再继续支付——否则重启后的新支付从 nonce 1 重发，与
   聚合器已消耗 nonce 集冲突（§6.2 跨意图复用 = `E_NONCE` 拒绝，不双花但不可用）。
+  空集（聚合器 `next_nonce` = 0）不回退本地 1 起的初值（S-46：`resync` 只取
+  `max(本地, 网关)`，网关 0 < 本地 1 时不动）。
   单进程不重启场景无需调用（`pay()` 语义不变）。
 
 ### 6.7 网络 ingest API（S-29，多租户网关）
@@ -1096,11 +1102,30 @@ Poseidon）留在 Noir**（S-05 教训守住）。
 `MERIDIAN_NARGO_BIN` → PATH → WSL2 兜底 `MERIDIAN_WSL_DISTRO`，Windows 路径经 `/mnt/<盘>/`
 转换），皆不可得 `E_PROVER`。
 
+**keygen（S-46，attestation 同源，诚实边界 2 收口）**：`NoirProver::attestation_pubkey(secret)`
+从 `attestation_secret` 派生 BabyJubJub attestation 公钥——复用步 2 的**同一 oracle 入口**
+（`nargo execute keygen --prover-name ProverSDK --overwrite-return`，witness 工件独立命名
+`target/keygen.gz`，不碰正式管线工件；`--prover-name ProverSDK` 与 prove 同一套临时 toml，
+跑完即清理）：意图入参填零（只消费 `agent_pub_x/y`，签名/撤销树输出弃用——`eddsa_to_pub`
+是 prove 链路同一函数，零漂移）→ Field 大端外形翻 LE（电路 `to_le_bytes` 口径，
+`formal_gen_to_prover.py` 的 `le32` 同款）→ `AttestationPubKey` → 交叉校验
+`core::attestation::agent_commit(pk)` == oracle 口径承诺（锁定 LE 翻转的肢序，失配
+`E_PROVER`）。secret 值域闸（< SUBORDER）与 prove 入口同闸同错误码。曲线数学**仍全在
+Noir**（S-05 教训守住）。装配：`SdkClient::with_noir(wallet, transport, NoirProver, secret)`
+把同一实例同时装配为 prover 与 keyring（单 `Arc`，进程级互斥共用）；`attest_identity()`
+用派生公钥出绑定凭据（派生结果按 secret 键控缓存，secret 变更自动重派生）——`attest()`
+的 `agent_commit` 与 `pay()` 证明公共输入 `agent_commit` **同一 secret 单一来源**，
+「由调用方保证」的接缝关闭（e2e 实证相等）。`attest(&pk)` 显式口径保留（离线 / 外部
+注册流，如 mcp-server）。
+
 **验收测试**：单测（scalar golden + 边界、十进制互转、Prover.toml 组装形状、路径重算根）
 + e2e（`sdk/tests/noir_prover_e2e.rs`，`MERIDIAN_ZK_PROVER_E2E=1` 门控）：真实场景
 （SDK 建委托/意图 + 聚合器 `RevocationSet` 含真实撤销条目 → `non_membership_witness`）→
 `NoirProver.prove` → `BbVerifier.verify` **密码学接受**（prove × verify 两侧真后端首次
-闭环）；负向：篡改 proof 拒 / 篡改公共输入拒。接线：verify.sh 第 9 步后挂 **9c**
+闭环）；负向：篡改 proof 拒 / 篡改公共输入拒。**S-46 同源全链**（同文件同门控）：
+`with_noir` + `attest_identity` → `pay()` 真证明 → 进程内聚合器（`BbVerifier` +
+`enforce_revocation_root`，§6.2 绑定闸开启）接受，且 `attest_identity().agent_commit ==
+直接 prove 的公共输入 agent_commit`（同源实证）。接线：verify.sh 第 9 步后挂 **9c**
 （工件依赖 9b 同款：第 9 步产出编译产物与 vk）；CI noir job formal 之后同款。
 
 **诚实边界**：
@@ -1110,10 +1135,15 @@ Poseidon）留在 Noir**（S-05 教训守住）。
    同口径——生产默认不动，两侧真后端都开才算全链真 ZK）。每笔证明 = 三次子进程
    （oracle execute + 电路 execute + bb prove，B2 ~0.43s 量级），成本口径见 §5.5；
    100μs/笔 目标仍归递归聚合（§5.4 Phase 2）。
-2. **attestation 注册流一致性**：`attest()` / `registerDelegation` 仍用外部供给的
-   `AttestationPubKey`；证明公共输入 `agent_commit` 由 oracle 从 `attestation_secret`
-   派生——两处同源（同一 secret）由调用方保证，聚合器登记以公共输入为准（§9）。Rust 侧
-   Jubjub 密钥生成仍是接缝（本件不生成密钥，只消费标量）。
+2. **attestation 同源性 S-46 收口（SDK 内自洽装配）**：`NoirProver::attestation_pubkey`
+   从 `attestation_secret` 经 Noir 曲线 oracle 派生公钥（`eddsa_to_pub`，与 prove 链路
+   同一函数零漂移，曲线数学不进 Rust），`SdkClient::with_noir` 把同一实例装配为
+   prover + keyring，`attest_identity()` 出绑定凭据——`attest()` 的 `agent_commit` 与
+   `pay()` 证明公共输入同源由构造保证（本件之前「由调用方保证」的接缝关闭）。Rust 侧
+   Jubjub 密钥生成接缝同步关闭（keygen 也是 Noir）。残余：**熵来源（secret 的生成）由
+   调用方供给**——SDK 不生成随机熵（不引入 rand 依赖），keygen 入口只做值域闸（<
+   SUBORDER，非法标量 `E_PROVER` fail-closed）；显式 `attest(&pk)` 口径保留（mcp-server
+   等外部注册流），聚合器登记以公共输入为准（§9）。
 3. **撤销根换代**：prove 请求的 witness 是聚合器当刻树快照。**S-44（§4.6 残余③聚合器
    半边）收口绑定语义**：聚合器侧撤销根绑定闸（§6.2，`enforce_revocation_root`）接受
    本账本出现过的全部撤销状态根——换代窗口内的在途证明（旧状态 witness）不被换代本身

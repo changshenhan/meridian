@@ -26,6 +26,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use meridian_aggregator::bb::{serialize_public_inputs, VERIFIER_TARGET};
 use meridian_aggregator::noir_pedersen::{pedersen_hash2, Fe};
+use meridian_core::attestation::{agent_commit, AttestationPubKey};
 use meridian_core::dsa::zk_intent_hash;
 use meridian_core::error::Error;
 use meridian_core::zk::{
@@ -142,6 +143,24 @@ fn probe(bin: &str, flag: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// oracle 字节入参 TOML 形态 = 逐字节 hex（gen-witness Prover.toml 同款）。
+fn bytes_toml(bs: &[u8]) -> String {
+    let items: Vec<String> = bs.iter().map(|b| format!("0x{b:02x}")).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// attestation_secret 值域闸（§6.14 契约）：必须是合法 EdDSA 私钥标量（数值 < 子群阶
+/// SUBORDER）。越界值进 oracle 会被 nargo 按 BN254 域模拒绝（Field 反序列化失败）——
+/// prove / keygen 入口前置同一闸给出同一错误码（e2e 实证：`[0x42; 32]` 即越界）。
+fn validate_attestation_secret(secret: &[u8; 32]) -> Result<(), Error> {
+    let s = U256::from_le_bytes(secret);
+    if s.cmp_to(&U256 { limbs: SUBORDER }) != core::cmp::Ordering::Less {
+        eprintln!("[noir-prover] attestation_secret 越出 EdDSA 子群阶（非合法私钥标量）");
+        return Err(Error::EProver);
+    }
+    Ok(())
+}
+
 fn wsl_probe(distro: &str) -> bool {
     Command::new("wsl.exe")
         .args([
@@ -239,14 +258,8 @@ impl NoirProver {
         req: &SpendProofRequest,
         cleanup: &mut Cleanup,
     ) -> Result<OracleOut, Error> {
-        let d = &req.intent.delegation_hash;
         // attestation_secret = 标量的 LE 不透明字节（§6.14 契约口径）→ 数值（十进制）。
         let secret = to_decimal(U256::from_le_bytes(&req.attestation_secret));
-        // 字节入参 = 逐字节 hex（gen-witness Prover.toml 同款）；标量 = 带引号十进制。
-        let bytes_toml = |bs: &[u8]| -> String {
-            let items: Vec<String> = bs.iter().map(|b| format!("0x{b:02x}")).collect();
-            format!("[{}]", items.join(", "))
-        };
         let toml = format!(
             "secret = \"{secret}\"\n\
              delegation_hash = {}\n\
@@ -257,7 +270,7 @@ impl NoirProver {
              expires_at = \"{}\"\n\
              revoked_a = {}\n\
              revoked_b = {}\n",
-            bytes_toml(d),
+            bytes_toml(&req.intent.delegation_hash),
             bytes_toml(&req.intent.recipient),
             req.intent.amount,
             bytes_toml(&req.intent.category),
@@ -266,19 +279,76 @@ impl NoirProver {
             bytes_toml(&[0u8; 32]),
             bytes_toml(&[0u8; 32]),
         );
+        // witness 显式命名 `oracle`：不覆盖正式管线工件（formal_zk 产 gen_witness.gz）。
+        self.run_oracle_with(&toml, "oracle", cleanup)
+    }
+
+    /// keygen（S-46，§6.14 诚实边界 2 收口）：从 attestation_secret 派生 BabyJubJub
+    /// attestation 公钥——复用 prove 链路步 2 的同一 oracle 入口（意图入参填零，只消费
+    /// `agent_pub_x/y`，签名/撤销树输出弃用；`eddsa_to_pub` 是 prove 链路同一函数，零漂移），
+    /// **曲线数学仍全在 Noir**（S-05 教训守住）。`SdkClient::with_noir` 装配后，`attest()`
+    /// 的 agent_commit 与 `pay()` 证明公共输入 agent_commit 同一 secret 单一来源。
+    pub fn attestation_pubkey(&self, secret: [u8; 32]) -> Result<AttestationPubKey, Error> {
+        validate_attestation_secret(&secret)?;
+        // 与 prove 共用进程级互斥：ProverSDK.toml 同一临时文件，不允许并发写。
+        let _serial = self.lock()?;
+        let mut cleanup = Cleanup { files: Vec::new() };
+        let toml = format!(
+            "secret = \"{}\"\n\
+             delegation_hash = {}\n\
+             recipient = {}\n\
+             amount = \"0\"\n\
+             category = {}\n\
+             spend_nonce = \"0\"\n\
+             expires_at = \"0\"\n\
+             revoked_a = {}\n\
+             revoked_b = {}\n",
+            to_decimal(U256::from_le_bytes(&secret)),
+            bytes_toml(&[0u8; 32]),
+            bytes_toml(&[0u8; 20]),
+            bytes_toml(&[0u8; 32]),
+            bytes_toml(&[0u8; 32]),
+            bytes_toml(&[0u8; 32]),
+        );
+        // witness 独立命名 `keygen`：不覆盖正式管线 / prove 链路工件。
+        let oracle = self.run_oracle_with(&toml, "keygen", &mut cleanup)?;
+        let pk = AttestationPubKey {
+            // oracle 标量出参是 Field 的 32B 大端外形，AttestationPubKey 是 LE（电路
+            // to_le_bytes 口径）——先翻转再出（`formal_gen_to_prover.py` 的 le32 同款）。
+            x: le32(&oracle.agent_pub_x),
+            y: le32(&oracle.agent_pub_y),
+        };
+        // 交叉校验：core 的 agent_commit（规范口径 sha256(x_le ‖ y_le)）必须与 oracle
+        // 口径承诺一致——锁定 LE 翻转的肢序（S-41 坑②同源错位在此 fail-closed）。
+        if agent_commit(&pk) != oracle_commit(&oracle) {
+            eprintln!("[noir-prover] keygen 公钥承诺交叉校验失配（E_PROVER）");
+            return Err(Error::EProver);
+        }
+        Ok(pk)
+    }
+
+    /// oracle 执行（步 2 共用体）：写包目录 `ProverSDK.toml` → `nargo execute <witness>`
+    /// （`--prover-name ProverSDK` 独立 toml，不碰正式管线 `Prover.toml`）→ 解析
+    /// `[return]` 节。witness 名由调用方给定（prove 链路 `oracle` / keygen `keygen`），
+    /// 均不覆盖正式管线工件（formal_zk 产 gen_witness.gz）。
+    fn run_oracle_with(
+        &self,
+        toml: &str,
+        witness_name: &str,
+        cleanup: &mut Cleanup,
+    ) -> Result<OracleOut, Error> {
         let oracle_toml = self.gen_witness_dir.join("ProverSDK.toml");
-        std::fs::write(&oracle_toml, &toml).map_err(|e| {
+        std::fs::write(&oracle_toml, toml).map_err(|e| {
             eprintln!("[noir-prover] write oracle ProverSDK.toml failed: {e}");
             Error::EProver
         })?;
         cleanup.push(oracle_toml);
 
-        // witness 显式命名 `oracle`：不覆盖正式管线工件（formal_zk 产 gen_witness.gz）。
         let out = self.shell.run(
             "nargo",
             &[
                 "execute",
-                "oracle",
+                witness_name,
                 "--prover-name",
                 "ProverSDK",
                 "--overwrite-return",
@@ -503,13 +573,8 @@ impl SpendProver for NoirProver {
             );
             return Err(Error::EProver);
         }
-        // attestation_secret 必须是合法 EdDSA 私钥标量（< 子群阶）：越界值进 oracle 会被
-        // nargo 按域模拒绝（BN254 Field 反序列化失败）——这里前置同一闸给出同一错误码。
-        let secret = U256::from_le_bytes(&req.attestation_secret);
-        if secret.cmp_to(&U256 { limbs: SUBORDER }) != core::cmp::Ordering::Less {
-            eprintln!("[noir-prover] attestation_secret 越出 EdDSA 子群阶（非合法私钥标量）");
-            return Err(Error::EProver);
-        }
+        // attestation_secret 值域闸（§6.14 契约）：非法标量不进 oracle（fail-closed）。
+        validate_attestation_secret(&req.attestation_secret)?;
 
         // 步 2：Noir oracle（曲线数学全在 Noir）。
         let oracle = self.run_oracle(req, &mut cleanup)?;
@@ -777,6 +842,22 @@ mod tests {
             verify_revocation_witness(&[0u8; 32], &w),
             Err(Error::EProver)
         );
+    }
+
+    #[test]
+    fn attestation_secret_gate_rejects_out_of_suborder() {
+        // 值域闸（S-46 起 prove / keygen 入口共用）：[0x42; 32] 远超 EdDSA 子群阶
+        // （e2e 实证会被 nargo 按 BN254 域模拒）→ E_PROVER；小标量合法（0 < secret）。
+        assert_eq!(
+            validate_attestation_secret(&[0x42u8; 32]),
+            Err(Error::EProver)
+        );
+        let mut s = [0u8; 32];
+        s[0] = 0xEF;
+        s[1] = 0xBE;
+        s[2] = 0xAD;
+        s[3] = 0xDE;
+        assert!(validate_attestation_secret(&s).is_ok());
     }
 
     #[test]

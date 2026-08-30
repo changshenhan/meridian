@@ -11,19 +11,33 @@
 //! （bb 字节码）与 `circuits/target/vk`；缺失则显式打印跳过原因（不静默成功）。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use meridian_aggregator::bb::{BbBackend, BbVerifier};
+use meridian_aggregator::ingest::{Aggregator, IngestConfig};
 use meridian_aggregator::revocation::RevocationSet;
+use meridian_aggregator::wal::Wal;
+use meridian_core::attestation::agent_commit;
 use meridian_core::error::Error;
 use meridian_core::zk::{SpendProofRequest, SpendProver, SpendVerifier};
 use meridian_sdk::identity::{create_delegation, AgentWallet, DelegationLimits};
 use meridian_sdk::prover::NoirProver;
+use meridian_sdk::{InProcessAggregator, PayParams, SdkClient};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("sdk/ 的上级即仓库根")
         .to_path_buf()
+}
+
+/// prove 重操作串行锁（测试文件内）：NoirProver 的进程级互斥是**实例级**（自有 `Mutex`），
+/// 而临时 witness 文件 `gen-witness/ProverSDK.toml` / `circuits/ProverSDK.toml` 是**路径级
+/// 共享**——两条 prove 测试并行跑会互相踩写。cargo test 默认并行，必须在测试体串行。
+static PROVE_LOCK: Mutex<()> = Mutex::new(());
+
+fn prove_guard() -> std::sync::MutexGuard<'static, ()> {
+    PROVE_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn artifact(root: &Path, rel: &str, why: &str) -> Option<Vec<u8>> {
@@ -42,6 +56,8 @@ fn noir_prover_e2e_real_proof_via_aggregator_revocation() {
         println!("SKIP: MERIDIAN_ZK_PROVER_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
         return;
     }
+    // 临时 witness 文件路径级共享（见 PROVE_LOCK 注释）——跨测试串行。
+    let _prove_serial = prove_guard();
     let root = repo_root();
     let _bytecode = match artifact(
         &root,
@@ -204,4 +220,154 @@ fn noir_prover_fails_closed_without_revocation_witness() {
         }
         Err(e) => assert_eq!(e, Error::EProver, "工具链缺失 = 构造期 E_PROVER"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// S-46：SDK pay() × NoirProver 全链路（attest 同源自洽装配，§6.14 诚实边界 2 收口）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sdk_pay_full_path_with_noir_prover_and_attested_identity() {
+    if std::env::var("MERIDIAN_ZK_PROVER_E2E").as_deref() != Ok("1") {
+        println!("SKIP: MERIDIAN_ZK_PROVER_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
+        return;
+    }
+    let _prove_serial = prove_guard();
+    let root = repo_root();
+    let _bytecode = match artifact(
+        &root,
+        "circuits/target/spend_authorization.json",
+        "formal_zk 未跑",
+    ) {
+        Some(b) => b,
+        None => return,
+    };
+    let vk = match artifact(&root, "circuits/target/vk", "formal_zk 未跑") {
+        Some(b) => b,
+        None => return,
+    };
+    let backend = match BbBackend::detect() {
+        Some(b) => b,
+        None => {
+            println!("SKIP: bb 工具链不可得（Windows 原生与 WSL 兜底皆无）");
+            return;
+        }
+    };
+
+    // ——— 进程内聚合器：BbVerifier（§6.13）+ 撤销根绑定闸（§6.2，S-44）———
+    let wal_path =
+        std::env::temp_dir().join(format!("meridian-sdk-noir-pay-{}.wal", std::process::id()));
+    let _ = std::fs::remove_file(&wal_path);
+    let wal = Wal::open(&wal_path, 1_000).expect("open wal");
+    let verifier = BbVerifier::from_parts(vk, backend, root.join("target/bb-sdk-pay-e2e"));
+    let agg = Arc::new(Aggregator::new(
+        IngestConfig {
+            enforce_revocation_root: true,
+            ..Default::default()
+        },
+        Box::new(verifier),
+        wal,
+    ));
+    // 撤销另一张委托：撤销集非空 → 绑定闸接受集含真实状态根（非退化空根口径）。
+    let mut other = [0x7Au8; 32];
+    other[31] = 0x03;
+    agg.revoke(other);
+
+    // ——— SDK 自洽装配（S-46）：同一 NoirProver 兼作 prove 后端与 attestation keyring———
+    let wallet = AgentWallet::from_seed([0xB7u8; 32]);
+    let owner_key = meridian_core::dsa::owner_signing_key_from_bytes([0x11u8; 32]);
+    let limits = DelegationLimits {
+        max_per_spend: 5_000,
+        rate_window_secs: 60,
+        rate_max_per_window: 20_000,
+        total_cap: 100_000,
+        categories: vec![],
+        not_before: 1_700_000_000,
+        expires_at: 1_900_000_000,
+    };
+    let prover = NoirProver::from_repo_root(&root).expect("noir 工具链可得（原生或 WSL 兜底）");
+    let secret = {
+        // attestation 私钥标量（LE 不透明字节）= 0xDEADBEEF（< EdDSA 子群阶，合法私钥）。
+        let mut s = [0u8; 32];
+        s[0] = 0xEF;
+        s[1] = 0xBE;
+        s[2] = 0xAD;
+        s[3] = 0xDE;
+        s
+    };
+    let client = SdkClient::with_noir(
+        wallet.clone(),
+        Box::new(InProcessAggregator::from_inner(Arc::clone(&agg))),
+        prover,
+        secret,
+    );
+    let rec = client
+        .authorize(&owner_key, [0x0Bu8; 20], &limits)
+        .expect("authorize");
+    let dh = rec.delegation_hash;
+
+    // 同源凭据：公钥由 keygen 从 attestation_secret 经 Noir 曲线 oracle 派生。
+    let cred = client
+        .attest_identity()
+        .expect("keygen 派生 + 绑定自校验（S-46）");
+    let pk = client.attestation_pubkey().expect("派生缓存命中");
+    assert_eq!(cred.agent_commit, agent_commit(&pk));
+
+    // pay 全链：witness 自动现取（S-45）→ NoirProver 真证明 → BbVerifier 密码学验证 +
+    // 绑定闸接受（enforce_revocation_root = true，witness 取自同一账本树）。
+    let receipt = client
+        .pay(&PayParams {
+            delegation_hash: dh,
+            recipient: [0x9Cu8; 20],
+            amount: 4_200,
+            category: [0xC0; 32],
+            memo: None,
+            expires_at: 1_800_000_000,
+        })
+        .unwrap_or_else(|e| panic!("pay 全链失败（prove / 验证 / 绑定闸）: {e:?}"));
+    assert_eq!(receipt.seq, 0);
+    assert!(
+        receipt.spend_nonce >= 1,
+        "电路断言 7：spend_nonce 从 1 计（S-46 NonceManager 修正）"
+    );
+    assert_eq!(agg.accepted_count(), 1);
+    assert_eq!(agg.total_spent(&dh), Some(4_200));
+
+    // 同源对账（最强锚）：独立请求直接走 prove 六步链（同一 secret），公共输入
+    // agent_commit 必须与 attest_identity 凭据一致——attest 与 prove 的电路签名身份
+    // 单一来源由构造保证，不再依赖调用方手工对齐。
+    let standalone = NoirProver::from_repo_root(&root).expect("工具链");
+    let sd = create_delegation(&owner_key, [0x0Bu8; 20], 9, &limits).expect("delegation");
+    let sdh = meridian_core::dsa::delegation_hash(&sd.delegation);
+    let (intent, _sig) = wallet.create_intent(
+        sd.delegation.agent,
+        sdh,
+        [0x9Cu8; 20],
+        100,
+        [0xC0; 32],
+        9, // spend_nonce > 0（电路断言 7）
+        None,
+        1_800_000_000,
+    );
+    let witness = agg
+        .revocation_witness(&sdh)
+        .expect("未撤销委托必有非成员 witness")
+        .into();
+    let proof = standalone
+        .prove(&SpendProofRequest {
+            sd: &sd,
+            intent: &intent,
+            agent_key: &wallet.agent_key,
+            attestation_secret: secret,
+            revocation: witness,
+            now: 1_750_000_000,
+        })
+        .unwrap_or_else(|e| panic!("standalone prove 失败: {e:?}"));
+    assert_eq!(
+        proof.public_inputs.agent_commit, cred.agent_commit,
+        "attest_identity 凭据承诺 == 证明公共输入 agent_commit（同源实证，S-46）"
+    );
+
+    drop(client);
+    let _ = std::fs::remove_file(&wal_path);
 }

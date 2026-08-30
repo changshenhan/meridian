@@ -508,7 +508,7 @@ fn e2e_next_nonce_query_restarts_sdk_recovery() {
         client.pay(&pay_params(dh, 43)).unwrap();
     } // 模拟重启：客户端（含 NonceManager）丢弃，聚合器存活。
 
-    // 重启后的进程：新客户端从 nonce 0 重新计数。
+    // 重启后的进程：新客户端从 nonce 1 重新计数（S-46 NonceManager 1 起）。
     let transport = HttpTransport::new(&addr, "e2e-key");
     let mut client = SdkClient::new(wallet, Box::new(transport));
     client.set_retry(RetryPolicy {
@@ -519,7 +519,7 @@ fn e2e_next_nonce_query_restarts_sdk_recovery() {
     let rec = client.authorize(&owner, [1u8; 20], &limits(1_000)).unwrap();
     let dh = rec.delegation_hash;
 
-    // 不恢复直接 pay → 跨意图复用 nonce 0 → E_NONCE（不双花，但不可用）。
+    // 不恢复直接 pay → 跨意图复用 nonce 1 → E_NONCE（不双花，但不可用）。
     let err = client.pay(&pay_params(dh, 44)).unwrap_err();
     assert_eq!(
         err.code(),
@@ -527,18 +527,19 @@ fn e2e_next_nonce_query_restarts_sdk_recovery() {
         "expected nonce reuse rejection: {err:?}"
     );
 
-    // sync_nonce：查网关 → 推进到 max(已接受) + 1 = 2 → 后续支付正常。
-    assert_eq!(client.sync_nonce(&dh).unwrap(), 2);
+    // sync_nonce：查网关 → 推进到 max(已消耗) + 1 = 3（nonce 1、2 已在账）→ 支付正常。
+    // 本地 NonceManager 因刚才那次 E_NONCE 定局已推进到 2，网关值 3 取 max 生效。
+    assert_eq!(client.sync_nonce(&dh).unwrap(), 3);
     let r = client.pay(&pay_params(dh, 44)).unwrap();
-    assert_eq!(r.spend_nonce, 2, "恢复后从网关值起计");
-    assert_eq!(client.sync_nonce(&dh).unwrap(), 3, "支付后计数同步推进");
+    assert_eq!(r.spend_nonce, 3, "恢复后从网关值起计");
+    assert_eq!(client.sync_nonce(&dh).unwrap(), 4, "支付后计数同步推进");
 
     // 原始 GET 线格式：带认证 200（delegation_hash 回显 + next_nonce）；无认证 401。
     let path = format!("/v1/nonce/{}", hex::encode(dh));
     let (status, body) = raw_get(&addr, &path, Some("e2e-key"));
     assert_eq!(status, 200);
     assert!(
-        body.contains(&format!("\"next_nonce\":{}", 3)),
+        body.contains(&format!("\"next_nonce\":{}", 4)),
         "body: {body}"
     );
     assert!(body.contains(&hex::encode(dh)), "body: {body}");
@@ -551,7 +552,7 @@ fn e2e_next_nonce_query_restarts_sdk_recovery() {
     assert!(transport2.next_nonce([0xEE; 32]).unwrap().is_none());
 
     // 聚合器句柄同源一致。
-    assert_eq!(agg.next_nonce(&dh), Some(3));
+    assert_eq!(agg.next_nonce(&dh), Some(4));
 }
 
 /// S-45 撤销 witness 查询 e2e（真 socket）：`HttpTransport::revocation_witness` →

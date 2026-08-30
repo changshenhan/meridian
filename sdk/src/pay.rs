@@ -74,7 +74,10 @@ impl Default for RetryPolicy {
 /// 每委托的单调 spend_nonce 管理器。
 ///
 /// 契约：**仅上一笔定局（accepted 或永久拒绝）后才取下一个**——重试全程 nonce 固定，这是
-/// 双花防护的前提。进程内状态；跨进程崩溃恢复经 [`NonceManager::resync`]（S-31：聚合器
+/// 双花防护的前提。**从 1 起（S-46 全链发现）**：电路断言 7 `spend_nonce > 0`（防零
+/// nonce 误用）——0 起使每张委托的首笔支付在真 prover（`NoirProver`）下必然 `E_PROVER`
+/// （占位 prover 不消费 nonce，缺口只在全链路暴露）。进程内状态；跨进程崩溃恢复经
+/// [`NonceManager::resync`]（S-31：聚合器
 /// `GET /v1/nonce` 查询，§6.7，[`SdkClient::sync_nonce`](crate::SdkClient::sync_nonce) 包装）。
 pub struct NonceManager {
     next: RwLock<HashMap<[u8; 32], u64>>,
@@ -93,20 +96,21 @@ impl NonceManager {
         }
     }
 
-    /// 分配下一个 nonce（每委托单调）。
+    /// 分配下一个 nonce（每委托单调，从 1 起；聚合器只禁复用不要求连续，§6.2）。
     pub fn next(&self, dh: &[u8; 32]) -> u64 {
         let mut map = self.next.write().expect("nonce manager poisoned");
-        let cur = map.entry(*dh).or_insert(0);
-        let n = *cur;
-        *cur = n + 1;
-        n
+        let n = map.entry(*dh).or_insert(1);
+        let v = *n;
+        *n = v + 1;
+        v
     }
 
     /// S-31 跨重启恢复：把本地计数推进到 `max(本地, 远端)`。本地领先时**不动**
-    /// （避免并发客户端被回退重发撞已消耗 nonce）；返回生效值。
+    /// （避免并发客户端被回退重发撞已消耗 nonce）；返回生效值。聚合器空集（远端 0）
+    /// 不回退本地 1 起的初值。
     pub fn resync(&self, dh: &[u8; 32], remote_next: u64) -> u64 {
         let mut map = self.next.write().expect("nonce manager poisoned");
-        let cur = map.entry(*dh).or_insert(0);
+        let cur = map.entry(*dh).or_insert(1);
         if remote_next > *cur {
             *cur = remote_next;
         }
@@ -264,10 +268,23 @@ mod tests {
         let m = NonceManager::new();
         let dh_a = [1u8; 32];
         let dh_b = [2u8; 32];
-        assert_eq!(m.next(&dh_a), 0);
+        // S-46 起从 1 计：电路断言 7 `spend_nonce > 0`（TECH_SPEC §6.6）。
         assert_eq!(m.next(&dh_a), 1);
-        assert_eq!(m.next(&dh_b), 0); // 委托间独立
         assert_eq!(m.next(&dh_a), 2);
+        assert_eq!(m.next(&dh_b), 1); // 委托间独立
+        assert_eq!(m.next(&dh_a), 3);
+    }
+
+    #[test]
+    fn nonce_resync_ignores_empty_remote() {
+        // 聚合器空集（next_nonce = 0）不回退本地 1 起的初值（S-46 resync 语义）。
+        let m = NonceManager::new();
+        let dh = [3u8; 32];
+        assert_eq!(m.resync(&dh, 0), 1);
+        assert_eq!(m.next(&dh), 1);
+        // 远端领先推进；本地领先不回退。
+        assert_eq!(m.resync(&dh, 7), 7);
+        assert_eq!(m.resync(&dh, 4), 7);
     }
 
     #[test]
@@ -488,10 +505,10 @@ mod tests {
         assert_eq!(mock.submissions(), 2);
         assert_eq!(mock.witness_fetches(), 2, "pay 起手一次 + 刷新一次");
         // 绑定闸拒不耗 nonce（§6.2）：重交复用同一 nonce，仅定局后才推进。
-        assert_eq!(r.spend_nonce, 0);
+        assert_eq!(r.spend_nonce, 1);
         // 新根已入库（per-dh 缓存，后续支付复用不再现取）。
         let r2 = client.pay(&refreshed_params(dh, 43)).unwrap();
-        assert_eq!(r2.spend_nonce, 1, "只有定局后才推进 nonce");
+        assert_eq!(r2.spend_nonce, 2, "只有定局后才推进 nonce");
         assert_eq!(mock.witness_fetches(), 2, "缓存命中不再现取");
         assert_eq!(mock.submissions(), 3);
     }
