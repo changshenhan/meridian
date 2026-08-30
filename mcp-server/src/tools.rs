@@ -1,4 +1,5 @@
-//! S-13 MCP 工具定义：`authorize` / `pay` / `balance` / `attest` / `verify_receipt`。
+//! S-13 MCP 工具定义：`authorize` / `pay` / `balance` / `attest` / `verify_receipt` /
+//! `revocation_witness`（S-52）。
 //!
 //! 入参用**扁平 hex 字符串**而非嵌套 core 类型：`#[tool]` 宏需要入参类型实现
 //! `JsonSchema`（rmcp 用 schemars 生成工具 JSON Schema），而 core 的 `Delegation`
@@ -13,6 +14,7 @@ use meridian_core::attestation::AttestationPubKey;
 use meridian_core::dsa::{
     AgentPubKey, Delegation, OwnerPubKey, RateLimit, Signature64, SpendIntent,
 };
+use meridian_core::zk::{SpendProof, SpendPublicInputs};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::ServerHandler;
 use rmcp::{tool, tool_handler, tool_router};
@@ -109,6 +111,25 @@ impl AuthorizeRequest {
     }
 }
 
+/// `meridian.pay` 可选的客户端直通证明（S-52，TECH_SPEC §6.16）。
+///
+/// keyless 保形（D3）：`attestation_secret` 不上服务器，真证明由框架侧客户端产出
+/// （`NoirProver`，§6.14），作为**数据**随意图一起提交，服务器只验证。公共输入的共享
+/// 字段（delegation_hash / recipient / amount / category / spend_nonce / expires_at）
+/// 不在此上报——服务器从意图派生，`check_public_inputs_consistent` 保证派生结果与证明
+/// 声称的是同一笔意图；客户端只报服务器无法自知的三个自由量 + 证明字节本体。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProofRequest {
+    /// 电路证明字节（bb UltraHonk，hex）。
+    pub proof_hex: String,
+    /// attestation 承诺 `agent_commit`（32 字节 hex，客户端 attestation 身份）。
+    pub agent_commit: String,
+    /// 客户端所锚定的撤销状态根（32 字节 hex；bb + 撤销根绑定闸下必须 ∈ 聚合器接受集）。
+    pub revocation_root: String,
+    /// 证明时刻（unix 秒；电路断言 5 时间窗）。
+    pub now: u64,
+}
+
 /// `meridian.pay` 入参。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct PayRequest {
@@ -130,10 +151,14 @@ pub struct PayRequest {
     pub expires_at: u64,
     /// agent 对 intent 的 Ed25519 签名（64 字节 hex）。
     pub signature: String,
+    /// 客户端直通证明（S-52，可缺省）：缺席 = 服务器占位证明（缺省口径逐字节不变，
+    /// §6.16）；bb 验证后端装配下占位会被全拒（fail-closed）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<ProofRequest>,
 }
 
 impl PayRequest {
-    fn into_parts(self) -> Result<(SpendIntent, AgentSignature), String> {
+    fn into_parts(self) -> Result<(SpendIntent, AgentSignature, Option<SpendProof>), String> {
         let intent = SpendIntent {
             agent: decode::<20>(&self.agent, "agent")?,
             delegation_hash: decode::<32>(&self.delegation_hash, "delegation_hash")?,
@@ -149,7 +174,25 @@ impl PayRequest {
             expires_at: self.expires_at,
         };
         let sig = AgentSignature::from_bytes(&decode::<64>(&self.signature, "signature")?);
-        Ok((intent, sig))
+        let proof = self.proof.map(|p| {
+            Ok::<SpendProof, String>(SpendProof {
+                proof: hex::decode(&p.proof_hex)
+                    .map_err(|e| format!("proof.proof_hex: invalid hex: {e}"))?,
+                public_inputs: SpendPublicInputs {
+                    agent_commit: decode::<32>(&p.agent_commit, "proof.agent_commit")?,
+                    delegation_hash: intent.delegation_hash,
+                    recipient: intent.recipient,
+                    amount: intent.amount,
+                    category: intent.category,
+                    spend_nonce: intent.spend_nonce,
+                    expires_at: intent.expires_at,
+                    revocation_root: decode::<32>(&p.revocation_root, "proof.revocation_root")?,
+                    now: p.now,
+                },
+            })
+        });
+        let proof = proof.transpose()?;
+        Ok((intent, sig, proof))
     }
 }
 
@@ -212,6 +255,19 @@ impl VerifyReceiptRequest {
     }
 }
 
+/// `meridian.revocation_witness` 入参（S-52，§6.16）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct WitnessRequest {
+    /// 目标委托的 delegation_hash（32 字节 hex）。
+    pub delegation_hash: String,
+}
+
+impl WitnessRequest {
+    fn into_dh(self) -> Result<[u8; 32], String> {
+        decode::<32>(&self.delegation_hash, "delegation_hash")
+    }
+}
+
 /// `#[tool_router]` 生成模块私有的 `tool_router()` 关联函数：每次调用重建一个
 /// 装满路由的 `ToolRouter`（路由表由宏内联在构造器里，无跨请求状态）。
 /// `#[tool_handler]` 生成的 `call_tool/list_tools/get_tool` 每请求调一次它，
@@ -237,14 +293,15 @@ impl MeridianServer {
     }
 
     /// 执行一笔支付：真实聚合器内核执行全部闸口（幂等 re-ack → 验签 → 预算 → WAL）。
-    /// 返回回执（含 seq）。TEMPORARY：证明是服务器侧占位，S-09 接入真电路。
+    /// 返回回执（含 seq）。证明：`proof` 缺席 = 服务器占位（缺省口径）；携带时直通
+    /// 验证器（S-52，§6.16——客户端产证明，服务器只验证，keyless 保形）。
     #[tool(
         name = "pay",
-        description = "执行一笔支付（SpendIntent）：真实聚合器验签 + 预算强制 + WAL，幂等重发返回先前 seq。返回 {intent_hash, seq, spend_nonce}。"
+        description = "执行一笔支付（SpendIntent）：真实聚合器验签 + 预算强制 + WAL，幂等重发返回先前 seq。返回 {intent_hash, seq, spend_nonce}。可选 proof：客户端产的真 ZK 证明直通验证（keyless——服务器不持有任何密钥）。"
     )]
     fn pay(&self, req: Parameters<PayRequest>) -> Result<String, String> {
-        let (intent, sig) = req.0.into_parts()?;
-        match self.state.pay(&intent, &sig) {
+        let (intent, sig, proof) = req.0.into_parts()?;
+        match self.state.pay(&intent, &sig, proof) {
             Ok(receipt) => Ok(ok_body(&receipt)),
             Err(e) => Err(err_body(e.as_code())),
         }
@@ -285,6 +342,20 @@ impl MeridianServer {
         let (dh, nonce, ih) = req.0.into_parts()?;
         Ok(ok_body(&self.state.verify_receipt(&dh, nonce, &ih)))
     }
+
+    /// 撤销非成员 witness（S-52，§6.16）：客户端构建真电路证明所需的唯一服务器侧
+    /// 事实（S-45 网关 `GET /v1/revocation-witness/{dh}` 的 MCP 面）。
+    #[tool(
+        name = "revocation_witness",
+        description = "撤销非成员 witness：给定 delegation_hash，返回当前撤销状态根 + 深度 256 兄弟路径（扁平 hex）。构建真 ZK 证明（pay 的 proof 入参）所需的撤销事实。目标已撤销 → E_REVOKED（非成员接口不给成员陈述）。"
+    )]
+    fn revocation_witness(&self, req: Parameters<WitnessRequest>) -> Result<String, String> {
+        let dh = req.0.into_dh()?;
+        match self.state.revocation_witness(&dh) {
+            Ok(receipt) => Ok(ok_body(&receipt)),
+            Err(e) => Err(err_body(e.as_code())),
+        }
+    }
 }
 
 /// ServerHandler 实现由宏生成（get_info / list_tools / call_tool / get_tool）。
@@ -292,7 +363,7 @@ impl MeridianServer {
 #[tool_handler(
     name = "meridian",
     version = "0.2.0",
-    instructions = "Meridian DSA 正式版：authorize 注册委托、pay 预算内支付、balance 查额度、attest 双钥绑定、verify_receipt 确认回执。"
+    instructions = "Meridian DSA 正式版：authorize 注册委托、pay 预算内支付（可选 proof：客户端真 ZK 证明直通）、balance 查额度、attest 双钥绑定、revocation_witness 取撤销事实、verify_receipt 确认回执。"
 )]
 impl ServerHandler for MeridianServer {}
 

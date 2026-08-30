@@ -7,7 +7,7 @@ Meridian 的集成面按**角色**分三条路，各自独立可接。本文按�
 （私钥持有者）          （替 owner 花钱）        （LangChain/AutoGen/Eliza）
     │  签发 Delegation       │                       │
     ▼                        ▼                       ▼
- 授权原语  ◄──────────────  SDK / MCP pay           MCP 5 工具（keyless）
+ 授权原语  ◄──────────────  SDK / MCP pay           MCP 6 工具（keyless）
                             │                       │
                             ▼                       ▼
                     聚合器内核（验签/预算/WAL/净额）  BatchSettler（链上净额）
@@ -78,12 +78,13 @@ MERIDIAN_WAL_DIR=demos/.wal target/release/meridian-mcp     # 默认 ./meridian.
 
 任何支持 stdio MCP 的框架都能挂成工具。自述名 `meridian`，版本 `0.2.0`。
 
-### 5 工具
+### 6 工具
 
 | 工具 | 入参 | 返回 | 校验 |
 |---|---|---|---|
 | `authorize` | 委托全字段 + owner secp256k1 签名 + owner/agent 公钥 | `AuthorizeReceipt` | owner 签名有效；字段自洽；防换钥重绑；幂等 |
-| `pay` | intent 全字段 + agent Ed25519 签名 | `PayReceipt {intent_hash, seq, spend_nonce}` | 委托已注册；agent 签名；幂等 re-ack；预算；WAL |
+| `pay` | intent 全字段 + agent Ed25519 签名 + 可选 `proof`（S-52 客户端真 ZK 证明直通） | `PayReceipt {intent_hash, seq, spend_nonce}` | 委托已注册；agent 签名；幂等 re-ack；预算；WAL |
+| `revocation_witness` | `delegation_hash` | `WitnessReceipt {root, path}`（256×32B 扁平 hex） | 只读；目标已撤销 → `E_REVOKED` |
 | `balance` | `delegation_hash` | `BalanceReceipt {total_spent, total_cap, remaining}` | 委托已注册 |
 | `attest` | `delegation_hash, pk_x, pk_y, binding` | `AttestReceipt {pk_x, pk_y, agent_commit, binding}` | 绑定 agent 对 binding 消息验签 |
 | `verify_receipt` | `delegation_hash, spend_nonce, intent_hash` | `VerifyReceiptResult {accepted, seq}` | 只读；幂等表确认 |
@@ -104,7 +105,8 @@ MERIDIAN_WAL_DIR=demos/.wal target/release/meridian-mcp     # 默认 ./meridian.
 - **eliza（@noble/curves）**：2.x 移除 `./secp256k1` 子路径并重构签名 API → 固定
   **1.x 线**（curves 1.9.7 / hashes 1.8.0）。
 
-详见 `mcp-server/README.md`（含决策记录 D1-D5：为什么 keyless / 扁平 hex 入参 / stdio）。
+详见 `mcp-server/README.md`（含决策记录 D1-D6：为什么 keyless / 扁平 hex 入参 / stdio /
+真 ZK 走证明直通不走服务器代证）。
 
 ---
 

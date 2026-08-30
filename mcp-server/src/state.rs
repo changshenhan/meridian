@@ -4,7 +4,9 @@
 //! 幂等 re-ack（同意图重发返回先前 seq）、单调 seq、预算强制、真错误码。本层只保留：
 //!   1. 已授权委托的内存表（`total_cap` 给 balance；`agent_pub` 给 EAttestBind 与 attest）；
 //!   2. authorize 的 owner 验签与委托字段自洽（探针既有逻辑原样保留）；
-//!   3. pay 的占位证明构造（诚实边界，见 README）。
+//!   3. pay 的证明来源分派（S-52 §6.16）：客户端直通证明优先，缺席才落占位构造
+//!      （诚实边界，见 README）；
+//!   4. revocation_witness 的只读事实面（S-45 网关同款，真证明的撤销事实来源）。
 //!
 //! 安全模型（Shape 1）：**服务器无任何私钥**。owner secp256k1 / agent Ed25519 密钥都在
 //! 框架侧，签名外部完成；本层只验签 + 执行。`SdkClient` 不用在服务器侧（authorize/pay
@@ -106,6 +108,16 @@ pub struct VerifyReceiptResult {
     pub seq: u64,
 }
 
+/// `revocation_witness` 回执（S-52，§6.16）：`path` = 深度 256 兄弟路径的扁平 hex
+/// （256 × 32B BE Field 依深度序拼接 = 16384 hex 字符，`RevocationWitnessResponse`
+/// 同口径——客户端按 32B 分块还原成电路 witness）。
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct WitnessReceipt {
+    pub delegation_hash: String,
+    pub root: String,
+    pub path: String,
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -201,15 +213,23 @@ impl AppState {
 
     /// 执行一笔支付（meridian.pay）。
     ///
-    /// 由服务器用占位证明构造信封（诚实边界，见 README），`Aggregator::submit` 执行
-    /// 全部闸口：幂等 re-ack（S-12，同意图重发返回先前 seq）→ 过期 → 注册表 →
-    /// 撤销 → agent 绑定 → Ed25519 验签 → 证明 → 公共输入一致 → 窗口预留 → 预算 → WAL。
-    /// 回执映射：accepted → {intent_hash, seq, spend_nonce}；rejected → 错误码透传。
-    pub fn pay(&self, intent: &SpendIntent, sig: &AgentSignature) -> Result<PayReceipt, Error> {
+    /// 证明来源（S-52，TECH_SPEC §6.16）：`proof = Some` 时**客户端直通**——框架侧
+    /// 客户端产真电路证明（`NoirProver`，keyless 保形：attestation secret 不上服务器），
+    /// 服务器只验证；`proof = None` 时服务器用占位证明构造信封（缺省口径，逐字节不变）。
+    /// `Aggregator::submit` 执行全部闸口：幂等 re-ack（S-12，同意图重发返回先前 seq）→
+    /// 过期 → 注册表 → 撤销 → agent 绑定 → Ed25519 验签 → 证明 → 公共输入一致 →
+    /// 窗口预留 → 预算 → WAL。回执映射：accepted → {intent_hash, seq, spend_nonce}；
+    /// rejected → 错误码透传。
+    pub fn pay(
+        &self,
+        intent: &SpendIntent,
+        sig: &AgentSignature,
+        proof: Option<SpendProof>,
+    ) -> Result<PayReceipt, Error> {
         let env = IntentEnvelope {
             intent: intent.clone(),
             agent_sig: *sig,
-            proof: Self::build_proof(intent),
+            proof: proof.unwrap_or_else(|| Self::build_proof(intent)),
         };
         let r = self.agg.submit(&env);
         if r.accepted {
@@ -289,10 +309,27 @@ impl AppState {
         }
     }
 
+    /// 撤销非成员 witness（meridian.revocation_witness，S-52 §6.16）。
+    ///
+    /// 客户端构建真电路证明所需的唯一服务器侧事实（S-45 网关同款语义）：`root` =
+    /// 当前撤销状态根（BE Field 32B），`path` = 深度 256 兄弟路径扁平 hex（与
+    /// `RevocationWitnessResponse` 同一口径）。目标已撤销 → `E_REVOKED`（S-42
+    /// fail-closed，成员证明不由本接口给出）；未注册 dh 照常返回 witness（只读事实面）。
+    pub fn revocation_witness(&self, dh: &[u8; 32]) -> Result<WitnessReceipt, Error> {
+        let w = self.agg.revocation_witness(dh).ok_or(Error::ERevoked)?;
+        let flat: Vec<u8> = w.path.iter().flat_map(|p| p.iter().copied()).collect();
+        Ok(WitnessReceipt {
+            delegation_hash: hex_hash(dh),
+            root: hex_hash(&w.root),
+            path: hex::encode(flat),
+        })
+    }
+
     /// 占位证明（诚实边界，见 README D3）：proof 非空 + 公共输入从 intent 派生。
     /// `agent_commit` / `revocation_root` = [0;32]（TEMPORARY），`now` = unix。
     /// `FormatVerifier` 只查 proof 非空 + 公共输入与 intent 一致（`check_public_inputs_consistent`），
-    /// 不查这两项 → 占位成立。真 S-09 prover 插 `SpendVerifier` 同缝，pay 不改。
+    /// 不查这两项 → 占位成立。真 ZK 语义自 S-52 起：客户端直通证明经 `pay` 入参进入
+    /// 同一验证缝（§6.16），bb 装配（main.rs `MERIDIAN_VERIFY_BACKEND=bb`）下占位被全拒。
     fn build_proof(intent: &SpendIntent) -> SpendProof {
         SpendProof {
             proof: vec![0x00, 0x01, 0x02],

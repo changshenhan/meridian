@@ -1,5 +1,5 @@
 //! S-13 MCP 服务器正式版：`meridian.authorize` / `meridian.pay` / `meridian.balance` /
-//! `meridian.attest` / `meridian.verify_receipt`。
+//! `meridian.attest` / `meridian.verify_receipt` / `meridian.revocation_witness`（S-52）。
 //!
 //! 形态：**stdio MCP server + 内嵌真实聚合器内核**（`meridian-aggregator`：WAL 持久化、
 //! 幂等 re-ack、单调 seq、真错误码、预算强制）。任何主流 agent 框架（LangChain / AutoGen /
@@ -8,12 +8,14 @@
 //!
 //! 安全模型（Shape 1，延续 S-07）：**服务器不持有任何私钥**。owner secp256k1 与 agent
 //! Ed25519 密钥都在框架侧、签名外部完成；服务器只验签 + 执行。authorize 校验 owner 对
-//! delegation_hash 的 secp256k1 签名后调 `Aggregator::register`；pay 由服务器用占位证明
-//! 构造信封（诚实边界，见 README）后 `Aggregator::submit`——幂等重发（S-12）免费获得。
+//! delegation_hash 的 secp256k1 签名后调 `Aggregator::register`；pay 的证明来源分派
+//! （S-52，TECH_SPEC §6.16）：客户端直通证明优先（真 ZK，keyless 保形——证明是数据
+//! 不是密钥），缺席才由服务器用占位证明构造信封（诚实边界，见 README）后
+//! `Aggregator::submit`——幂等重发（S-12）免费获得。
 //!
-//! TEMPORARY 边界（诚实口径，README 决策记录有完整版）：`pay()` 的 ZK 证明目前是服务器
-//! 侧占位（proof 非空 + 公共输入与 intent 一致），`FormatVerifier` 只做格式门禁。真实
-//! S-09 电路 prover 实现 `SpendVerifier` 插同一路径即可，`pay` 不改。
+//! ZK 语义（README 决策记录 D6 / §6.16）：`pay` 可选 `proof` 入参直通同一 `SpendVerifier`
+//! 缝，真验证后端（`BbVerifier`，bin `MERIDIAN_VERIFY_BACKEND=bb` + S-48 撤销根绑定闸）
+//! 下占位被全拒；`revocation_witness` 工具下发客户端构建真证明所需的撤销事实。
 //!
 //! 模块划分（宏作用域约束：`#[tool_router]` 生成的 `tool_router()` 关联函数与
 //! `#[tool_handler]` 必须同模块，见 tools.rs）。

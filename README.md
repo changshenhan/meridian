@@ -34,7 +34,7 @@ aggregator/    结算内核：ingest / commitment lattice / WAL / 净额（merid
 gateway/       S-29 网络 ingest 网关：多租户 Bearer + 每租户令牌桶，std-only HTTP/1.1（meridian-gateway）
 sdk/           Agent 集成层：authorize / pay / attest + 幂等重试 + x402 fetch 拦截（S-30b）（meridian-sdk）
 facilitator/   S-30c x402 merchant 参考实现：网关回执验证，fail-closed，std-only HTTP/1.1（meridian-facilitator）
-mcp-server/    MCP stdio 服务器：5 工具、keyless（meridian-mcp）
+mcp-server/    MCP stdio 服务器：6 工具、keyless、真 ZK 证明直通（meridian-mcp）
 monitor/       S-15 可观测性：/metrics Prometheus 文本 + /healthz 健康判定（std-only）
 bench/         基准基座 + 零分配门禁 + CI gate（meridian-bench）
 contracts/     Solidity：DSA / RevocationRegistry / BatchSettler + rust-smoke（独立 workspace）

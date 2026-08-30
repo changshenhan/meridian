@@ -231,6 +231,17 @@ else
 fi
 
 printf '\n'
+# S-52：mcp-server 真 ZK e2e（TECH_SPEC §6.16，MCP 面证明直通）。客户端侧 NoirProver
+# 真电路证明 → MCP pay 工具 → BbVerifier + 撤销根绑定闸聚合器密码学接受；对照组占位
+# pay 必拒 E_PROOF。工件依赖 9c 同款；MERIDIAN_MCP_NOIR_E2E 门控测试本体。
+if [ -f "$ROOT/circuits/target/spend_authorization.json" ] && [ -f "$ROOT/circuits/target/vk" ]; then
+    step "9f/10 mcp-server noir-prover e2e (S-52, MCP 面证明直通)"
+    run "mcp noir-prover e2e" env MERIDIAN_MCP_NOIR_E2E=1 cargo test -p meridian-mcp --test mcp_noir_e2e
+else
+    step "9f/10 mcp-server noir-prover e2e (S-52)"
+    skip "circuits/target/{spend_authorization.json,vk} 不存在（第 9 步 ZK 被跳过）→ mcp noir-prover e2e 跳过"
+fi
+
 if [ "$FAIL" -eq 0 ]; then
     printf '\033[1;32m✓ 本地门禁全部通过 —— 可以推送\033[0m\n'
     exit 0

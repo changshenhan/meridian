@@ -145,6 +145,7 @@ fn pay_args(i: &SpendIntent, sig: &ed25519_dalek::Signature) -> JsonObject {
         memo: None,
         expires_at: i.expires_at,
         signature: hex::encode(sig.to_bytes()),
+        proof: None,
     };
     serde_json::to_value(&req)
         .unwrap()
@@ -621,6 +622,245 @@ async fn attest_verify_and_tamper_reject() -> anyhow::Result<()> {
     let att_forged = call_tool(&client, "attest", attest_args(dh, &forged, &binding)).await;
     assert!(att_forged.is_error.unwrap_or(false));
     assert_eq!(error_code(&att_forged), "E_ATTEST_BIND");
+
+    client.cancel().await?;
+    server_handle.await??;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S-52（TECH_SPEC §6.16）：客户端直通证明 + revocation_witness 事实面
+// ---------------------------------------------------------------------------
+
+/// 直通证明入参（S-52 wire：proof_hex + 三个自由量；共享字段由服务器从意图派生）。
+fn proof_args(
+    i: &SpendIntent,
+    sig: &ed25519_dalek::Signature,
+    proof_bytes: &[u8],
+    agent_commit: [u8; 32],
+    revocation_root: [u8; 32],
+    now: u64,
+) -> JsonObject {
+    let req = PayRequest {
+        agent: hex::encode(i.agent),
+        delegation_hash: hex::encode(i.delegation_hash),
+        recipient: hex::encode(i.recipient),
+        amount: i.amount,
+        category: hex::encode(i.category),
+        spend_nonce: i.spend_nonce,
+        memo: None,
+        expires_at: i.expires_at,
+        signature: hex::encode(sig.to_bytes()),
+        proof: Some(meridian_mcp::tools::ProofRequest {
+            proof_hex: hex::encode(proof_bytes),
+            agent_commit: hex::encode(agent_commit),
+            revocation_root: hex::encode(revocation_root),
+            now,
+        }),
+    };
+    serde_json::to_value(&req)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone()
+}
+
+#[tokio::test]
+async fn pay_with_client_proof_flows_through_format_backend() -> anyhow::Result<()> {
+    let (client, server_handle, agg) = setup("proof_passthrough").await;
+
+    let d = delegation_fixture();
+    let owner_key = owner_signing_key_from_bytes([7u8; 32]);
+    let agent_key = AgentSigningKey::from_bytes(&[9u8; 32]);
+    let auth = call_tool(
+        &client,
+        "authorize",
+        authorize_args(&d, &owner_key, &agent_key),
+    )
+    .await;
+    assert!(!auth.is_error.unwrap_or(false));
+    let dh = delegation_hash(&d);
+
+    // 客户端直通证明（format 后端：proof 非空 + 公共输入与意图一致即过）。
+    // 共享字段不在线上——服务器从意图派生，`check_public_inputs_consistent` 保证
+    // 派生结果与证明声称的是同一笔意图（§6.16）。
+    let i = intent_fixture(dh, 7, 1);
+    let sig = sign_intent(&i, &agent_key);
+    let pay = call_tool(
+        &client,
+        "pay",
+        proof_args(
+            &i,
+            &sig,
+            &[0xDE, 0xAD, 0xBE, 0xEF],
+            [0x11; 32],
+            [0x22; 32],
+            1_750_000_000,
+        ),
+    )
+    .await;
+    assert!(
+        !pay.is_error.unwrap_or(false),
+        "client proof should be accepted"
+    );
+    assert_eq!(body(&pay)["seq"].as_u64().unwrap(), 0);
+    assert_eq!(agg.accepted_count(), 1);
+
+    // 空 proof 字节 → E_PROOF（fail-closed，不因直通而绕过非空闸）。
+    let i2 = intent_fixture(dh, 8, 2);
+    let sig2 = sign_intent(&i2, &agent_key);
+    let empty = call_tool(
+        &client,
+        "pay",
+        proof_args(&i2, &sig2, &[], [0x11; 32], [0x22; 32], 1_750_000_000),
+    )
+    .await;
+    assert!(empty.is_error.unwrap_or(false));
+    assert_eq!(error_code(&empty), "E_PROOF");
+
+    client.cancel().await?;
+    server_handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pay_client_proof_reaches_verifier_not_server_placeholder() -> anyhow::Result<()> {
+    // RejectAllVerifier 对照组（§6.16 测试口径）：若服务器把直通证明偷偷换成自己的
+    // 占位（占位在 format 后端必过），本测试必红——直通证明**真实进入验证缝**。
+    let agg = {
+        let wal = Wal::open(&wal_path("proof_reject_all"), 1_000).unwrap();
+        Arc::new(Aggregator::new(
+            IngestConfig::default(),
+            Box::new(meridian_aggregator::proof::RejectAllVerifier),
+            wal,
+        ))
+    };
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let server_agg = Arc::clone(&agg);
+    let server_handle = tokio::spawn(async move {
+        MeridianServer::new(server_agg)
+            .serve(server_transport)
+            .await?
+            .waiting()
+            .await?;
+        anyhow::Ok(())
+    });
+    let client = ProbeClient.serve(client_transport).await.unwrap();
+
+    let d = delegation_fixture();
+    let owner_key = owner_signing_key_from_bytes([7u8; 32]);
+    let agent_key = AgentSigningKey::from_bytes(&[9u8; 32]);
+    let auth = call_tool(
+        &client,
+        "authorize",
+        authorize_args(&d, &owner_key, &agent_key),
+    )
+    .await;
+    assert!(!auth.is_error.unwrap_or(false));
+    let dh = delegation_hash(&d);
+
+    let i = intent_fixture(dh, 7, 1);
+    let sig = sign_intent(&i, &agent_key);
+    let pay = call_tool(
+        &client,
+        "pay",
+        proof_args(
+            &i,
+            &sig,
+            &[0x01, 0x02],
+            [0x11; 32],
+            [0x22; 32],
+            1_750_000_000,
+        ),
+    )
+    .await;
+    assert!(
+        pay.is_error.unwrap_or(false),
+        "client proof must be verified"
+    );
+    assert_eq!(error_code(&pay), "E_PROOF");
+    assert_eq!(agg.accepted_count(), 0);
+
+    client.cancel().await?;
+    server_handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn revocation_witness_tool_serves_ledger_fact() -> anyhow::Result<()> {
+    let (client, server_handle, agg) = setup("witness").await;
+
+    let d = delegation_fixture();
+    let owner_key = owner_signing_key_from_bytes([7u8; 32]);
+    let agent_key = AgentSigningKey::from_bytes(&[9u8; 32]);
+    let auth = call_tool(
+        &client,
+        "authorize",
+        authorize_args(&d, &owner_key, &agent_key),
+    )
+    .await;
+    assert!(!auth.is_error.unwrap_or(false));
+    let dh = delegation_hash(&d);
+
+    // 未撤销 → 非成员 witness（root = 空根，path = 256×32B 扁平 hex）。
+    let wit = call_tool(
+        &client,
+        "revocation_witness",
+        json!({ "delegation_hash": hex::encode(dh) })
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .await;
+    assert!(!wit.is_error.unwrap_or(false), "non-revoked dh has witness");
+    let wit_body = body(&wit);
+    assert_eq!(
+        wit_body["delegation_hash"].as_str().unwrap(),
+        hex::encode(dh)
+    );
+    assert_eq!(wit_body["root"].as_str().unwrap().len(), 64);
+    let path_hex = wit_body["path"].as_str().unwrap();
+    assert_eq!(
+        path_hex.len(),
+        256 * 64,
+        "256 × 32B 扁平 hex（S-42 树口径）"
+    );
+
+    // 服务器账本撤销另一张委托（与 m1_demo/noir_demo 同款通道）→ 根推进。
+    let mut other = [0x5E; 32];
+    other[31] = 0x01;
+    assert!(agg.revoke(other));
+
+    // 目标仍未撤销 → witness 可再取，root 已推进（同一棵确定性树）。
+    let wit2 = call_tool(
+        &client,
+        "revocation_witness",
+        json!({ "delegation_hash": hex::encode(dh) })
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .await;
+    let wit2_body = body(&wit2);
+    assert_ne!(
+        wit2_body["root"].as_str().unwrap(),
+        wit_body["root"].as_str().unwrap(),
+        "撤销事件推进撤销状态根"
+    );
+
+    // 目标已撤销 → E_REVOKED（S-42 fail-closed：非成员接口不给成员陈述）。
+    assert!(agg.revoke(dh));
+    let revoked = call_tool(
+        &client,
+        "revocation_witness",
+        json!({ "delegation_hash": hex::encode(dh) })
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .await;
+    assert!(revoked.is_error.unwrap_or(false));
+    assert_eq!(error_code(&revoked), "E_REVOKED");
 
     client.cancel().await?;
     server_handle.await??;

@@ -1250,6 +1250,60 @@ verify.sh 专属），本地参考机全量实证。
 诚实边界：demo 笔数 3（真电路证明 ~1.3s/笔，100k 笔吞吐口径仍归 `m1_demo` 的占位缝 +
 递归聚合 §5.4 Phase 2）；`m1_demo` 本体不动（占位 ZK 缝是 M1 吞吐规格的诚实实现）。
 
+### 6.16 mcp-server 证明直通（S-52，keyless 保形的真 ZK 装配，候选⑤收口）
+
+§6.13–§6.15 的装配面落在 SDK / 网关 / 桥 / demo 四处后，MCP 面仍是**双重占位**：服务器
+自建占位证明（`AppState::build_proof`）+ `FormatVerifier`。本件把 MCP 面收口为
+**证明直通**，同时不动摇 keyless 安全模型（`mcp-server/README.md` D3：服务器无任何私钥）。
+
+**设计决策（记录在案，候选⑤「keyless 模型需先定夺」的定夺结果）**——`attestation_secret`
+不上服务器，三条路取其三：
+
+1. secret 上服务器 + 服务器代证 = **否决**：违背 D3 双钥分离（私钥进无信任边界的外围 =
+   扩大攻击面），把 Shape 1 降级成 Shape 2。
+2. 维持双重占位 = **否决**：bb 装配普及后 MCP 面成为唯一无法接入真 ZK 的集成层。
+3. **证明直通（采纳）**：证明是**数据**不是密钥——真证明由框架侧客户端产出（`NoirProver`
+   持 attestation secret，§6.14 `SdkClient::with_noir` 同源模型的客户端形态），作为
+   `pay` 入参随意图一起提交，服务器只做**验证**。这与网关摄取面的信任模型完全一致
+   （§6.7：客户端提交信封、服务器验证记账），MCP 层从「自证自验的占位闭环」升级为
+   「验证面真 ZK + 证明来源外置」。
+
+**线格式（`meridian.pay` 入参新增 optional `proof` 对象）**：
+
+```json
+{ "proof_hex": "<bb UltraHonk 证明字节，hex>",
+  "agent_commit": "<32B hex>", "revocation_root": "<32B hex>", "now": <unix 秒> }
+```
+
+公共输入的**共享字段**（`delegation_hash` / `recipient` / `amount` / `category` /
+`spend_nonce` / `expires_at`）不由客户端重复上报——服务器从信封内 intent 派生，
+`check_public_inputs_consistent`（§6.2 步 8）保证派生结果与证明声称的是同一笔意图；
+客户端只上报**服务器无法自知的三个自由量**：`agent_commit`（客户端 attestation 身份）、
+`revocation_root`（客户端所锚定的撤销状态）、`now`（证明时刻）。缺省 `proof` 缺席 =
+服务器占位证明（`build_proof`，占位口径**逐字节不变**）——向后兼容，存量框架无感。
+
+**装配面（`meridian-mcp` bin，网关 bin 同款）**：`MERIDIAN_VERIFY_BACKEND`（缺省
+`format` 口径不变；`bb` → `BbVerifier::from_env`，工具链不可得**启动即退** fail-closed）
++ S-48 构造期配对闸（`requires_revocation_root_binding()` ⇒ `enforce_revocation_root =
+true`）。bb 模式下占位证明 / 派生错位 / 篡改任一公共输入 = 密码学拒 `E_PROOF`。
+
+**新工具 `meridian.revocation_witness`（第 6 个工具）**：客户端构建真证明所需的**唯一
+服务器侧事实**——S-45 网关 `GET /v1/revocation-witness/{dh}` 的 MCP 面（`root` 64hex +
+`path` 256×32B 扁平 hex = 16384 字符，MCP 面首次大载荷）；已撤销 → `E_REVOKED`
+（§11 同码）。没有它，MCP 客户端拿不到非成员路径，真证明无从谈起。
+
+**测试**：`mcp_flow` +3（直通证明被验证器**真实消费**——`RejectAllVerifier` 对照组
+`E_PROOF`，服务器绝不偷偷换成自己的占位；缺省口径占位不变；witness 工具正/负向）+
+门控 e2e `MERIDIAN_MCP_NOIR_E2E=1`（`mcp-server/tests/mcp_noir_e2e.rs`：客户端侧
+`NoirProver` 真电路证明 → MCP `pay` 工具 → `BbVerifier` + 撤销根绑定闸聚合器接受；
+对照组：同一聚合器上占位 `pay` 必拒 `E_PROOF`）。verify.sh **9f** + CI noir job 同款。
+
+**诚实边界**：`format` 缺省后端下 `agent_commit` / `revocation_root` / `now` 三个自由量
+无密码学约束（与网关格式口径一致，真约束在 bb 装配 + 撤销根绑定闸）；服务器侧产证明
+**不在本件也永远不在**（keyless 是设计约束不是待办）；证明 8128B 经 JSON hex 走 stdio，
+MCP 面单笔载荷 ~20KB（吞吐口径不适用于 MCP 面）；WAL 不落证明（`RecordKind::Intent`
+固定 116B payload，§10），直通不影响 WAL 格式与恢复语义。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）

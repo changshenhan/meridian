@@ -1,9 +1,10 @@
 # meridian-mcp — S-13 MCP 正式版
 
 **MCP stdio 服务器**：内嵌**真实聚合器内核**（WAL + 幂等 re-ack + seq + 预算强制），
-向主流 agent 框架暴露 5 个工具——`authorize` / `pay` / `balance` / `attest` /
-`verify_receipt`。**服务器无任何私钥**：owner secp256k1 与 agent Ed25519 签名都在
-框架侧完成，服务器只验签 + 执行。
+向主流 agent 框架暴露 6 个工具——`authorize` / `pay` / `balance` / `attest` /
+`verify_receipt` / `revocation_witness`。**服务器无任何私钥**：owner secp256k1 与
+agent Ed25519 签名都在框架侧完成，服务器只验签 + 执行；S-52 起 ZK 证明同样在框架侧
+产出（`pay` 可选 `proof` 入参直通验证，见决策记录 D6）。
 
 ## 运行
 
@@ -23,10 +24,11 @@ MERIDIAN_WAL_DIR=demos/.wal target/release/meridian-mcp
 | 工具 | 入参 | 返回 | 校验 |
 |---|---|---|---|
 | `authorize` | 委托全字段 + owner secp256k1 签名 + owner/agent 公钥（hex） | `AuthorizeReceipt` | owner 签名有效；委托字段自洽；绑定 agent 身份；防换钥重绑；幂等（同委托同 agent 重发返回既有回执） |
-| `pay` | intent 全字段 + agent Ed25519 签名（hex） | `PayReceipt {intent_hash, seq, spend_nonce}` | 委托已注册；agent 签名；幂等 re-ack；预算规则；WAL 落盘 |
+| `pay` | intent 全字段 + agent Ed25519 签名（hex）+ 可选 `proof`（S-52 直通证明） | `PayReceipt {intent_hash, seq, spend_nonce}` | 委托已注册；agent 签名；幂等 re-ack；预算规则；WAL 落盘 |
 | `balance` | `delegation_hash` | `BalanceReceipt {delegation_hash, total_spent, total_cap, remaining}` | 委托已注册 |
 | `attest` | `delegation_hash, pk_x, pk_y, binding` | `AttestReceipt {delegation_hash, pk_x, pk_y, agent_commit, binding}` | authorize 时绑定的 agent Ed25519 对 binding 消息验签 |
 | `verify_receipt` | `delegation_hash, spend_nonce, intent_hash` | `VerifyReceiptResult {delegation_hash, spend_nonce, intent_hash, accepted, seq}` | 只读；聚合器幂等表确认 |
+| `revocation_witness` | `delegation_hash` | `WitnessReceipt {delegation_hash, root, path}`（S-52，path = 256×32B 扁平 hex） | 只读；目标已撤销 → `E_REVOKED`（非成员接口不给成员陈述） |
 
 错误统一回 `{"ok":false,"error":"E_..."}` 形式的工具错误（`is_error=true`）。错误码
 见 `meridian_core::error::Error::as_code()`：
@@ -84,9 +86,13 @@ cd eliza && node eliza_client.mjs
 
 ## 诚实边界
 
-1. **占位证明服务器侧（TEMPORARY）**：`pay` 由服务器用占位证明构造信封，真实
-   `FormatVerifier` 只查 proof 非空 + public_inputs↔intent 一致性。真 S-09 电路
-   prover 插 `SpendVerifier` 同缝，`pay` 不改。
+1. **证明来源分派（S-52 收口）**：`pay` 的 `proof` 入参缺席 = 服务器占位证明
+   （缺省口径，`FormatVerifier` 只查 proof 非空 + public_inputs↔intent 一致性，逐字节
+   不变）；携带 = **客户端直通**（框架侧 `NoirProver` 产真电路证明，服务器只验证，
+   D6）。真验证语义经 `MERIDIAN_VERIFY_BACKEND=bb`（`BbVerifier` + 撤销根绑定闸，
+   网关 bin 同款）开启——bb 装配下占位 pay / 篡改任一公共输入 = 密码学拒 `E_PROOF`。
+   **format 缺省后端下 `agent_commit` / `revocation_root` / `now` 三个自由量无密码学
+   约束**（与网关格式口径一致）。
 2. **WAL 本步只追加、不恢复**（restore_from_wal 后续）：每 boot `Aggregator::new`
    重建状态。重启后 EAttestBind 靠 `Aggregator::registered` 兜底（authorize 同时查
    注册表）；客户端重发语义按 S-12（同意图重发 re-ack、跨意图 E_NONCE），首笔
@@ -101,7 +107,7 @@ cd eliza && node eliza_client.mjs
 |---|---|---|
 | 状态层 | 手写 Mutex<HashMap> + ShardedLedger + payment_counter | **真实 `Aggregator` 内核**（WAL + 幂等 + seq + 预算） |
 | pay 回执 | `{payment_id, total_spent, remaining}` | `{intent_hash, seq, spend_nonce}`（幂等 re-ack：同意图重发返回原 seq） |
-| 工具数 | 2（authorize/pay） | 5（+ balance / attest / verify_receipt） |
+| 工具数 | 2（authorize/pay） | 6（+ balance / attest / verify_receipt / revocation_witness，S-52） |
 | 错误码 | 未授权 pay → `E_DELEG_EXPIRED` | 未授权 pay → **`E_DELEG_UNKNOWN`**（委托已过期 ≠ 从未注册） |
 | 幂等 | 无（重放即拒） | S-12 幂等闸口：re-ack / E_NONCE |
 
@@ -130,17 +136,33 @@ binding 消息 = `MERIDIAN-BINDING-v1\0 || x_le || y_le`，`agent_commit = sha25
 MCP 服务器内嵌真实聚合器（WAL），框架经 stdio 连各自实例。网络 Transport + 独立
 聚合器服务推迟到 S-15（TECH_SPEC §6.6 记接缝）。
 
+### D6. 真 ZK 走证明直通，不走服务器代证（S-52）
+S-40/S-43/S-46/S-47/S-51 把装配面铺到 SDK / 网关 / 桥 / demo 后，MCP 面如何接真 ZK
+有三条路：secret 上服务器代证 = 违背 D3（否决）；维持双重占位 = bb 普及后 MCP 成为
+唯一接不进真 ZK 的集成层（否决）；**证明直通（采纳，TECH_SPEC §6.16）**——证明是数据
+不是密钥，框架侧客户端持 `attestation_secret` 产真电路证明（`NoirProver`，`SdkClient::
+with_noir` 同源模型的客户端形态），作为 `pay` 的可选 `proof` 入参随意图提交，服务器只
+验证。这与网关摄取面的信任模型一致（客户端提交信封、服务器验证记账）。配套新增第 6
+工具 `revocation_witness`（客户端构建真证明所需的唯一服务器侧事实，S-45 网关端点的
+MCP 面）；bin 经 `MERIDIAN_VERIFY_BACKEND=bb` 装配真验证后端 + S-48 撤销根绑定闸。
+`attestation_secret` 永不上服务器——keyless 是设计约束不是待办。
+
 ## 测试
 
 ```bash
-cargo test -p meridian-mcp        # 单元 + 9 集成（真实聚合器 + 临时 WAL + rmcp duplex）
+cargo test -p meridian-mcp        # 单元 + 12 集成（真实聚合器 + 临时 WAL + rmcp duplex）
 cargo clippy -p meridian-mcp --all-targets -- -D warnings
 ```
 
 集成测试 `tests/mcp_flow.rs` 用官方 rmcp client 通过 `tokio::io::duplex` 连
 MeridianServer，走完整 MCP JSON-RPC：authorize→pay 闭环、幂等 re-ack、伪造签名、
-超预算、未注册、verify_receipt、attest 篡改全部覆盖。**密钥与签名全部用 core 原语
-现场构造，绝无 mock。**
+超预算、未注册、verify_receipt、attest 篡改、客户端直通证明（format 后端接受 +
+`RejectAllVerifier` 对照组证真通进验证缝）、revocation_witness 正/负向全部覆盖。
+**密钥与签名全部用 core 原语现场构造，绝无 mock。**
+
+门控 e2e `tests/mcp_noir_e2e.rs`（`MERIDIAN_MCP_NOIR_E2E=1`，verify.sh 步 9f / CI
+noir job）：客户端侧 `NoirProver` 真电路证明 → MCP `pay` 直通 → `BbVerifier` +
+撤销根绑定闸聚合器密码学接受；对照组占位 pay 必拒 `E_PROOF`。
 
 ## 布局
 
@@ -148,8 +170,9 @@ MeridianServer，走完整 MCP JSON-RPC：authorize→pay 闭环、幂等 re-ack
 mcp-server/
 ├── src/
 │   ├── lib.rs        # MeridianServer::new(Arc<Aggregator>) + ServerHandler
-│   ├── state.rs      # 薄 keyless 层：验签 + 挂真实聚合器 + 5 工具回执
+│   ├── state.rs      # 薄 keyless 层：验签 + 挂真实聚合器 + 6 工具回执
 │   ├── tools.rs      # #[tool_router]/#[tool_handler] + 入参类型 + hex 解码
-│   └── main.rs       # stdio 入口（WAL 路径优先级 + 聚合器接线）
-└── tests/mcp_flow.rs # 9 个验收集成测试（真实 MCP client + 临时 WAL）
+│   └── main.rs       # stdio 入口（WAL 路径优先级 + 验证后端装配 + 聚合器接线）
+├── tests/mcp_flow.rs     # 12 个验收集成测试（真实 MCP client + 临时 WAL）
+└── tests/mcp_noir_e2e.rs # S-52 门控真 ZK e2e（MERIDIAN_MCP_NOIR_E2E=1）
 ```

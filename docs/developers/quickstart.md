@@ -82,8 +82,9 @@ let receipt = client.pay(&PayParams {
 let cred = client.attest_identity()?;
 ```
 
-不需要 Rust？agent 框架走 MCP（第 3 步）即可，5 个工具覆盖 authorize / pay / balance /
-attest / verify_receipt，密钥由框架侧持有（服务器 keyless）。
+不需要 Rust？agent 框架走 MCP（第 3 步）即可，6 个工具覆盖 authorize / pay / balance /
+attest / verify_receipt / revocation_witness，密钥（及 ZK 证明）由框架侧持有（服务器
+keyless，S-52：pay 可选 proof 直通真 ZK 证明，服务器只验证）。
 
 ## 下一步
 
