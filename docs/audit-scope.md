@@ -52,9 +52,10 @@
 - **ZK 电路**（`circuits/`，Noir）：约束逻辑审计需 Noir 专长，单独二期。当前生产摄取
   路径**缺省**用 `FormatVerifier`（TEMPORARY 占位），**未**依赖电路正确性——审计报告
   须注明此临时态。S-40（2026-08-30）已交付真验证后端 `BbVerifier`（bb CLI wrapper，
-  TECH_SPEC §6.13）：`MERIDIAN_VERIFY_BACKEND=bb` 显式开启后摄取路径**依赖电路正确性**
+  TECH_SPEC §6.13）；**prove 侧 S-43（2026-08-30）已实装**（`NoirProver`，TECH_SPEC
+  §6.14）。`MERIDIAN_VERIFY_BACKEND=bb` 显式开启后摄取路径**依赖电路正确性**
   （电路进审计范围）；该模式同时要求真电路 prover 产物（`PlaceholderProver` 产物会被
-  fail-closed 全拒），prove 侧实装仍是独立交付物。
+  fail-closed 全拒）。全链真 ZK 装配的可运行示例见 §6.15（`noir_demo`）。
 - 聚合器内核 Rust 侧（WAL/lattice）：不持链上资产，故障模式 = 停机非盗币；作为
   运营风险单独评估。
 - 网关/SDK（S-29）：明文 HTTP 已披露（部署须 TLS 反代）。
@@ -66,9 +67,11 @@
   depth 256，索引 = delegation_hash 全 32B LE，TECH_SPEC §5.3）。相异 delegation_hash 在两侧
   均派生相异叶。**哈希函数/叶值规范错配也已收口（S-41，2026-08-30）**：聚合器侧改为与电路
   同一棵 Pedersen 树（`aggregator/src/noir_pedersen.rs`，bb 预计算生成器硬编码 + 三层验证锚，
-  TECH_SPEC §4.6），根数值可比。残余：聚合器尚不产出非成员路径（prover 侧消费，下一步
-  候选②）；当前生产摄取路径 `FormatVerifier`（TEMPORARY）从不读 `pi.revocation_root`，
-  真正的 `E_REVOKED` 闸口在 `submit()`。
+  TECH_SPEC §4.6），根数值可比。**非成员路径也已产出（S-42，2026-08-30）**并由真 prover
+  消费（S-43 电路自校验重算根对账）、绑定闸收口（S-44/S-48：`enforce_revocation_root`，
+  证明公共输入 `revocation_root` 必须 ∈ 本账本撤销状态根集合）。残余：当前生产摄取路径
+  `FormatVerifier`（TEMPORARY）从不读 `pi.revocation_root`，真正的 `E_REVOKED` 闸口在
+  `submit()`。
 - 超付不可证（需完备性）——设计上接受，出界记录见 TECH_SPEC §6.5。
 - ~~challenge 无押金~~——**S-38 已收口（2026-08-30）**：`challenge` 变 `payable`，随笔押金
   （原生 ETH）；押金入场后任何实质验证失败不再 revert，改为 `ChallengeRejected` 事件 +

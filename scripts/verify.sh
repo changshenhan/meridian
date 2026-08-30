@@ -197,6 +197,20 @@ else
     skip "circuits/target/{spend_authorization.json,vk} 不存在（第 9 步 ZK 被跳过）→ bridge noir-prover e2e 跳过"
 fi
 
+# S-51：demo 层真 ZK 装配示例（TECH_SPEC §6.15）。with_noir 装配 → 真电路证明 →
+# BbVerifier + 撤销根绑定闸 → BatchSettler Anvil 净额结算（撤销根三方同源断言）。
+# 依赖第 9 步刚产出的 circuits/target/{spend_authorization.json,vk} + 步 8/10 同款
+# anvil 工具链；缺任一即同口径跳过。CI 不跑（noir job 无 anvil、solidity job 无
+# nargo/bb，§6.15 诚实边界——同 m1_demo 的 CI 口径）。
+if [ -f "$ROOT/circuits/target/spend_authorization.json" ] && [ -f "$ROOT/circuits/target/vk" ] \
+   && { command -v anvil >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/anvil" ]; }; then
+    step "9e/10 demo 层真 ZK 装配示例 (S-51, with_noir × BbVerifier × BatchSettler)"
+    run "noir demo e2e" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && MERIDIAN_NOIR_DEMO=1 cargo run --quiet --bin noir_demo'
+else
+    step "9e/10 demo 层真 ZK 装配示例 (S-51)"
+    skip "circuits 工件 / anvil 不可得 → demo 层真 ZK 示例跳过"
+fi
+
 if [ -f "$ROOT/target/Prover.toml.pregate" ] && ! cmp -s "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"; then
     cp "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"
     printf '    \033[1;33m[CLEAN]\033[0m gen-witness/Prover.toml 已还原（nargo --overwrite-return 改写，return 键不进版本库）\n'

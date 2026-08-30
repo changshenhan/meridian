@@ -1325,6 +1325,7 @@ dependencies = [
  "hex",
  "meridian-aggregator",
  "meridian-core",
+ "meridian-sdk",
  "serde_json",
  "tokio",
  "url",
@@ -2706,6 +2707,21 @@ dependencies = [
  "k256",
  "serde",
  "sha2",
+]
+
+[[package]]
+name = "meridian-sdk"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "k256",
+ "meridian-aggregator",
+ "meridian-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3 0.10.9",
 ]
 
 [[package]]

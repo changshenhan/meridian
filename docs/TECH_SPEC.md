@@ -1214,6 +1214,42 @@ Noir**（S-05 教训守住）。装配：`SdkClient::with_noir(wallet, transport
 4. gen-witness 的 `MAX_REVOKED = 2` 固定撤销集仍只服务正式管线 fixture；真撤销 witness
    一律来自聚合器 `RevocationSet`（S-42），oracle 的撤销树输出弃用。
 
+### 6.15 demo 层真 ZK 装配示例（S-51，M1 真 ZK capstone，候选⑥）
+
+§6.13/§6.14 的装配面（SDK `with_noir`、网关 bb、桥 noir 装配）此前的实证都在 **crate e2e
+测试**里；demo/smoke 层（`contracts/rust-smoke` 的 Anvil 端到端）仍只有占位 ZK 缝
+（`m1_demo` A 段）。本件补 demo 层真 ZK 装配示例：`contracts/rust-smoke/src/bin/noir_demo.rs`
+（独立 workspace 新 bin，`MERIDIAN_NOIR_DEMO=1` 门控，verify.sh 步 9e）——**真电路证明 →
+真验证后端 + 撤销根绑定闸 → 链上净额结算，撤销根三方同源**的 M1 形态首次走通：
+
+1. **装配面（§6.14 全套，demo 即可运行的装配答案）**：`SdkClient::with_noir(wallet,
+   transport, NoirProver, attestation_secret)` + `InProcessAggregator`（`BbVerifier::
+   from_parts(vk, backend, tmp_root)` + `IngestConfig::enforce_revocation_root = true`，
+   §6.13/§6.2/§6.14 同口径；S-48 构造期配对闸在此生效）。
+2. **授权上下文**：`client.authorize()`（S-46 NonceManager 1 起口径）→ `create_delegation`
+   同参数重建同 dh（assert 相等）→ 链上 `DSA.registerDelegation`，`isRegistered(dh)`
+   断言 **sha256(delegationABI) == meridian-core delegation_hash**（m1_demo 同款交叉实现
+   契约，S-11d）。
+3. **撤销根三方同源断言（本件核心）**：聚合器 `revoke(另一委托)`（撤销集非空，绑定闸
+   接受集含真实状态根）→ `pay()` 现取 witness（S-45）→ 证明公共输入 `revocation_root`
+   经绑定闸锚定本账本撤销树 → seal 后 `EpochResult.revocation_root` == 证明所用的
+   witness 根（**逐字节**，S-41 同棵 Pedersen 树的可比性）→ 该根上链
+   `BatchSettler.commit`——agent 证明、聚合器账本、链上结算三方同一撤销状态根。
+4. **对照组（诚实口径）**：占位 `SdkClient::new`（同 dh，`sync_nonce` 推进到远端后）
+   `pay()` 在同一 BbVerifier 聚合器上必拒 `E_PROOF`——bb 全拒占位证明，正向的接受不是
+   占位漏网（S-47 桥 e2e 对照组同口径）。
+5. **链上净额结算**：`seal_expired`（epoch_capacity = 笔数，满窗即封）→ `settle_epoch` →
+   `commit(债券)` → `settle(Σnet)` → 过挑战窗 → 逐收款人 `claim`，余额增量 == 净额行
+   （m1_demo E 段同款，笔数小、走真 ZK）。
+
+门禁：verify.sh **9e**（工件依赖 9b/9c/9d 同款 `circuits/target/{spend_authorization.json,
+vk}` + anvil 可得；缺任一即 `[SKIP]`）。**CI 不跑本步**（noir job 无 anvil、solidity job
+无 nargo/bb，跨 job 工具链拼装收益不抵复杂度；同 `m1_demo` 的 CI 口径——S-14a 起即
+verify.sh 专属），本地参考机全量实证。
+
+诚实边界：demo 笔数 3（真电路证明 ~1.3s/笔，100k 笔吞吐口径仍归 `m1_demo` 的占位缝 +
+递归聚合 §5.4 Phase 2）；`m1_demo` 本体不动（占位 ZK 缝是 M1 吞吐规格的诚实实现）。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）

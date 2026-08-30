@@ -59,8 +59,11 @@ Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互
 - **不做新链**：结算在链上**净额**进行（BatchSettler 挑战-担保-净额结算），单笔意图不进链。
 - **性能即护城河**：Phase 0 PoC 实测 488,738 笔/s（满核）；M1 demo 单委托 100k 笔
   ~28k 笔/s 顺序提交全绿。每行代码按"要发表 benchmark"的要求写。
-- **诚实边界**：ZK 证明目前是**占位**（TEMPORARY，`FormatVerifier` 只查格式与一致性），
-  真实 UltraPlonk 电路 prover 插同一 `SpendVerifier` 缝即可切换，上层 API 不变。
+- **诚实边界**：ZK 证明的**缺省**路径仍是**占位**（`FormatVerifier` 只查格式与一致性 /
+  `PlaceholderProver`）——生产默认不动。真电路两侧已交付（S-40 `BbVerifier` /
+  S-43 `NoirProver`），经显式装配开启（网关 `MERIDIAN_VERIFY_BACKEND=bb` + SDK
+  `SdkClient::with_noir` + `enforce_revocation_root`，TECH_SPEC §6.13/§6.14/§6.15；
+  `contracts/rust-smoke/src/bin/noir_demo.rs` 是可运行的装配示例），上层 API 不变。
 
 ## 仓库结构
 
