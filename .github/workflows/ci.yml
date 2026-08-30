@@ -118,6 +118,15 @@ jobs:
           export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"
           MERIDIAN_ZK_PROVER_E2E=1 cargo test -p meridian-sdk --test noir_prover_e2e
 
+      # S-47（TECH_SPEC §6.10/§6.14）：桥接真 prover e2e——facilitator EIP-3009 桥经
+      # BridgeConfig.noir（SdkClient::with_noir）在真 BbVerifier 网关上摄取成功；
+      # 占位桥对照组 402（bb 全拒占位证明）。与本地 verify.sh 步 9d 同一测试
+      # （过滤器只选 noir 桥用例），nargo 走 ubuntu 原生 PATH。
+      - name: bridge noir-prover e2e (S-47)
+        run: |
+          export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"
+          MERIDIAN_ZK_PROVER_E2E=1 cargo test -p meridian-facilitator --test facilitator e2e_bridge_with_noir_prover
+
       - name: upload ZK artifacts (baseline report + EVM verifier)
         uses: actions/upload-artifact@v4
         with:

@@ -78,6 +78,11 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
    EIP-712 domain 由配置显式给出。测试：eip3009 单测 7 + facilitator handle 纯分发 2 +
    真 socket e2e（exact client → 真摄取真记账 1 笔 → 重放不摄取 → 伪造 402）
    + S-33 增量（journal 单测 4 + open 重建 1 + 重启后重放闸 e2e 1）。
+   **真 prover 装配（S-47，2026-08-30，TECH_SPEC §6.10/§6.14）**：`BridgeConfig.noir`
+   （bin `MERIDIAN_BRIDGE_NOIR=1` + `MERIDIAN_BRIDGE_NOIR_ROOT` + `MERIDIAN_BRIDGE_ATTEST_SECRET`）
+   经 `SdkClient::with_noir` 装配真电路 prover（§6.14 同源装配——S-46 装配面的首个
+   二进制消费方）；缺省占位不变。门控 e2e：noir 装配桥在真 BbVerifier 网关
+   （`enforce_revocation_root = true`）摄取 200，占位桥对照组 402（bb 全拒占位证明）。
 4. **规范上游**：x402 规范仍在演进，scheme 扩展注册路径未定——设计稿按"自定义 scheme"
    起步，跟进上游后再标准化。
 

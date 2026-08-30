@@ -15,6 +15,15 @@
 //! - `MERIDIAN_BRIDGE_DOMAIN_NAME`（缺省 `USD Coin`）/ `MERIDIAN_BRIDGE_DOMAIN_VERSION`（缺省 `2`）
 //! - `MERIDIAN_BRIDGE_CHAIN_ID`（缺省 8453）/ 域合约缺省取 `MERIDIAN_ASSET`（USDC 主网）
 //! - `MERIDIAN_BRIDGE_REPLAY_JOURNAL`（可选，S-33 重放闸持久化文件路径；缺省进程内存态）
+//! - `MERIDIAN_BRIDGE_NOIR`（可选，S-47 真 prover 装配，TECH_SPEC §6.10/§6.14）：`=1`
+//!   时垫付 client 经 `SdkClient::with_noir` 用真电路 prover（NoirProver，§6.14 同源
+//!   装配）；缺省占位 prover（口径同 `MERIDIAN_VERIFY_BACKEND` 缺省 `format`——生产
+//!   默认不动，真后端显式开启）。
+//!   - `MERIDIAN_BRIDGE_NOIR_ROOT`（noir 模式可选，缺省 `.`）：仓库根（`gen-witness/`
+//!     + `circuits/` 所在目录）；启动期检查两目录存在（fail-fast，配置错误启动即暴露）。
+//!   - `MERIDIAN_BRIDGE_ATTEST_SECRET`（noir 模式必填，0x 32B hex）：attestation 私钥
+//!     标量（熵由调用方供给，SDK 不生成随机熵，§6.14 诚实边界 2）；prove/keygen 入口
+//!     另有值域闸（< EdDSA 子群阶，越界 `E_PROVER` fail-closed）。
 
 use std::net::TcpListener;
 use std::path::Path;
@@ -80,7 +89,31 @@ fn bridge_config(gateway_addr: String, gateway_bearer: String, asset: &str) -> B
             not_before: 0,
             expires_at: u64::MAX,
         },
+        noir: noir_assembly(),
     }
+}
+
+/// 真 prover 装配（S-47，TECH_SPEC §6.10 第 4 步 / §6.14 CLI 消费）。
+/// `MERIDIAN_BRIDGE_NOIR=1` 才启用；缺省 `None`（占位 prover，口径逐字节不变）。
+/// 仓库根目录存在性在此 fail-fast（配置错误启动即暴露，同缺种子 panic 口径）；
+/// 工具链探测仍惰性（首次 `pay()` 时 `NoirProver::from_dirs`，不可得 `E_PROVER`
+/// → 503 fail-closed）。
+fn noir_assembly() -> Option<meridian_facilitator::eip3009::NoirAssembly> {
+    if env_or("MERIDIAN_BRIDGE_NOIR", "0") != "1" {
+        return None;
+    }
+    let root = std::path::PathBuf::from(env_or("MERIDIAN_BRIDGE_NOIR_ROOT", "."));
+    for dir in ["gen-witness", "circuits"] {
+        assert!(
+            root.join(dir).is_dir(),
+            "MERIDIAN_BRIDGE_NOIR_ROOT({}) 缺 {dir}/ 目录（NoirProver 仓库布局装配需要）",
+            root.display()
+        );
+    }
+    Some(meridian_facilitator::eip3009::NoirAssembly {
+        root,
+        attestation_secret: env_seed("MERIDIAN_BRIDGE_ATTEST_SECRET"),
+    })
 }
 
 fn main() {
@@ -125,6 +158,13 @@ fn main() {
     } else {
         None
     };
+    // S-47 可观测：垫付 client prover 模式（noir = 真电路 prover，§6.14 同源装配）。
+    if let Some(b) = &bridge {
+        eprintln!(
+            "meridian-facilitator: bridge prover={} (TECH_SPEC §6.10/§6.14)",
+            b.prover_mode()
+        );
+    }
     let bridge_enabled = bridge.is_some();
     let addr = format!("127.0.0.1:{}", env_or("PORT", "9500"));
 

@@ -159,6 +159,19 @@ impl From<SdkError> for BridgeError {
     }
 }
 
+/// 真 prover 装配参数（S-47，TECH_SPEC §6.10 第 4 步 / §6.14 CLI 消费）。
+///
+/// 纯数据投影（bin 从环境变量解析）；`NoirProver` 在 `register_operator` 惰性构造
+/// （工具链探测 fail fast → `E_PROVER` → 503 fail-closed）。熵（`attestation_secret`）
+/// 由调用方供给——SDK 不生成随机熵（§6.14 诚实边界 2）。
+#[derive(Debug, Clone)]
+pub struct NoirAssembly {
+    /// 仓库根（`<root>/gen-witness` + `<root>/circuits`，`NoirProver::from_repo_root`）。
+    pub root: std::path::PathBuf,
+    /// attestation 私钥标量（LE 32B，值域闸 `< SUBORDER` 在 prove / keygen 入口）。
+    pub attestation_secret: [u8; 32],
+}
+
 /// 桥配置。
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -174,6 +187,10 @@ pub struct BridgeConfig {
     pub owner_seed: [u8; 32],
     /// 垫付委托限额（预算 / 速率 / 类别白名单照常生效）。
     pub limits: meridian_sdk::DelegationLimits,
+    /// 真 prover 装配（S-47）：`None` = 占位 prover（缺省，口径逐字节不变）；
+    /// `Some` = `SdkClient::with_noir`（§6.14 同源装配）。与 §6.13
+    /// `MERIDIAN_VERIFY_BACKEND` 缺省 `format` 同口径：生产默认不动。
+    pub noir: Option<NoirAssembly>,
 }
 
 /// 资源绑定参数（facilitator 配置投影，桥校验用）。
@@ -245,6 +262,15 @@ impl Eip3009Bridge {
 
     pub fn config(&self) -> &BridgeConfig {
         &self.cfg
+    }
+
+    /// 垫付 client prover 模式（S-47 可观测：bin 启动日志用）。
+    /// `"noir"` = 真电路 prover（§6.14 同源装配）；`"placeholder"` = 占位（缺省）。
+    pub fn prover_mode(&self) -> &'static str {
+        match &self.cfg.noir {
+            Some(_) => "noir",
+            None => "placeholder",
+        }
     }
 
     /// 重放闸登记数（可观测：重放不再摄取）。
@@ -399,7 +425,18 @@ pub fn agent_did(agent_seed: &[u8; 32]) -> [u8; 20] {
 fn register_operator(cfg: &BridgeConfig) -> Result<BridgeClient, SdkError> {
     let wallet = AgentWallet::from_seed(cfg.agent_seed);
     let transport = HttpTransport::new(&cfg.gateway_addr, &cfg.gateway_bearer);
-    let client = SdkClient::new(wallet, Box::new(transport));
+    // 真 prover 装配（S-47）：`with_noir` 把同一 `NoirProver` 实例装配为 prove 后端
+    // 与 attestation keyring（§6.14 同源）；缺省占位（口径逐字节不变）。
+    let client = match &cfg.noir {
+        Some(a) => {
+            // 工具链不可得 = `E_PROVER`（fail-closed，绝不降级回占位证明，§6.14 口径）；
+            // 经 `Meridian` 变体透传错误码（永不重试），不吞成 Local 文案。
+            let prover = meridian_sdk::prover::NoirProver::from_repo_root(&a.root)
+                .map_err(SdkError::Meridian)?;
+            SdkClient::with_noir(wallet, Box::new(transport), prover, a.attestation_secret)
+        }
+        None => SdkClient::new(wallet, Box::new(transport)),
+    };
     let owner = SigningKey::from_bytes(&cfg.owner_seed.into())
         .map_err(|e| SdkError::Local(format!("bad operator owner seed: {e}")))?;
     let receipt = client.authorize(&owner, agent_did(&cfg.agent_seed), &cfg.limits)?;
@@ -776,6 +813,33 @@ mod tests {
                 not_before: 0,
                 expires_at: u64::MAX,
             },
+            noir: None,
         }
+    }
+
+    /// 缺省口径自检（S-47）：`noir: None` = 占位 prover，装配投影逐字段不变。
+    #[test]
+    fn default_config_is_placeholder_prover() {
+        let cfg = bridge_cfg();
+        assert!(cfg.noir.is_none());
+        let b = Eip3009Bridge::new(cfg.clone());
+        assert_eq!(b.prover_mode(), "placeholder");
+        assert!(b.config().noir.is_none());
+    }
+
+    /// noir 装配投影（S-47）：`prover_mode` 报 `"noir"`，装配参数原样落位
+    /// （真实 prove 链路在门控 e2e——工具链重操作不进默认 cargo test）。
+    #[test]
+    fn noir_assembly_is_reported_and_carried() {
+        let mut cfg = bridge_cfg();
+        cfg.noir = Some(NoirAssembly {
+            root: std::path::PathBuf::from("/some/repo"),
+            attestation_secret: [0x0E; 32],
+        });
+        let b = Eip3009Bridge::new(cfg.clone());
+        assert_eq!(b.prover_mode(), "noir");
+        let a = b.config().noir.as_ref().expect("noir assembly");
+        assert_eq!(a.root, std::path::PathBuf::from("/some/repo"));
+        assert_eq!(a.attestation_secret, [0x0E; 32]);
     }
 }

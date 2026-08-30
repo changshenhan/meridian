@@ -860,6 +860,17 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
    `authorize` 的 delegation nonce 是进程内自增（重启归零 → 同 delegation_hash），不恢复
    则首笔支付撞已消耗 nonce（`E_NONCE` 定局拒）。摄取仍走**全量 DSA 闸口**（预算/速率/
    撤销/ZK 证明），桥不旁路任何协议层检查。
+   **真 prover 装配（S-47，S-46 候选⑤首块）**：`BridgeConfig.noir`（`None` = 占位
+   prover，缺省口径逐字节不变；`Some(NoirAssembly { root, attestation_secret })` =
+   `NoirProver::from_repo_root(root)` + `SdkClient::with_noir`，§6.14 同源装配——垫付
+   client 的 prove 后端与 attestation keyring 同一实例同一 secret）。缺省占位与
+   §6.13 `MERIDIAN_VERIFY_BACKEND` 缺省 `format`、§6.14 缺省 `PlaceholderProver`
+   同口径：生产默认不动，真后端显式开启。bin 侧 `MERIDIAN_BRIDGE_NOIR=1` +
+   `MERIDIAN_BRIDGE_NOIR_ROOT`（缺省 `.`）+ `MERIDIAN_BRIDGE_ATTEST_SECRET`
+   （0x 32B hex，启用时必填——熵由调用方供给，SDK 不生成随机熵，§6.14 诚实边界 2）；
+   启动期检查 root 下 `gen-witness/` 与 `circuits/` 存在（fail-fast，配置错误启动即
+   暴露，同缺种子 panic 口径），工具链探测仍惰性（首次 `pay()` 时
+   `NoirProver::from_dirs`，不可得 `E_PROVER` → 503 fail-closed）。
 5. **重放闸**：进程内 `(from, eip3009_nonce) → intent_hash` 映射——同 payload
    重放不再摄取，直接落 §6.9 的回执查询路径（accepted → 200 / 未命中 → 402）。
 6. 桥的 `SdkError` 不透传内部细节：摄取失败统一 402（业务拒绝）或 503（网关
@@ -899,6 +910,11 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
 （facilitator 带 `MERIDIAN_BRIDGE_REPLAY_JOURNAL` 摄取 1 笔 → **销毁重建**（同日志路径）
 → 同 payload 重放 200 且 `accepted_count` 不变（重启后重放闸仍命中）；新 nonce 正常摄取
 （闸不误挡））。
+**S-47 增量**：`BridgeConfig.noir` 装配单测（缺省 `None` 口径逐字节不变 / noir 装配
+`config()` 投影）+ 门控 e2e（`MERIDIAN_ZK_PROVER_E2E=1`，与 §6.14 9c 同门同工件）：
+真 BbVerifier 网关（`enforce_revocation_root = true`）+ noir 装配桥摄取 1 笔 →
+真电路证明经 `with_noir` 垫付 client 产出并被聚合器密码学接受（占位证明在 bb 模式下
+必被全拒，§6.13——e2e 通过本身即证装配生效），重放同 payload 落重放闸不再摄取。
 
 ### 6.11 热路径延迟直方图（S-35，ops.md §5 挂账项收口）
 
@@ -1116,7 +1132,10 @@ Noir**（S-05 教训守住）。装配：`SdkClient::with_noir(wallet, transport
 用派生公钥出绑定凭据（派生结果按 secret 键控缓存，secret 变更自动重派生）——`attest()`
 的 `agent_commit` 与 `pay()` 证明公共输入 `agent_commit` **同一 secret 单一来源**，
 「由调用方保证」的接缝关闭（e2e 实证相等）。`attest(&pk)` 显式口径保留（离线 / 外部
-注册流，如 mcp-server）。
+注册流，如 mcp-server）。**CLI 消费（S-47）**：facilitator EIP-3009 桥垫付 client
+经 `BridgeConfig.noir`（bin `MERIDIAN_BRIDGE_NOIR=1`）接入同一装配——S-46 装配面
+的首个二进制消费方（§6.10 第 4 步），`pay()` 的证明公共输入 `agent_commit` 与潜在
+`attest_identity()` 同 secret 单一来源由构造保证；缺省占位不变（口径同上）。
 
 **验收测试**：单测（scalar golden + 边界、十进制互转、Prover.toml 组装形状、路径重算根）
 + e2e（`sdk/tests/noir_prover_e2e.rs`，`MERIDIAN_ZK_PROVER_E2E=1` 门控）：真实场景
@@ -1127,6 +1146,8 @@ Noir**（S-05 教训守住）。装配：`SdkClient::with_noir(wallet, transport
 `enforce_revocation_root`，§6.2 绑定闸开启）接受，且 `attest_identity().agent_commit ==
 直接 prove 的公共输入 agent_commit`（同源实证）。接线：verify.sh 第 9 步后挂 **9c**
 （工件依赖 9b 同款：第 9 步产出编译产物与 vk）；CI noir job formal 之后同款。
+**S-47 增量**：verify.sh 挂 **9d**（同门同工件，facilitator 桥 e2e，过滤器只选 noir
+桥用例）；CI noir job 同款步。
 
 **诚实边界**：
 

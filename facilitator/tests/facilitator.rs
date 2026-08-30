@@ -15,13 +15,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use meridian_aggregator::bb::{BbBackend, BbVerifier};
 use meridian_aggregator::ingest::{Aggregator, IngestConfig};
 use meridian_aggregator::proof::FormatVerifier;
 use meridian_aggregator::wal::Wal;
 use meridian_core::dsa::owner_signing_key_from_bytes;
 use meridian_facilitator::eip3009::{
     eip3009_digest, keccak256, parse_addr20, Authorization, BridgeConfig, Eip3009Bridge,
-    Eip3009Domain, ExactPayload, ExactPayment,
+    Eip3009Domain, ExactPayload, ExactPayment, NoirAssembly,
 };
 use meridian_facilitator::{Facilitator, FacilitatorConfig};
 use meridian_gateway::http::serve as gateway_serve;
@@ -264,6 +265,7 @@ fn bridge_config(gateway_addr: &str) -> BridgeConfig {
         agent_seed: [0xAAu8; 32],
         owner_seed: [0xBBu8; 32],
         limits: limits(),
+        noir: None,
     }
 }
 
@@ -771,4 +773,205 @@ fn e2e_replay_gate_survives_bridge_restart() {
     drop(agg);
     let _ = std::fs::remove_file(&wal);
     let _ = std::fs::remove_file(&journal);
+}
+
+// ---------------------------------------------------------------------------
+// 6. S-47：桥接真 prover 装配（TECH_SPEC §6.10 第 4 步 / §6.14 CLI 消费）——
+//    `BridgeConfig.noir` 经 `SdkClient::with_noir` 装配真电路 prover 的垫付
+//    client，在真 BbVerifier 网关（enforce_revocation_root = true）上摄取成功；
+//    占位 prover 的桥在同一网关被全拒（对照：装配确实在起作用）。
+// ---------------------------------------------------------------------------
+
+/// 仓库根（`gen-witness/` + `circuits/` 布局，与 sdk e2e 同款）。
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("facilitator/ 的上级即仓库根")
+        .to_path_buf()
+}
+
+/// 真 BbVerifier 网关（§6.13 + §6.2 绑定闸开启）——占位证明在此必被全拒。
+fn spawn_gateway_bb(
+    tag: &str,
+    vk: Vec<u8>,
+    backend: &BbBackend,
+) -> (String, PathBuf, Arc<Aggregator>) {
+    // 自建 Wal（`aggregator()` 助手把 Wal 封进 FormatVerifier 聚合器，bb 模式需要
+    // 自带 BbVerifier 的聚合器）。
+    let wal_path = std::env::temp_dir().join(format!(
+        "meridian-fac-{}-{tag}-{seq}.wal",
+        std::process::id(),
+        seq = WAL_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&wal_path);
+    let wal = Wal::open(&wal_path, 1_000).expect("open wal");
+    let verifier = BbVerifier::from_parts(
+        vk,
+        backend.clone(),
+        repo_root().join(format!("target/bb-fac-bridge-{tag}")),
+    );
+    let agg = Arc::new(Aggregator::new(
+        IngestConfig {
+            enforce_revocation_root: true,
+            ..Default::default()
+        },
+        Box::new(verifier),
+        wal,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let gw = Arc::new(Gateway::with_tenants(
+        Arc::clone(&agg),
+        tenants_one(GATEWAY_KEY, "fac-noir-tenant", u64::MAX),
+        64 * 1024,
+    ));
+    std::thread::spawn(move || {
+        let _ = gateway_serve(gw, listener, 256, Duration::from_secs(5));
+    });
+    (addr, wal_path, agg)
+}
+
+#[test]
+fn e2e_bridge_with_noir_prover_pays_real_proof_into_bb_gateway() {
+    if std::env::var("MERIDIAN_ZK_PROVER_E2E").as_deref() != Ok("1") {
+        println!("SKIP: MERIDIAN_ZK_PROVER_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
+        return;
+    }
+    let root = repo_root();
+    if !root
+        .join("circuits/target/spend_authorization.json")
+        .exists()
+        || !root.join("circuits/target/vk").exists()
+    {
+        println!("SKIP: circuits/target 工件不存在（formal_zk 未跑）");
+        return;
+    }
+    let vk = std::fs::read(root.join("circuits/target/vk")).expect("read vk");
+    let backend = match BbBackend::detect() {
+        Some(b) => b,
+        None => {
+            println!("SKIP: bb 工具链不可得（Windows 原生与 WSL 兜底皆无）");
+            return;
+        }
+    };
+
+    let (gw_addr, wal, agg) = spawn_gateway_bb("e2e-noir-bridge", vk, &backend);
+    // 撤销另一张委托：撤销集非空 → 绑定闸接受集含真实状态根（非退化空根口径）。
+    let mut other = [0x3Du8; 32];
+    other[31] = 0x07;
+    agg.revoke(other);
+
+    // 桥：noir 装配（S-47）。工具链探测在首次摄取时惰性发生（register_operator）。
+    let mut cfg = bridge_config(&gw_addr);
+    cfg.noir = Some(NoirAssembly {
+        root: root.clone(),
+        attestation_secret: {
+            // 0xDEADBEEF（LE 不透明字节，< EdDSA 子群阶，§6.14 值域闸合法私钥）。
+            let mut s = [0u8; 32];
+            s[0] = 0xEF;
+            s[1] = 0xBE;
+            s[2] = 0xAD;
+            s[3] = 0xDE;
+            s
+        },
+    });
+    assert_eq!(Eip3009Bridge::new(cfg.clone()).prover_mode(), "noir");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let fac_addr = listener.local_addr().expect("addr").to_string();
+    let f = Arc::new(Facilitator::with_bridge(
+        FacilitatorConfig {
+            gateway_addr: gw_addr.clone(),
+            gateway_bearer: GATEWAY_KEY.into(),
+            resource: "http://fac.example.com/weather".into(),
+            pay_to: PAY_TO.into(),
+            amount: AMOUNT.into(),
+            network: NETWORK.into(),
+            asset: None,
+            max_timeout_seconds: 30,
+            protected_body: "{\"weather\":\"clear+28C\"}".into(),
+        },
+        Some(Eip3009Bridge::new(cfg)),
+    ));
+    std::thread::spawn(move || {
+        let _ = meridian_facilitator::http::serve(f, listener);
+    });
+    let url = format!("http://{fac_addr}/");
+
+    let domain = Eip3009Domain {
+        name: "USD Coin".into(),
+        version: "2".into(),
+        chain_id: 8453,
+        verifying_contract: parse_addr20("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+            .expect("asset addr"),
+    };
+    let (after, before) = valid_window();
+    let payment = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [5u8; 32],
+        signer_seed: [5u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x5E; 32],
+    });
+
+    // 标准 exact client → 桥摄取：witness 现取（S-45）→ with_noir 垫付 client 真证明
+    // → 网关 BbVerifier 密码学接受 + 绑定闸放行 → 200。**e2e 通过本身即证装配生效**
+    // （占位证明在 bb 模式下必被全拒）。
+    let (status, body) = raw_get_with_payment(&url, &exact_header(&payment));
+    assert_eq!(status, 200, "noir 装配桥摄取失败: {body}");
+    assert_eq!(body, "{\"weather\":\"clear+28C\"}");
+    assert_eq!(agg.accepted_count(), 1);
+
+    // 重放同 payload → 200（重放闸命中）且不再摄取。
+    let (status2, body2) = raw_get_with_payment(&url, &exact_header(&payment));
+    assert_eq!(status2, 200, "{body2}");
+    assert_eq!(agg.accepted_count(), 1, "replay must not re-ingest");
+
+    // 对照组：占位 prover 的桥在同一 BbVerifier 网关上被拒（402）——证明上面的
+    // 200 来自真电路证明而非占位口径漏网。
+    let vk2 = std::fs::read(root.join("circuits/target/vk")).expect("read vk");
+    let (gw2, wal2, agg2) = spawn_gateway_bb("e2e-noir-bridge-ctrl", vk2, &backend);
+    let cfg2 = bridge_config(&gw2);
+    assert!(cfg2.noir.is_none(), "缺省占位口径");
+    let listener2 = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let fac2 = listener2.local_addr().expect("addr").to_string();
+    let f2 = Arc::new(Facilitator::with_bridge(
+        FacilitatorConfig {
+            gateway_addr: gw2.clone(),
+            gateway_bearer: GATEWAY_KEY.into(),
+            resource: "http://fac.example.com/weather".into(),
+            pay_to: PAY_TO.into(),
+            amount: AMOUNT.into(),
+            network: NETWORK.into(),
+            asset: None,
+            max_timeout_seconds: 30,
+            protected_body: "{\"weather\":\"clear+28C\"}".into(),
+        },
+        Some(Eip3009Bridge::new(cfg2)),
+    ));
+    std::thread::spawn(move || {
+        let _ = meridian_facilitator::http::serve(f2, listener2);
+    });
+    let url2 = format!("http://{fac2}/");
+    let fresh = exact_payment(&ExactSpec {
+        domain: &domain,
+        from_seed: [6u8; 32],
+        signer_seed: [6u8; 32],
+        to: PAY_TO,
+        value: AMOUNT,
+        valid_after: after,
+        valid_before: before,
+        nonce: [0x5F; 32],
+    });
+    let (status3, body3) = raw_get_with_payment(&url2, &exact_header(&fresh));
+    assert_eq!(status3, 402, "占位证明在 BbVerifier 网关必须被拒: {body3}");
+    assert_eq!(agg2.accepted_count(), 0);
+
+    drop(agg);
+    drop(agg2);
+    let _ = std::fs::remove_file(&wal);
+    let _ = std::fs::remove_file(&wal2);
 }

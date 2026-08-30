@@ -185,6 +185,18 @@ else
     skip "circuits/target/{spend_authorization.json,vk} 不存在（第 9 步 ZK 被跳过）→ noir-prover e2e 跳过"
 fi
 
+# S-47：桥接真 prover e2e（TECH_SPEC §6.10 第 4 步 / §6.14 CLI 消费）。facilitator
+# EIP-3009 桥经 BridgeConfig.noir（SdkClient::with_noir）在真 BbVerifier 网关上摄取；
+# 占位桥对照组 402（bb 全拒占位证明）。工件依赖 9c 同款；MERIDIAN_ZK_PROVER_E2E 门控
+# 测试本体（同门同工件，过滤器只选 noir 桥用例，不重跑全量 facilitator e2e）。
+if [ -f "$ROOT/circuits/target/spend_authorization.json" ] && [ -f "$ROOT/circuits/target/vk" ]; then
+    step "9d/10 bridge noir-prover e2e (S-47, with_noir CLI 消费)"
+    run "bridge noir-prover e2e" env MERIDIAN_ZK_PROVER_E2E=1 cargo test -p meridian-facilitator --test facilitator e2e_bridge_with_noir_prover
+else
+    step "9d/10 bridge noir-prover e2e (S-47)"
+    skip "circuits/target/{spend_authorization.json,vk} 不存在（第 9 步 ZK 被跳过）→ bridge noir-prover e2e 跳过"
+fi
+
 if [ -f "$ROOT/target/Prover.toml.pregate" ] && ! cmp -s "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"; then
     cp "$ROOT/target/Prover.toml.pregate" "$ROOT/gen-witness/Prover.toml"
     printf '    \033[1;33m[CLEAN]\033[0m gen-witness/Prover.toml 已还原（nargo --overwrite-return 改写，return 键不进版本库）\n'
