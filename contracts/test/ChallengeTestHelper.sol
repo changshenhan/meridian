@@ -31,7 +31,14 @@ contract ChallengeTestHelper {
 
     function intentHash(IntentFields memory i) internal pure returns (bytes32) {
         return IntentHelper.computeIntentHash(
-            i.agent, i.delegationHash, i.recipient, i.amount, i.category, i.spendNonce, i.memo, i.expiresAt
+            i.agent,
+            i.delegationHash,
+            i.recipient,
+            i.amount,
+            i.category,
+            i.spendNonce,
+            i.memo,
+            i.expiresAt
         );
     }
 
@@ -46,8 +53,12 @@ contract ChallengeTestHelper {
         uint256 size = 1;
         while (size < n) size <<= 1;
         bytes32[] memory layer = new bytes32[](size);
-        for (uint256 i = 0; i < n; i++) layer[i] = leaves[i];
-        for (uint256 i = n; i < size; i++) layer[i] = Merkle.EMPTY_LEAF;
+        for (uint256 i = 0; i < n; i++) {
+            layer[i] = leaves[i];
+        }
+        for (uint256 i = n; i < size; i++) {
+            layer[i] = Merkle.EMPTY_LEAF;
+        }
         while (size > 1) {
             bytes32[] memory next = new bytes32[](size / 2);
             for (uint256 i = 0; i < size / 2; i++) {
@@ -70,10 +81,16 @@ contract ChallengeTestHelper {
         uint256 size = 1;
         while (size < n) size <<= 1;
         bytes32[] memory layer = new bytes32[](size);
-        for (uint256 i = 0; i < n; i++) layer[i] = leaves[i];
-        for (uint256 i = n; i < size; i++) layer[i] = Merkle.EMPTY_LEAF;
+        for (uint256 i = 0; i < n; i++) {
+            layer[i] = leaves[i];
+        }
+        for (uint256 i = n; i < size; i++) {
+            layer[i] = Merkle.EMPTY_LEAF;
+        }
         uint256 depth = 0;
-        for (uint256 s = size; s > 1; s >>= 1) depth++;
+        for (uint256 s = size; s > 1; s >>= 1) {
+            depth++;
+        }
         bytes32[] memory siblings = new bytes32[](depth);
         uint256 idx = index;
         for (uint256 d = 0; d < depth; d++) {

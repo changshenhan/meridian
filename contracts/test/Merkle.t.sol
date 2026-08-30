@@ -25,7 +25,10 @@ contract MerkleTest is Test, ChallengeTestHelper {
         bytes32(0x7ed38000e72f87c2c0a205f55e885010e01746c8a6a085d5f9e6237399258757);
 
     function test_empty_leaf_constant_matches_rust() public pure {
-        assertEq(Merkle.EMPTY_LEAF, bytes32(0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855));
+        assertEq(
+            Merkle.EMPTY_LEAF,
+            bytes32(0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855)
+        );
     }
 
     function test_leaf_golden_vectors() public pure {

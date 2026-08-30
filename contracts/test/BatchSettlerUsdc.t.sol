@@ -6,6 +6,35 @@ import {BatchSettler} from "../src/BatchSettler.sol";
 import {ChallengeTestHelper} from "./ChallengeTestHelper.sol";
 import {MockUSDC} from "./MockUSDC.sol";
 
+/// 审计加固测试替身：transfer 恒 revert 的 token（真实 USDC 黑名单语义），覆盖挑战
+/// 退款 try/catch 的 revert 冒泡分支（transferFrom 正常，settle 拉款不受影响）。
+contract RevertOnTransferToken {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address, uint256) external pure returns (bool) {
+        revert("frozen");
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 a = allowance[from][msg.sender];
+        if (a < amount) revert("no allowance");
+        if (a != type(uint256).max) allowance[from][msg.sender] = a - amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
 /// S-28：资产参数化 —— ERC-20（USDC）结算路径。
 /// 覆盖：settle `transferFrom` 拉款 / ETH 禁入 / claim 付 token / 挑战退款按 token 原路退 /
 /// 债券恒原生 ETH / 黑名单（转账失败）语义。净额结构与欺诈证明机制与 ETH 模式共用
@@ -251,6 +280,93 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         vm.prank(CHALLENGER);
         bs.challenge{value: challengeBond}(EPOCH, fp);
         assertEq(usdc.balanceOf(address(this)), opUsdcBefore + 100e6, "USDC fund refunded");
+    }
+
+    // ------------------------------------------------------------------ 审计加固：退款 push 失败不阻断挑战（pull 兜底）
+
+    /// 运营者被 token 黑名单冻结（MockUSDC 语义 = transfer 返回 false）→ 退款 push 失败
+    /// 不得阻断挑战：epoch 照常 voided、资金留在合约记回 settlementFunded；解除黑名单后
+    /// withdrawRefund 拉取兜底。
+    function test_challenge_refund_push_failure_pull_fallback_usdc() public {
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100e6, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
+        net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 100e6});
+        _settleUsdc(net);
+
+        usdc.setBlacklist(address(this), true); // 冻结运营者
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](1);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        BatchSettler.FraudProof memory fp =
+            BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
+
+        uint256 challengerBefore = CHALLENGER.balance;
+        vm.prank(CHALLENGER);
+        bs.challenge{value: challengeBond}(EPOCH, fp);
+
+        (,,, uint256 funded,,,,, bool challenged, bool voided) = _epochView(EPOCH);
+        assertTrue(challenged, "challenge must not be blocked by refund failure");
+        assertTrue(voided);
+        assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond payout intact");
+        assertEq(usdc.balanceOf(address(bs)), 100e6, "USDC retained in contract");
+        assertEq(funded, 100e6, "retained refund re-credited");
+
+        // 拉取兜底：解除黑名单后运营者取回留存量。
+        usdc.setBlacklist(address(this), false);
+        vm.expectEmit();
+        emit BatchSettler.RefundWithdrawn(EPOCH, 100e6);
+        bs.withdrawRefund(EPOCH);
+        assertEq(usdc.balanceOf(address(bs)), 0, "drained after pull");
+        assertEq(usdc.balanceOf(address(this)), MINT, "operator recovered refund");
+    }
+
+    /// 真实 USDC 黑名单语义 = transfer revert 冒泡 → try/catch 兜底分支：挑战照常成功，
+    /// 资金留存；withdrawRefund 在运营者仍被冻结时 revert（TokenTransferFailed）可重试。
+    function test_challenge_refund_reverting_token_catch_branch() public {
+        RevertOnTransferToken token = new RevertOnTransferToken();
+        BatchSettler bsR = new BatchSettler(address(this), address(token), CHALLENGE_BOND);
+        token.mint(address(this), 1_000e6);
+
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100e6, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        bsR.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
+        net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 100e6});
+        token.approve(address(bsR), 100e6);
+        bsR.settle(EPOCH, net, keccak256(abi.encode(net)));
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](1);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        BatchSettler.FraudProof memory fp =
+            BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
+
+        vm.prank(CHALLENGER);
+        bsR.challenge{value: challengeBond}(EPOCH, fp); // transfer revert → catch 吸收
+
+        (,,, uint256 funded,,,,, bool challenged, bool voided) = bsR.epochs(EPOCH);
+        assertTrue(challenged);
+        assertTrue(voided);
+        assertEq(funded, 100e6, "retained via catch branch");
+        assertEq(token.balanceOf(address(bsR)), 100e6);
+
+        // 运营者仍被"冻结" → 拉取失败：revert 原样冒泡（真实 USDC 黑名单语义，
+        // 与 claim 的失败路径一致），settlementFunded 记账不丢，解除后可重试。
+        vm.expectRevert("frozen");
+        bsR.withdrawRefund(EPOCH);
+        (,,, uint256 fundedAfter,,,,,,) = bsR.epochs(EPOCH);
+        assertEq(fundedAfter, 100e6, "retained accounting intact");
     }
 
     // ------------------------------------------------------------------ ETH 模式回归锚点

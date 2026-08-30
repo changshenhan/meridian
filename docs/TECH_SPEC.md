@@ -609,6 +609,16 @@ pub trait Ingest {
   5. **CEI 顺序**：拒绝路径 = 事件（状态）→ 销毁转账；成功路径 = 先置 `challenged`/`voided`
      → 挑战者转账 → 运营者退款转账。两次外部调用目标分别是挑战者（可能拒收 → `require`
      整笔回滚，与 S-11 行为一致）与运营者。
+  6. **退款推送失败不阻断挑战（审计加固，收口「运营者审查欺诈证明」向量）**：挑战的
+     唯一对手方就是运营者本身——若运营者退款 push 失败导致 `require` 整笔回滚（原实现），
+     恶意运营者只需把 operator 地址做成收 ETH 即 revert 的合约（或让自身进 token 黑名单，
+     真实 USDC 黑名单是 revert 冒泡），就能让每一次合法欺诈证明原子回滚 → epoch 永不
+     `voided` → 债券机制对唯一需要防的人失效。修复：退款 push 失败（ETH `call` 返回
+     `false` / token `transfer` 返回 `false` 或 revert 冒泡经 `catch` 吸收）**不阻断挑战**，
+     资金留在合约并记回 `settlementFunded`；运营者经 `withdrawRefund(epochId)` 拉取兜底
+     （`onlyOperator`，仅 `voided` epoch 开放——正常 epoch 的结算资金归收款人 claim，绝不
+     给运营者取回路径防双花；voided epoch 的 claim 已被拒，这笔钱不会再被任何人认领）。
+     回记账为贷记方向且外呼期间重入面闭合（slither `reentrancy-eth` 定性留档在代码注释）。
 - **诚实路径**：v1 信任运营者（我们自己是第一个运营者），债券起震慑作用；Phase 2 引入多运营者 + 共享账本（L3 前置）。
 - **出界**：超付不可证（需完备性）；按 epoch 结算资金后超付是运营者自损（自掏 Σnet 付虚高
   行），不掏空其他 claim 方。整 epoch void 会惩罚诚实收款人（该 epoch 全部 claim 拒绝）——
@@ -1458,6 +1468,7 @@ contract BatchSettler {
     event Settled(uint256 indexed epochId, bytes32 nettingRoot, uint64 netCount);
     event ChallengeSucceeded(uint256 indexed epochId, address indexed challenger, uint8 kind);
     event ChallengeRejected(uint256 indexed epochId, address indexed challenger, uint8 reason);
+    event RefundWithdrawn(uint256 indexed epochId, uint256 amount);
     event Claimed(uint256 indexed epochId, address indexed recipient, uint256 amount);
 
     address public immutable operator;                 // 唯一运营者（onlyOperator 守卫）
@@ -1480,6 +1491,9 @@ contract BatchSettler {
     function challenge(uint256 epochId, FraudProof calldata fp)
         external payable;                             // S-38 押金制：入场前 4 类 revert；入场后
                                                       // 驳回即销毁押金（ChallengeRejected），epoch 不动
+    function withdrawRefund(uint256 epochId) external onlyOperator;
+                                                      // 审计加固：挑战成功时退款 push 失败的
+                                                      // 留存量拉取兜底（仅 voided epoch 可取）
 
     error EpochAlreadyCommitted(uint256); error EpochAlreadySettled(uint256);
     error EpochAlreadyChallenged(uint256); error EpochUnknown(uint256); error EpochVoided(uint256);
@@ -1491,6 +1505,7 @@ contract BatchSettler {
     // S-38 移除（押金入场后不再 revert，改为 ChallengeRejected 的 reason 码）：
     // TooManyIntents / DuplicateIntent / BadInclusionProof / NotFraud / BadFraudKind
     error TokenTransferFailed(); error EthValueInTokenMode();   // S-28 资产参数化
+    error EpochNotVoided(uint256); error NothingToRefund(uint256);  // 审计加固：withdrawRefund 守卫
 }
 ```
 

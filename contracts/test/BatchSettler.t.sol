@@ -5,6 +5,39 @@ import {Test} from "forge-std/Test.sol";
 import {BatchSettler} from "../src/BatchSettler.sol";
 import {ChallengeTestHelper} from "./ChallengeTestHelper.sol";
 
+/// 审计加固测试替身：可切换收/拒 ETH 的运营者合约（bind/settler 循环依赖用后绑定解）。
+contract ToggleOperator {
+    BatchSettler internal settler;
+    bool public accept;
+
+    function bind(BatchSettler s) external {
+        settler = s;
+    }
+
+    function setAccept(bool a) external {
+        accept = a;
+    }
+
+    function commit(uint256 epochId, bytes32 root, bytes32 rr) external payable {
+        settler.commit{value: msg.value}(epochId, root, rr);
+    }
+
+    function settle(uint256 epochId, BatchSettler.NetInstruction[] calldata net, bytes32 nr)
+        external
+        payable
+    {
+        settler.settle{value: msg.value}(epochId, net, nr);
+    }
+
+    function withdrawRefund(uint256 epochId) external {
+        settler.withdrawRefund(epochId);
+    }
+
+    receive() external payable {
+        require(accept, "operator refuses eth");
+    }
+}
+
 /// S-11a：BatchSettler 生产化 —— operator 守卫、延迟 claim（原生 ETH）、完整挑战流
 /// （漏单/低付欺诈证明 + 债券罚没 + void + 退款）。
 /// `epochs()` getter 返回 10 元组（net[]/claimed 被跳过）：
@@ -120,7 +153,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
     /// （address(0)，任何一方不可取回）+ epoch 状态零改动（不置 challenged/voided、运营者
     /// 债券与结算资金原封、合约余额进出相抵）。
     function _challengeRejected(BatchSettler.FraudProof memory fp, uint8 reason) internal {
-        (, , uint256 bondedBefore, uint256 fundedBefore, , , , , , ) = _epochView(EPOCH);
+        (,, uint256 bondedBefore, uint256 fundedBefore,,,,,,) = _epochView(EPOCH);
         uint256 challengerBefore = CHALLENGER.balance;
         uint256 contractBefore = address(bs).balance;
         uint256 burnBefore = address(0).balance;
@@ -133,8 +166,14 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         assertEq(address(0).balance, burnBefore + challengeBond, "bond burned");
         assertEq(address(bs).balance, contractBefore, "contract balance in == out");
         assertEq(CHALLENGER.balance, challengerBefore - challengeBond, "bond forfeited");
-        (, , uint256 bondedAfter, uint256 fundedAfter, , , , bool settled, bool challenged, bool voided)
-            = _epochView(EPOCH);
+        (
+            ,,
+            uint256 bondedAfter,
+            uint256 fundedAfter,,,,
+            bool settled,
+            bool challenged,
+            bool voided
+        ) = _epochView(EPOCH);
         assertEq(bondedAfter, bondedBefore, "operator bond untouched");
         assertEq(fundedAfter, fundedBefore, "settlement fund untouched");
         assertTrue(settled);
@@ -186,7 +225,7 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         custom.challenge{value: customBond}(EPOCH, fp);
         // 押金原额退回（净增 0），净增 = 运营者债券罚没。
         assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond payout uses custom");
-        (, , uint256 bondedAmount, uint256 settlementFunded, , , , , , bool voided) =
+        (,, uint256 bondedAmount, uint256 settlementFunded,,,,,, bool voided) =
             _epochViewOn(custom, EPOCH);
         assertEq(bondedAmount, 0);
         assertEq(settlementFunded, 0);
@@ -781,10 +820,89 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         // 净得 = 运营者债券（两次押金：第一次已没收，第二次原额退回）。
         assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond to challenger, bond returned");
         assertEq(address(bs).balance, 0, "contract drained");
-        (,,,,,, , bool settled, bool challenged, bool voided) = _epochView(EPOCH);
+        (,,,,,,, bool settled, bool challenged, bool voided) = _epochView(EPOCH);
         assertTrue(settled);
         assertTrue(challenged);
         assertTrue(voided);
+    }
+
+    // ------------------------------------------------------------------ 审计加固：退款 push 失败不阻断挑战（pull 兜底）
+
+    /// 退款 push 失败（运营者合约拒收 ETH）不得阻断挑战 —— 否则恶意运营者可把 operator
+    /// 地址做成 revert 合约审查一切欺诈证明（挑战原子回滚，epoch 永不 voided）。
+    /// 断言：挑战照常成功（voided / 债券给挑战者 / 押金退回），结算资金留在合约并记回
+    /// settlementFunded；运营者解除拒收后经 withdrawRefund 拉取兜底。
+    function test_challenge_refund_push_failure_does_not_block_challenge() public {
+        ToggleOperator op = new ToggleOperator();
+        BatchSettler target = new BatchSettler(address(op), address(0), CHALLENGE_BOND);
+        op.bind(target);
+        op.setAccept(false); // 运营者拒收 ETH
+
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
+        net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 100});
+        op.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+        op.settle{value: 100}(EPOCH, net, keccak256(abi.encode(net)));
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](1);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        BatchSettler.FraudProof memory fp =
+            BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips});
+
+        uint256 challengerBefore = CHALLENGER.balance;
+        vm.prank(CHALLENGER);
+        target.challenge{value: challengeBond}(EPOCH, fp);
+
+        // 挑战未被阻断：epoch voided，押金退回 + 债券罚没，结算资金留在合约。
+        (,,, uint256 funded,,,,, bool challenged, bool voided) = _epochViewOn(target, EPOCH);
+        assertTrue(challenged, "challenge must not be blocked by refund failure");
+        assertTrue(voided);
+        assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond payout intact");
+        assertEq(address(target).balance, 100, "retained refund");
+        assertEq(funded, 100, "retained refund re-credited to settlementFunded");
+
+        // 拉取兜底：运营者解除拒收后取回留存量。
+        op.setAccept(true);
+        op.withdrawRefund(EPOCH);
+        assertEq(address(target).balance, 0, "drained after pull");
+        (,,, uint256 fundedAfter,,,,,,) = _epochViewOn(target, EPOCH);
+        assertEq(fundedAfter, 0, "settlementFunded zeroed on pull");
+    }
+
+    /// withdrawRefund 只对 voided epoch 开放：正常 epoch 的结算资金归收款人 claim，
+    /// 绝不给运营者取回路径（防双花）。
+    function test_withdraw_refund_rejects_non_voided_epoch() public {
+        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        _settleWith(_net());
+        vm.expectRevert(abi.encodeWithSelector(BatchSettler.EpochNotVoided.selector, EPOCH));
+        bs.withdrawRefund(EPOCH);
+    }
+
+    /// voided 但无留存资金（退款 push 当场成功）→ NothingToRefund。
+    function test_withdraw_refund_rejects_zero_retained() public {
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+        _settleWith(_emptyNet()); // settlementFunded = 0
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](1);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        vm.prank(CHALLENGER);
+        bs.challenge{value: challengeBond}(
+            EPOCH, BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips})
+        );
+        vm.expectRevert(abi.encodeWithSelector(BatchSettler.NothingToRefund.selector, EPOCH));
+        bs.withdrawRefund(EPOCH);
     }
 
     // ------------------------------------------------------------------ shared fixtures

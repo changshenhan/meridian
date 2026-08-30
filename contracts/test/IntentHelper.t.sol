@@ -10,8 +10,10 @@ import {IntentHelperHarness} from "./InternalHarnesses.sol";
 /// 任一侧字节序/前缀/字段序变化 → 立即失配（§11 E-03 交叉实现契约）。
 contract IntentHelperTest is Test {
     bytes20 internal constant AGENT = bytes20(0x1111111111111111111111111111111111111111);
-    bytes32 internal constant DELEGATION_HASH = bytes32(0x2222222222222222222222222222222222222222222222222222222222222222);
-    bytes32 internal constant CATEGORY = bytes32(0x4444444444444444444444444444444444444444444444444444444444444444);
+    bytes32 internal constant DELEGATION_HASH =
+        bytes32(0x2222222222222222222222222222222222222222222222222222222222222222);
+    bytes32 internal constant CATEGORY =
+        bytes32(0x4444444444444444444444444444444444444444444444444444444444444444);
 
     function test_compute_intent_hash_golden_none_memo() public pure {
         bytes32 h = IntentHelper.computeIntentHash(
@@ -60,10 +62,24 @@ contract IntentHelperTest is Test {
         bytes memory memo32 = new bytes(32);
         memo32[0] = 0xAA;
         bytes32 withMemo = IntentHelper.computeIntentHash(
-            AGENT, DELEGATION_HASH, bytes20(uint160(0x33)), 42, CATEGORY, 7, memo32, type(uint64).max
+            AGENT,
+            DELEGATION_HASH,
+            bytes20(uint160(0x33)),
+            42,
+            CATEGORY,
+            7,
+            memo32,
+            type(uint64).max
         );
         bytes32 withoutMemo = IntentHelper.computeIntentHash(
-            AGENT, DELEGATION_HASH, bytes20(uint160(0x33)), 42, CATEGORY, 7, new bytes(0), type(uint64).max
+            AGENT,
+            DELEGATION_HASH,
+            bytes20(uint160(0x33)),
+            42,
+            CATEGORY,
+            7,
+            new bytes(0),
+            type(uint64).max
         );
         assertTrue(withMemo != withoutMemo);
     }
@@ -73,7 +89,14 @@ contract IntentHelperTest is Test {
         IntentHelperHarness h = new IntentHelperHarness();
         vm.expectRevert("memo: empty or 32B");
         h.computeIntentHash(
-            AGENT, DELEGATION_HASH, bytes20(uint160(0x33)), 42, CATEGORY, 7, new bytes(5), type(uint64).max
+            AGENT,
+            DELEGATION_HASH,
+            bytes20(uint160(0x33)),
+            42,
+            CATEGORY,
+            7,
+            new bytes(5),
+            type(uint64).max
         );
     }
 }

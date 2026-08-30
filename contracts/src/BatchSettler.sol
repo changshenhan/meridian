@@ -86,19 +86,21 @@ contract BatchSettler {
     );
     event Settled(uint256 indexed epochId, bytes32 nettingRoot, uint64 netCount);
     event ChallengeSucceeded(uint256 indexed epochId, address indexed challenger, uint8 kind);
+    /// 审计加固：结算资金 push 退款失败后的运营者拉取（withdrawRefund）。
+    event RefundWithdrawn(uint256 indexed epochId, uint256 amount);
     /// S-38：欺诈证明被驳回（押金没收销毁，epoch 状态不变）。reason 见 RejectReason。
     event ChallengeRejected(uint256 indexed epochId, address indexed challenger, uint8 reason);
     event Claimed(uint256 indexed epochId, address indexed recipient, uint256 amount);
 
     /// S-38：欺诈证明驳回原因码（押金入场后不再 revert，改为本枚举随事件上报）。
     enum RejectReason {
-        None,                // 占位（0 值不随事件使用 = 验证通过）
-        NotFraud,            // 证明自洽但不构成欺诈（漏单收款人在 net[] / 低付子集和不超行额）
-        BadInclusionProof,   // 叶索引越界 / 兄弟深度不匹配 / 根不匹配（含伪造意图）
-        DuplicateIntent,     // 低付子集同笔意图重复计入（防假阳性 #1）
-        BadFraudKind,        // kind 非法 / kind1 意图数 != 1 / 跨收款人子集（防假阳性 #2）
-        TooManyIntents,      // 意图数为 0 或超出 gas 上界
-        NetIndexOutOfBounds  // kind2 目标行越界
+        None, // 占位（0 值不随事件使用 = 验证通过）
+        NotFraud, // 证明自洽但不构成欺诈（漏单收款人在 net[] / 低付子集和不超行额）
+        BadInclusionProof, // 叶索引越界 / 兄弟深度不匹配 / 根不匹配（含伪造意图）
+        DuplicateIntent, // 低付子集同笔意图重复计入（防假阳性 #1）
+        BadFraudKind, // kind 非法 / kind1 意图数 != 1 / 跨收款人子集（防假阳性 #2）
+        TooManyIntents, // 意图数为 0 或超出 gas 上界
+        NetIndexOutOfBounds // kind2 目标行越界
     }
 
     error EpochAlreadyCommitted(uint256 epochId);
@@ -123,6 +125,9 @@ contract BatchSettler {
     // S-28 资产参数化。
     error TokenTransferFailed();
     error EthValueInTokenMode();
+    // 审计加固：结算资金拉取兜底（挑战成功时退款 push 失败的留存量，仅 voided epoch 可取）。
+    error EpochNotVoided(uint256 epochId);
+    error NothingToRefund(uint256 epochId);
 
     /// 挑战窗口：settle 后 6 小时内可挑战（TECH_SPEC §6.5）。
     uint256 public constant CHALLENGE_WINDOW = 6 hours;
@@ -238,7 +243,9 @@ contract BatchSettler {
     /// 押金入场前 revert（无押金风险）：epoch 未结算 / 已成功挑战或 voided / 窗口关闭 /
     /// msg.value != challengeBond。押金入场后"驳回即没收"：任何实质验证失败不再 revert，
     /// 发 ChallengeRejected + 押金全额销毁（address(0)）、epoch 状态一字不动（仍可再挑战）。
-    /// 验证通过 → 押金退回 + 运营者债券罚没给挑战者、settlementFunded 退运营者、整 epoch voided。
+    /// 验证通过 → 押金退回 + 运营者债券罚没给挑战者、settlementFunded 退运营者、整 epoch
+    /// voided。退款推送失败不阻断挑战（资金留合约，运营者经 withdrawRefund 拉取兜底）——
+    /// 防恶意运营者以 revert 地址 / token 黑名单审查欺诈证明。
     function challenge(uint256 epochId, FraudProof calldata fp) external payable {
         Epoch storage ep = epochs[epochId];
         if (!ep.settled) revert EpochUnknown(epochId);
@@ -268,14 +275,48 @@ contract BatchSettler {
         require(okPayout, "bond transfer failed");
         if (refund > 0) {
             // S-28：settlementFunded 退款按结算资产原路退回（ETH 或 token）。
+            // 审计加固：退款失败**绝不阻断挑战本身**——挑战整体原子回滚意味着恶意运营者
+            // 只要把 operator 地址做成收 ETH 即 revert 的合约（或让自身进 token 黑名单），
+            // 就能审查一切欺诈证明（epoch 永不 voided，债券机制对其失效）。退款推送失败时
+            // 资金留在合约并记回 settlementFunded，运营者可经 withdrawRefund 拉取兜底。
+            // 失败回记账的 reentrancy-eth 定性（审计留档）：回记账是贷记方向（记回运营者
+            // 应得资金），且外呼期间重入面已闭合——challenged/voided 先行、settlementFunded
+            // 已清零，重入 challenge/claim/withdrawRefund 均被前置守卫拒绝。
             if (asset == address(0)) {
                 (bool okRefund,) = payable(operator).call{value: refund}("");
-                require(okRefund, "refund transfer failed");
+                // slither-disable-next-line reentrancy-eth
+                if (!okRefund) ep.settlementFunded = refund;
             } else {
-                if (!IERC20(asset).transfer(operator, refund)) revert TokenTransferFailed();
+                bool pushed = false;
+                try IERC20(asset).transfer(operator, refund) returns (bool ok) {
+                    pushed = ok;
+                } catch {
+                    pushed = false; // 真实 USDC 黑名单是 revert 冒泡（catch 吸收，不阻断挑战）
+                }
+                // slither-disable-next-line reentrancy-eth
+                if (!pushed) ep.settlementFunded = refund;
             }
         }
         emit ChallengeSucceeded(epochId, msg.sender, fp.kind);
+    }
+
+    /// 审计加固：结算资金拉取兜底 —— 挑战成功时退款 push 失败（运营者合约不收 ETH /
+    /// token 黑名单 revert）而留在合约的资金，运营者自行取回。
+    /// 仅 voided epoch 开放：正常 epoch 的结算资金归收款人 claim，绝不给运营者取回路径
+    ///（防双花）；voided epoch 的 claim 已被拒，这笔钱不会再被任何人认领。
+    function withdrawRefund(uint256 epochId) external onlyOperator {
+        Epoch storage ep = epochs[epochId];
+        if (!ep.committed || !ep.voided) revert EpochNotVoided(epochId);
+        uint256 refund = ep.settlementFunded;
+        if (refund == 0) revert NothingToRefund(epochId);
+        ep.settlementFunded = 0;
+        if (asset == address(0)) {
+            (bool okRefund,) = payable(operator).call{value: refund}("");
+            require(okRefund, "refund transfer failed");
+        } else {
+            if (!IERC20(asset).transfer(operator, refund)) revert TokenTransferFailed();
+        }
+        emit RefundWithdrawn(epochId, refund);
     }
 
     /// 欺诈证明实质验证（S-38：不再 revert，失败返回原因码；None = 欺诈成立）。判定逻辑与
