@@ -8,7 +8,9 @@
 //!   nonce 固定重发安全）
 //! - 200 → 定局：`ReceiptDto::into_receipt`（业务拒绝原样透传 `reject_reason`）
 //! - 400 / 401 / 404 / 413 → `Local` —— 配置/协议错误，不自动重试
-//!   （404 仅只读查询 `receipt()`：未命中 → `Ok(None)`，§6.7 S-30a）
+//!   （404 仅只读查询 `receipt()`：未命中 → `Ok(None)`，§6.7 S-30a；`next_nonce`
+//!   未注册 → `Ok(None)`，S-31；`revocation_witness` 目标已撤销 `E_REVOKED` →
+//!   `Ok(None)`，S-45）
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -17,9 +19,10 @@ use std::time::Duration;
 use meridian_aggregator::receipt::{IntentEnvelope, Receipt};
 use meridian_aggregator::wire::{
     AuthorizeRequest, AuthorizeResponse, GatewayError, IntentEnvelopeDto, NextNonceResponse,
-    ReceiptDto,
+    ReceiptDto, RevocationWitnessResponse,
 };
 use meridian_core::dsa::{AgentPubKey, SignedDelegation};
+use meridian_core::zk::RevocationWitness;
 
 use crate::error::{SdkError, TransportError};
 use crate::transport::Transport;
@@ -173,6 +176,36 @@ impl HttpTransport {
             _ => Err(Self::map_transport_status(status, &resp)),
         }
     }
+
+    /// S-45 只读撤销非成员 witness 查询（§6.7，§6.14 SDK 半边）：delegation_hash →
+    /// `root` + 深度 256 兄弟路径（聚合器当刻撤销树快照）。`Ok(None)` = 404
+    /// `E_REVOKED`（目标已撤销，非成员陈述不属于该目标）；**其余 404 码 fail-closed
+    /// 上抛 `Local`**——本端点不应返回其它 404 码，出现即协议漂移，绝不静默当作
+    /// 「已撤销」（把协议漂移吞成 None 会让 stale witness 走到聚合器才被拒）。
+    pub fn revocation_witness(&self, dh: [u8; 32]) -> Result<Option<RevocationWitness>, SdkError> {
+        let path = format!("/v1/revocation-witness/{}", hex::encode(dh));
+        let (status, resp) = self
+            .request("GET", &path, None)
+            .map_err(SdkError::Transport)?;
+        match status {
+            200 => {
+                let dto: RevocationWitnessResponse = serde_json::from_slice(&resp)
+                    .map_err(|e| SdkError::Local(format!("bad witness response: {e}")))?;
+                Ok(Some(dto.into_witness().map_err(SdkError::Local)?))
+            }
+            404 => {
+                let code = serde_json::from_slice::<GatewayError>(&resp)
+                    .ok()
+                    .map(|e| e.error.code);
+                match code.as_deref() {
+                    // "E_REVOKED" = gateway::E_REVOKED（§11 主表内核码复用，wire 响应码）。
+                    Some("E_REVOKED") => Ok(None),
+                    _ => Err(SdkError::Local(gateway_error_message(&resp, 404))),
+                }
+            }
+            _ => Err(Self::map_transport_status(status, &resp)),
+        }
+    }
 }
 
 /// 尽力从 GatewayError JSON 提取 message；解析失败退回状态码描述。
@@ -218,5 +251,9 @@ impl Transport for HttpTransport {
 
     fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError> {
         Self::next_nonce(self, *dh)
+    }
+
+    fn revocation_witness(&self, dh: &[u8; 32]) -> Result<Option<RevocationWitness>, SdkError> {
+        Self::revocation_witness(self, *dh)
     }
 }

@@ -248,6 +248,84 @@ fn handle_nonce_lookup_gate_and_hash_validation() {
     assert!(r.body.contains(E_NOT_FOUND));
 }
 
+/// S-45 只读撤销 witness 查询闸门：与写端点同租户闸（401）+ 坏 hash 400 + 命中
+/// 200（root = 当刻撤销树根、path = 256 × 32B 扁平 hex）+ 已撤销目标 404 `E_REVOKED`。
+/// 未注册 delegation_hash 照常返回 witness（只读事实面，§6.7 语义边界）。
+#[test]
+fn handle_revocation_witness_gate_hash_and_revoked() {
+    let (_p, agg) = aggregator("revwitness-gate");
+    let gw = Gateway::with_tenants(Arc::clone(&agg), tenants_one("k1", "t1", 1_000), 64 * 1024);
+
+    // 无认证 → 401（只读端点走同一租户闸）。
+    let r = gw.handle("GET", "/v1/revocation-witness/00", None, b"");
+    assert_eq!(r.status, 401);
+    assert!(r.body.contains(E_AUTH));
+
+    // 坏 hex / 错长度 → 400。
+    for bad in ["zz", "00", &hex::encode([1u8; 31])] {
+        let r = gw.handle(
+            "GET",
+            &format!("/v1/revocation-witness/{bad}"),
+            Some("k1"),
+            b"",
+        );
+        assert_eq!(r.status, 400, "bad hash {bad:?}");
+        assert!(r.body.contains(E_MALFORMED));
+    }
+
+    // 命中：空撤销集 → root = 空树根，path = 256 层扁平 hex；DTO 还原回电路口径。
+    let dh = [7u8; 32];
+    let r = gw.handle(
+        "GET",
+        &format!("/v1/revocation-witness/0x{}", hex::encode(dh)),
+        Some("k1"),
+        b"",
+    );
+    assert_eq!(r.status, 200);
+    let dto: meridian_aggregator::wire::RevocationWitnessResponse =
+        serde_json::from_str(&r.body).expect("witness dto");
+    assert_eq!(dto.delegation_hash, hex::encode(dh));
+    let w = dto.into_witness().expect("witness roundtrip");
+    assert_eq!(
+        w.root,
+        agg.revocation_root(),
+        "witness 根 = 聚合器当刻撤销根"
+    );
+    assert_eq!(w.path.len(), 256);
+    assert_eq!(
+        w.root,
+        meridian_aggregator::revocation::RevocationSet::new().sparse_root()
+    );
+
+    // 已撤销目标 → 404 E_REVOKED（成员陈述不由非成员接口给出，S-42 fail-closed）。
+    assert!(agg.revoke(dh));
+    let r = gw.handle(
+        "GET",
+        &format!("/v1/revocation-witness/{}", hex::encode(dh)),
+        Some("k1"),
+        b"",
+    );
+    assert_eq!(r.status, 404);
+    assert!(r.body.contains(meridian_gateway::E_REVOKED));
+
+    // 撤销后其他委托的 witness 根推进（同一棵确定性树的当刻快照）。
+    let other = [8u8; 32];
+    let r = gw.handle(
+        "GET",
+        &format!("/v1/revocation-witness/{}", hex::encode(other)),
+        Some("k1"),
+        b"",
+    );
+    assert_eq!(r.status, 200);
+    let dto: meridian_aggregator::wire::RevocationWitnessResponse =
+        serde_json::from_str(&r.body).expect("witness dto");
+    assert_eq!(
+        dto.into_witness().expect("roundtrip").root,
+        agg.revocation_root(),
+        "撤销推进后的根同步进 witness"
+    );
+}
+
 #[test]
 fn handle_enforces_body_cap() {
     let (_p, agg) = aggregator("bodycap");
@@ -474,6 +552,47 @@ fn e2e_next_nonce_query_restarts_sdk_recovery() {
 
     // 聚合器句柄同源一致。
     assert_eq!(agg.next_nonce(&dh), Some(3));
+}
+
+/// S-45 撤销 witness 查询 e2e（真 socket）：`HttpTransport::revocation_witness` →
+/// 200 DTO 还原（root = 聚合器当刻撤销根，path = 256 层）；已撤销目标 → 404
+/// `E_REVOKED` → SDK 视角 `Ok(None)`；原始 GET 线格式（带认证 200 / 无认证 401）。
+#[test]
+fn e2e_revocation_witness_query_over_http() {
+    let (addr, agg) = spawn_gateway("e2e-revwitness");
+    let transport = HttpTransport::new(&addr, "e2e-key");
+
+    // 命中：空撤销集 → 非成员 witness，根与聚合器句柄同源一致。
+    let dh = [7u8; 32];
+    let w = transport.revocation_witness(dh).unwrap().expect("witness");
+    assert_eq!(w.root, agg.revocation_root());
+    assert_eq!(w.path.len(), 256);
+    // 还原回的 witness 与聚合器直出的逐字段一致（wire 编码无漂移）。
+    let direct = agg.revocation_witness(&dh).unwrap();
+    assert_eq!(w.root, direct.root);
+    assert_eq!(w.path, direct.path);
+
+    // 原始 GET 线格式：带认证 200（扁平 hex path ≈ 16KB）；无认证 401。
+    let path = format!("/v1/revocation-witness/{}", hex::encode(dh));
+    let (status, body) = raw_get(&addr, &path, Some("e2e-key"));
+    assert_eq!(status, 200);
+    assert!(body.contains(&hex::encode(dh)), "body: {body}");
+    assert!(
+        body.len() > 256 * 64,
+        "flat path hex must be present, body len {}",
+        body.len()
+    );
+    let (status, body) = raw_get(&addr, &path, None);
+    assert_eq!(status, 401);
+    assert!(body.contains("E_AUTH"), "body: {body}");
+
+    // 已撤销目标 → 404 E_REVOKED → SDK 视角 Ok(None)（fail-closed，成员路径不冒充）。
+    assert!(agg.revoke(dh));
+    assert!(transport.revocation_witness(dh).unwrap().is_none());
+    // 其他委托的 witness 拿到推进后的根。
+    let other = transport.revocation_witness([8u8; 32]).unwrap().unwrap();
+    assert_eq!(other.root, agg.revocation_root());
+    assert_ne!(other.root, w.root, "撤销推进换根");
 }
 
 #[test]

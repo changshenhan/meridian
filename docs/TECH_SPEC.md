@@ -285,7 +285,8 @@ pub fn check_budget(
   与 §6.5「撤销前已接受的意图仍留在承诺中支付（非追溯）」同一口径。诚实边界：状态根
   集合为**进程内**（不落 WAL）——重启后集合 = {空根, 当前根}，跨重启 + 跨换代的在途
   证明（witness 取自重启前的中间状态）以 `E_REV_ROOT` 拒（不安全方向为拒绝，可取新
-  witness 重出证明；SDK 侧自动刷新重试见 §6.14 诚实边界 3）。
+  witness 重出证明；SDK 侧自动刷新重试 S-45 已落地，见 §6.14 诚实边界 3 / §6.7
+  witness 查询端点）。
 
 ### 4.7 两种模式映射（实现同一接口）
 
@@ -488,9 +489,9 @@ pub trait Ingest {
   = 全链真 ZK 的完整形态）。撤销集只增 → 集合 ≤ 撤销事件数 + 1，闸成本 = 一次哈希集
   查找（热路径零分配）；根的计算只在 `revoke` 事件与集合未命中时发生（与 §6.3 每
   epoch 密封已付的 `sparse_root()` 同成本级，不新增热路径代价）。诚实边界：集合进程内
-  不持久化（重启后 = {空根, 当前根}），见 §4.6 残余③；SDK 对 `E_REV_ROOT` 的自动
-  刷新重试（witness 重新获取 + 同意图重出证明，nonce 未消耗故安全）为后续项，当前
-  按业务拒绝定局透传。
+  不持久化（重启后 = {空根, 当前根}），见 §4.6 残余③。**S-45 起 SDK 侧对 `E_REV_ROOT`
+  自动刷新重出**（witness 查询端点 §6.7 + 同意图重出证明重交，nonce 未消耗故安全——
+  本闸在 `try_commit` 之前拒，同意图重发不被幂等闸缓存的原拒绝命中，走全新校验）。
 
 ### 6.3 排序与承诺（commitment lattice，防抢跑）
 
@@ -624,6 +625,7 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
 | POST | `/v1/intents` | 幂等提交意图信封（同意图重发返回先前结果，§6.2 幂等闸口） | `Aggregator::submit` |
 | GET | `/v1/receipts/{intent_hash}` | 只读回执查询（S-30a，x402 merchant 验证面） | `Aggregator::receipt` |
 | GET | `/v1/nonce/{delegation_hash}` | 只读下一 nonce 查询（S-31，SDK 跨重启恢复） | `Aggregator::next_nonce` |
+| GET | `/v1/revocation-witness/{delegation_hash}` | 只读撤销非成员 witness 查询（S-45，§6.14 SDK 半边） | `Aggregator::revocation_witness` |
 | GET | `/healthz` | 网关存活（含内核 `accepted_count` 快照） | — |
 
 **请求/响应（wire，JSON）**：
@@ -675,6 +677,38 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
   `NonceManager` 推进到 `max(本地计数, 网关值)`（本地领先时不动——避免并发客户端回退），
   返回生效值。未授权委托 → `SdkError::Local`（与 `pay()` 前置闸一致）。
 
+**只读撤销 witness 查询（S-45，§6.14 诚实边界 3 SDK 半边收口）**：
+
+- `GET /v1/revocation-witness/<32B hex>`（可选 `0x` 前缀）→ `200` +
+  `wire::RevocationWitnessResponse`：
+
+  ```json
+  { "delegation_hash": "<64hex>", "root": "<64hex>", "path": "<16384hex>" }
+  ```
+
+  `root` = 当前撤销状态根（BE Field 32B，电路 `revocation_root` 公共输入口径，§4.6）；
+  `path` = 深度 256 的兄弟路径 **扁平 hex**（256 × 32B BE Field 依深度序拼接，8192B →
+  16384 hex 字符——与 gen-witness 扁平 witness 格式同口径，SDK 侧按 32B 分块还原
+  `Vec<[u8; 32]>`）。响应体 ~16.5KB，远小于请求体上限口径，无独立上限检查（GET 无 body）。
+- 内核侧：`Aggregator::revocation_witness(&dh) -> Option<NonMembershipWitness>`——S-42
+  `RevocationSet::non_membership_witness` 直出（与 `sparse_root()` 同一压实实现，root 与
+  路径出自同一棵确定性树）。`None` = 目标**已撤销**（撤销叶的路径是成员证明，不属于本
+  接口语义，S-42 fail-closed）→ `404 {"error":{"code":"E_REVOKED"}}`。`E_REVOKED` 复用
+  §11 主表内核码字符串（wire 层响应用码，语义同主表「委托已撤销」），不新增传输层码。
+  走与 `/v1/receipts`、`/v1/nonce` 相同的租户闸（认证 + 限流；GET 无 body）。
+- **语义边界（诚实）**：对**从未注册**的 delegation_hash 照常返回非成员 witness（空集
+  子树根 + 全空路径）——撤销树覆盖完整 256-bit 索引空间，注册与否不是树的事实；该委托
+  的意图提交仍会被管线步 1 注册闸（`E_DELEG_UNKNOWN`）拒，witness 端点不做注册校验
+  （查询是只读事实面，不是授权面）。witness 是**当刻树快照**：撤销事件发生后取到的
+  witness 换根，先前取的在途证明不因换代本身被拒（§6.2 绑定闸接受全部历史状态根）。
+- SDK 侧：`Transport::revocation_witness(&dh)`（trait 方法，`InProcessAggregator` /
+  `HttpTransport` 同实现；404 `E_REVOKED` → `Ok(None)`，其余 404 码 fail-closed 上抛
+  `Local`——端点不会返回其它 404 码，出现即协议漂移）。`SdkClient` 按 delegation_hash
+  分桶缓存 witness（**witness 是 per-dh 事实**：路径由目标索引决定，跨委托复用会被
+  电路断言 8 重算根失配拒）：`pay()` 缓存未命中时现取入库；`E_REV_ROOT` 业务拒绝时
+  现取新 witness 同意图重出证明重交（§6.14 诚实边界 3）；`sync_revocation_witness(dh)`
+  显式刷新（镜像 `sync_nonce` 口径）。
+
 **认证与多租户**：
 
 - `Authorization: Bearer <key>`；租户表 = JSON 配置文件（`{"<key>": {"tenant": "<id>",
@@ -691,7 +725,7 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
 |---|---|---|
 | 200 | 内核 Receipt（accepted 或 E_* 业务拒绝） | 定局 |
 | 400 | JSON 不合法 / 字段缺失 / hex 非法（`E_MALFORMED`） | 定局（重发同请求无害，但不自动重试） |
-| 404 | 只读查询未命中（`E_NOT_FOUND`，仅 `/v1/receipts`） | 定局（重发同查询无害，结果不变） |
+| 404 | 只读查询未命中（`E_NOT_FOUND`：回执不存在；`E_REVOKED`：witness 查询目标已撤销） | 定局（重发同查询无害，结果不变） |
 | 401 | Bearer 缺失/未知（`E_AUTH`） | 配置错误，不重试 |
 | 413 | 请求体 > 64 KiB | 不重试（信封远小于此） |
 | 429 | 租户限流（`E_RATE_LIMITED`） | **重试候选**（退避） |
@@ -1083,10 +1117,17 @@ Poseidon）留在 Noir**（S-05 教训守住）。
 3. **撤销根换代**：prove 请求的 witness 是聚合器当刻树快照。**S-44（§4.6 残余③聚合器
    半边）收口绑定语义**：聚合器侧撤销根绑定闸（§6.2，`enforce_revocation_root`）接受
    本账本出现过的全部撤销状态根——换代窗口内的在途证明（旧状态 witness）不被换代本身
-   拒，安全性由管线步 2b 当前撤销闸兜底。**SDK 半边（本件仍未收口，后续项）**：SDK 的
-   witness 为手动装配（`set_revocation_witness`），无自动新鲜度——被 `E_REV_ROOT` 拒
-   （绑定闸开启 + witness 取自重启前的中间状态等窄窗口）时按业务拒绝定局；自动刷新
-   （witness 查询端点 + 同意图重出证明，nonce 未消耗故安全）为后续项。
+   拒，安全性由管线步 2b 当前撤销闸兜底。**SDK 半边 S-45 收口（witness 自动新鲜度 +
+   `E_REV_ROOT` 刷新重出）**：witness 查询端点（§6.7 `GET /v1/revocation-witness`）+
+   `Transport::revocation_witness`；`SdkClient` 按 delegation_hash 分桶缓存（per-dh
+   事实，跨委托复用会被电路断言 8 拒），`pay()` 未命中现取，`E_REV_ROOT` 业务拒绝时
+   现取新 witness **同意图重出证明重交**（intent 不变 → intent_hash 不变；nonce 不
+   推进——绑定闸在 `try_commit` 之前拒、不占 nonce 占位，同意图重发不撞幂等闸缓存的
+   原拒绝，走全新校验）；刷新次数封顶 `RetryPolicy::max_attempts`（防 transport 指向
+   另一聚合器时无限循环），取不到 witness（`Ok(None)` = 已撤销）即按原拒绝定局
+   （fail-closed，`Ok(None)` 不重试）。手动装配 `set_revocation_witness(dh, w)` 保留
+   （离线 / 测试口径），分桶键 = 目标 delegation_hash（S-43 单槽 API 废弃——单槽对
+   多委托客户端是错配：后写覆盖先写，先取的委托拿到别的索引的路径）。
 4. gen-witness 的 `MAX_REVOKED = 2` 固定撤销集仍只服务正式管线 fixture；真撤销 witness
    一律来自聚合器 `RevocationSet`（S-42），oracle 的撤销树输出弃用。
 
@@ -1382,6 +1423,7 @@ contract BatchSettler {
 | `E_RATE_LIMITED` | 租户令牌桶超限（未进内核，无 seq） | 429 | 是（退避） |
 | `E_MALFORMED` | JSON/字段/hex 不合法 | 400 | 否 |
 | `E_NOT_FOUND` | 只读查询未命中（回执不存在 / 已结算修剪 / 被拒——**404 ≠ 未支付**，§6.7） | 404 | 否 |
+| `E_REVOKED` | 撤销 witness 查询目标已撤销（无非成员 witness 可给，S-45 §6.7；复用 §11 主表内核码字符串，不进内核枚举实例化） | 404 | 否（`Transport::revocation_witness` 映射 `Ok(None)`） |
 
 ---
 

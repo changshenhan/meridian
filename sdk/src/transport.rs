@@ -16,7 +16,7 @@ use meridian_aggregator::ingest::{Aggregator, IngestConfig};
 use meridian_aggregator::receipt::{IntentEnvelope, Receipt};
 use meridian_aggregator::wal::Wal;
 use meridian_core::dsa::{AgentPubKey, SignedDelegation};
-use meridian_core::zk::SpendVerifier;
+use meridian_core::zk::{RevocationWitness, SpendVerifier};
 
 use crate::error::{SdkError, TransportError};
 
@@ -33,6 +33,12 @@ pub trait Transport: Send + Sync {
     /// S-31 只读下一 nonce 查询（§6.7，[`crate::pay::NonceManager`] 跨重启恢复）。
     /// `Ok(None)` = 委托未注册（404 `E_NOT_FOUND`）。
     fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError>;
+
+    /// S-45 只读撤销非成员 witness 查询（§6.7，§6.14 诚实边界 3 SDK 半边）：目标 dh 的
+    /// `root` + 深度 256 兄弟路径（聚合器当刻撤销树快照，同一棵确定性树）。
+    /// `Ok(None)` = 目标已撤销（404 `E_REVOKED`——成员陈述不属于非成员接口，S-42
+    /// fail-closed）；其余传输错误按 `SdkError` 语义上抛。
+    fn revocation_witness(&self, dh: &[u8; 32]) -> Result<Option<RevocationWitness>, SdkError>;
 }
 
 /// 进程内聚合器（S-12 内置传输）。
@@ -84,6 +90,10 @@ impl Transport for InProcessAggregator {
     fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError> {
         Ok(self.agg.next_nonce(dh))
     }
+
+    fn revocation_witness(&self, dh: &[u8; 32]) -> Result<Option<RevocationWitness>, SdkError> {
+        Ok(self.agg.revocation_witness(dh).map(Into::into))
+    }
 }
 
 /// 断线模拟：丢弃前 `drop_count` 次 `submit` 响应（回执丢失，聚合器侧可能已接受）。
@@ -121,9 +131,13 @@ impl<T: Transport> Transport for DropFirstTransport<T> {
         self.inner.submit(env)
     }
 
-    // 只读查询：丢弃语义只针对 submit（nonce 查询本就无副作用，直通内层）。
+    // 只读查询：丢弃语义只针对 submit（nonce / witness 查询本就无副作用，直通内层）。
     fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError> {
         self.inner.next_nonce(dh)
+    }
+
+    fn revocation_witness(&self, dh: &[u8; 32]) -> Result<Option<RevocationWitness>, SdkError> {
+        self.inner.revocation_witness(dh)
     }
 }
 
@@ -164,9 +178,13 @@ impl<T: Transport> Transport for ResponseLossTransport<T> {
         Ok(receipt)
     }
 
-    // 只读查询：丢失语义只针对 submit 回执（nonce 查询无副作用，直通内层）。
+    // 只读查询：丢失语义只针对 submit 回执（nonce / witness 查询无副作用，直通内层）。
     fn next_nonce(&self, dh: &[u8; 32]) -> Result<Option<u64>, SdkError> {
         self.inner.next_nonce(dh)
+    }
+
+    fn revocation_witness(&self, dh: &[u8; 32]) -> Result<Option<RevocationWitness>, SdkError> {
+        self.inner.revocation_witness(dh)
     }
 }
 

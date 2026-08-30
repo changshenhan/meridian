@@ -10,6 +10,11 @@
 //! 证明 = [`PlaceholderProver`]（与聚合器 `FormatVerifier` 配套的 TEMPORARY 口径）；
 //! 真实 S-09 电路 prover 实现 `meridian_core::zk::SpendProver`，经 `SdkClient::with_prover`
 //! 接入，本函数不变。
+//!
+//! S-45 撤销 witness 自动新鲜度（§6.14 诚实边界 3 SDK 半边）：缓存（per-dh）未命中
+//! 现取（§6.7 witness 查询端点）；`E_REV_ROOT` 业务拒绝 = witness 取自旧状态根 → 同
+//! 意图现取新 witness 重出证明重交（nonce 未消耗——绑定闸在聚合器 `try_commit` 之前
+//! 拒，同意图重发不撞幂等闸缓存的原拒绝），刷新封顶 `RetryPolicy::max_attempts`。
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -18,7 +23,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use meridian_aggregator::receipt::IntentEnvelope;
 use meridian_core::dsa::{Amount, Category, Did};
 use meridian_core::error::Error;
-use meridian_core::zk::{SpendProof, SpendProofRequest, SpendProver, SpendPublicInputs};
+use meridian_core::zk::{
+    RevocationWitness, SpendProof, SpendProofRequest, SpendProver, SpendPublicInputs,
+};
 
 use crate::error::SdkError;
 use crate::SdkClient;
@@ -160,25 +167,50 @@ pub(crate) fn pay(client: &SdkClient, params: &PayParams) -> Result<PayReceipt, 
         params.expires_at,
     );
     let now = now_unix();
-    let proof = client
-        .prover()
-        .prove(&SpendProofRequest {
-            sd: &sd,
-            intent: &intent,
-            agent_key: &client.wallet().agent_key,
-            attestation_secret: client.attestation_secret(),
-            revocation: client.revocation_witness(),
-            now,
-        })
-        .map_err(SdkError::Meridian)?;
-    let env = IntentEnvelope {
-        intent,
+
+    // S-45 撤销 witness 自动新鲜度（§6.14 诚实边界 3 SDK 半边）：缓存（per-dh）未命中
+    // 时现取（§6.7 witness 查询端点）。`Ok(None)` = 目标已撤销——无缓存可入库，按占位
+    // 口径继续 prove，聚合器管线步 2b `E_REVOKED` 定局（fail-closed 不在此预判业务态）。
+    let witness = match client.revocation_witness_for(&dh) {
+        Some(w) => Some(w),
+        None => match client.transport().revocation_witness(&dh)? {
+            Some(w) => {
+                client.store_revocation_witness(&dh, w.clone());
+                Some(w)
+            }
+            None => None,
+        },
+    };
+    // 同一 prove 闭包复用：`E_REV_ROOT` 刷新重出时 intent / nonce / now 全部不动，
+    // 只换 witness 重出证明（revocation_root 是电路公共输入，换根必须重证）。
+    let prove = |w: RevocationWitness| -> Result<SpendProof, SdkError> {
+        client
+            .prover()
+            .prove(&SpendProofRequest {
+                sd: &sd,
+                intent: &intent,
+                agent_key: &client.wallet().agent_key,
+                attestation_secret: client.attestation_secret(),
+                revocation: w,
+                now,
+            })
+            .map_err(SdkError::Meridian)
+    };
+    let mut env = IntentEnvelope {
+        intent: intent.clone(),
         agent_sig: sig,
-        proof,
+        proof: prove(witness.unwrap_or(RevocationWitness {
+            root: [0u8; 32],
+            path: Vec::new(),
+        }))?,
     };
 
     let policy = *client.retry();
     let mut attempt: u32 = 1;
+    // S-45：`E_REV_ROOT` 刷新重出计数。与传输重试（attempt）分开计——业务拒绝不走
+    // 退避；封顶 `max_attempts` 防「transport 指向另一聚合器」时无限循环（该情况下
+    // 现取的 witness 永远不在提交目标的接受集内）。
+    let mut refreshes: u32 = 0;
     loop {
         match client.transport().submit(&env) {
             Ok(r) if r.accepted => {
@@ -189,8 +221,22 @@ pub(crate) fn pay(client: &SdkClient, params: &PayParams) -> Result<PayReceipt, 
                 });
             }
             Ok(r) => {
+                let reason = r.reject_reason.unwrap_or(Error::EProof);
+                // 撤销根绑定闸（S-44 §6.2）拒绝 = witness 取自旧状态根（重启前中间
+                // 状态 / 换代窄窗口）。nonce 未消耗（闸在 try_commit 之前拒、不占
+                // nonce 占位）→ 同意图现取新 witness 重出证明重交，安全。
+                if reason == Error::ERevRoot && refreshes < policy.max_attempts {
+                    refreshes += 1;
+                    let fresh = client
+                        .transport()
+                        .revocation_witness(&dh)?
+                        .ok_or(SdkError::Meridian(reason))?; // 已撤销 → 原拒绝定局
+                    client.store_revocation_witness(&dh, fresh.clone());
+                    env.proof = prove(fresh)?;
+                    continue;
+                }
                 // 永久拒绝：错误码透传，不重试。nonce 已被聚合器消耗，本笔到此为止。
-                return Err(SdkError::Meridian(r.reject_reason.unwrap_or(Error::EProof)));
+                return Err(SdkError::Meridian(reason));
             }
             Err(e) => {
                 // 仅传输错误重试；nonce/信封固定 → 聚合器幂等 re-ack → 不双花。
@@ -212,7 +258,7 @@ pub(crate) fn pay(client: &SdkClient, params: &PayParams) -> Result<PayReceipt, 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use std::sync::atomic::{AtomicU32, Ordering};
     #[test]
     fn nonce_manager_is_monotonic_per_delegation() {
         let m = NonceManager::new();
@@ -269,5 +315,243 @@ mod tests {
         assert_eq!(pi.spend_nonce, intent.spend_nonce);
         assert_eq!(pi.expires_at, intent.expires_at);
         assert!(!proof.proof.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // S-45 撤销 witness 自动新鲜度 + E_REV_ROOT 刷新重出（§6.14 诚实边界 3）
+    // -----------------------------------------------------------------------
+
+    /// 测试传输桩：witness 查询返回可切换的「当刻」witness（`None` = 已撤销 / 不可得；
+    /// 计数）；submit 前缀 `reject_before` 次回 `E_REV_ROOT` 业务拒（模拟 witness 取自
+    /// 旧状态根），之后接受。`PlaceholderProver` 把 witness 根原样透传进公共输入 →
+    /// 可据此断言「重出证明确实换了根」。
+    #[derive(Clone)]
+    struct MockTransport(std::sync::Arc<MockInner>);
+
+    struct MockInner {
+        witness: RwLock<Option<RevocationWitness>>,
+        /// 首次 submit 时切换到的「当刻」witness（模拟换代发生在取 witness 与提交之间，
+        /// 首提交因此撞旧根被 `E_REV_ROOT` 拒）。
+        switch_on_submit: RwLock<Option<Option<RevocationWitness>>>,
+        reject_before: AtomicU32,
+        submissions: AtomicU32,
+        witness_fetches: AtomicU32,
+        submitted_roots: std::sync::Mutex<Vec<[u8; 32]>>,
+    }
+
+    impl MockTransport {
+        fn new(witness: Option<RevocationWitness>, reject_before: u32) -> Self {
+            MockTransport(std::sync::Arc::new(MockInner {
+                witness: RwLock::new(witness),
+                switch_on_submit: RwLock::new(None),
+                reject_before: AtomicU32::new(reject_before),
+                submissions: AtomicU32::new(0),
+                witness_fetches: AtomicU32::new(0),
+                submitted_roots: std::sync::Mutex::new(Vec::new()),
+            }))
+        }
+
+        fn set_witness(&self, w: Option<RevocationWitness>) {
+            *self.0.witness.write().expect("witness poisoned") = w;
+        }
+
+        /// 预挂「首次 submit 时换代」：把当刻 witness 切到 `w`（None = 撤销到不可得）。
+        fn switch_witness_on_submit(&self, w: Option<RevocationWitness>) {
+            *self.0.switch_on_submit.write().expect("switch poisoned") = Some(w);
+        }
+
+        fn submissions(&self) -> u32 {
+            self.0.submissions.load(Ordering::SeqCst)
+        }
+
+        fn witness_fetches(&self) -> u32 {
+            self.0.witness_fetches.load(Ordering::SeqCst)
+        }
+
+        fn submitted_roots(&self) -> Vec<[u8; 32]> {
+            self.0
+                .submitted_roots
+                .lock()
+                .expect("roots poisoned")
+                .clone()
+        }
+    }
+
+    impl crate::transport::Transport for MockTransport {
+        fn authorize(
+            &self,
+            _: meridian_core::dsa::SignedDelegation,
+            _: meridian_core::dsa::AgentPubKey,
+        ) -> Result<(), SdkError> {
+            Ok(())
+        }
+
+        fn submit(
+            &self,
+            env: &IntentEnvelope,
+        ) -> Result<meridian_aggregator::receipt::Receipt, SdkError> {
+            self.0.submissions.fetch_add(1, Ordering::SeqCst);
+            // 模拟「提交瞬间聚合器换代」：首提交后当刻 witness 变化（只触发一次）。
+            if let Some(w) = self
+                .0
+                .switch_on_submit
+                .write()
+                .expect("switch poisoned")
+                .take()
+            {
+                self.set_witness(w);
+            }
+            self.0
+                .submitted_roots
+                .lock()
+                .expect("roots poisoned")
+                .push(env.proof.public_inputs.revocation_root);
+            let spent = self
+                .0
+                .reject_before
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            Ok(meridian_aggregator::receipt::Receipt {
+                intent_hash: [0xAB; 32],
+                accepted: !spent,
+                reject_reason: spent.then_some(Error::ERevRoot),
+                seq: 42,
+            })
+        }
+
+        fn next_nonce(&self, _dh: &[u8; 32]) -> Result<Option<u64>, SdkError> {
+            Ok(Some(0))
+        }
+
+        fn revocation_witness(
+            &self,
+            _dh: &[u8; 32],
+        ) -> Result<Option<RevocationWitness>, SdkError> {
+            self.0.witness_fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(self.0.witness.read().expect("witness poisoned").clone())
+        }
+    }
+
+    fn stale_witness(root: u8) -> RevocationWitness {
+        RevocationWitness {
+            root: [root; 32],
+            path: Vec::new(),
+        }
+    }
+
+    fn refreshed_params(dh: [u8; 32], amount: u64) -> PayParams {
+        PayParams {
+            delegation_hash: dh,
+            recipient: [3u8; 20],
+            amount,
+            category: [0xCD; 32],
+            memo: None,
+            expires_at: u64::MAX,
+        }
+    }
+
+    fn refreshed_client(mock: MockTransport) -> (SdkClient, k256::ecdsa::SigningKey) {
+        let wallet = crate::identity::AgentWallet::from_seed([9u8; 32]);
+        let owner = meridian_core::dsa::owner_signing_key_from_bytes([7u8; 32]);
+        (SdkClient::new(wallet, Box::new(mock)), owner)
+    }
+
+    fn refreshed_limits() -> crate::identity::DelegationLimits {
+        crate::identity::DelegationLimits {
+            max_per_spend: 1_000,
+            rate_window_secs: 60,
+            rate_max_per_window: 10_000,
+            total_cap: 10_000,
+            categories: vec![],
+            not_before: 0,
+            expires_at: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn pay_refreshes_witness_on_rev_root_and_resubmits_same_intent() {
+        // 旧状态 witness → E_REV_ROOT 拒 → 现取新根重出证明重交 → 接受；nonce 不推进。
+        let mock = MockTransport::new(Some(stale_witness(1)), 1);
+        let (client, owner) = refreshed_client(mock.clone());
+        let rec = client
+            .authorize(&owner, [1u8; 20], &refreshed_limits())
+            .unwrap();
+        let dh = rec.delegation_hash;
+
+        // 接受前把「当刻」witness 换新根（模拟换代后的聚合器状态）。
+        mock.switch_witness_on_submit(Some(stale_witness(2)));
+
+        let r = client.pay(&refreshed_params(dh, 42)).unwrap();
+        assert_eq!(r.seq, 42);
+        // 重出证明确实换了根：首次提交旧根、重交新根。
+        assert_eq!(mock.submitted_roots(), vec![[1u8; 32], [2u8; 32]]);
+        assert_eq!(mock.submissions(), 2);
+        assert_eq!(mock.witness_fetches(), 2, "pay 起手一次 + 刷新一次");
+        // 绑定闸拒不耗 nonce（§6.2）：重交复用同一 nonce，仅定局后才推进。
+        assert_eq!(r.spend_nonce, 0);
+        // 新根已入库（per-dh 缓存，后续支付复用不再现取）。
+        let r2 = client.pay(&refreshed_params(dh, 43)).unwrap();
+        assert_eq!(r2.spend_nonce, 1, "只有定局后才推进 nonce");
+        assert_eq!(mock.witness_fetches(), 2, "缓存命中不再现取");
+        assert_eq!(mock.submissions(), 3);
+    }
+
+    #[test]
+    fn pay_fetches_witness_on_cache_miss_per_delegation() {
+        // 无缓存的委托自动现取（§6.7 端点）——占位根被真实根替换（per-dh 分桶）。
+        let mock = MockTransport::new(Some(stale_witness(3)), 0);
+        let (client, owner) = refreshed_client(mock.clone());
+        let rec = client
+            .authorize(&owner, [1u8; 20], &refreshed_limits())
+            .unwrap();
+        let dh = rec.delegation_hash;
+
+        client.pay(&refreshed_params(dh, 42)).unwrap();
+        assert_eq!(
+            mock.submitted_roots(),
+            vec![[3u8; 32]],
+            "占位根被自动现取的真实根替换"
+        );
+    }
+
+    #[test]
+    fn pay_keeps_rejection_when_witness_unavailable() {
+        // 刷新时取不到 witness（Ok(None) = 已撤销）→ 原拒绝定局（fail-closed，不重试）。
+        let mock = MockTransport::new(Some(stale_witness(1)), 1);
+        let (client, owner) = refreshed_client(mock.clone());
+        let rec = client
+            .authorize(&owner, [1u8; 20], &refreshed_limits())
+            .unwrap();
+        let dh = rec.delegation_hash;
+
+        // 刷新窗口内聚合器侧已撤销 → witness 查询 Ok(None)。
+        mock.switch_witness_on_submit(None);
+
+        let err = client.pay(&refreshed_params(dh, 42)).unwrap_err();
+        assert_eq!(
+            err.code(),
+            "E_REV_ROOT",
+            "refresh 不可得 → 原拒绝透传: {err:?}"
+        );
+        assert_eq!(mock.submissions(), 1, "不重试");
+        assert_eq!(mock.witness_fetches(), 2, "起手 + 刷新各一次");
+    }
+
+    #[test]
+    fn pay_caps_witness_refresh_attempts() {
+        // 聚合器持续 E_REV_ROOT（如 transport 指向另一聚合器）→ 刷新封顶
+        // `RetryPolicy::max_attempts`，不无限循环。
+        let mock = MockTransport::new(Some(stale_witness(1)), u32::MAX);
+        let (client, owner) = refreshed_client(mock.clone());
+        let rec = client
+            .authorize(&owner, [1u8; 20], &refreshed_limits())
+            .unwrap();
+        let dh = rec.delegation_hash;
+
+        let err = client.pay(&refreshed_params(dh, 42)).unwrap_err();
+        assert_eq!(err.code(), "E_REV_ROOT");
+        // 起手 1 次 + 刷新 max_attempts（缺省 3）次；提交同数（每次刷新后重交一次）。
+        assert_eq!(mock.witness_fetches(), 1 + 3);
+        assert_eq!(mock.submissions(), 1 + 3);
     }
 }

@@ -140,6 +140,62 @@ pub struct NextNonceResponse {
     pub next_nonce: u64,
 }
 
+/// `GET /v1/revocation-witness/{delegation_hash}` 响应体（S-45，§6.7）。
+///
+/// 撤销非成员 witness（S-42 `RevocationSet::non_membership_witness` 直出）：
+/// `root` = 当前撤销状态根（BE Field 32B，电路 `revocation_root` 公共输入口径）；
+/// `path` = 深度 256 兄弟路径的**扁平 hex**（256 × 32B BE Field 依深度序拼接，8192B →
+/// 16384 hex 字符，与 gen-witness 扁平 witness 格式同口径）。目标已撤销 = 404
+/// `E_REVOKED`，不走本 DTO（成员证明不属于非成员接口语义，S-42 fail-closed）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevocationWitnessResponse {
+    pub delegation_hash: String,
+    pub root: String,
+    /// 256 × 32B BE Field 依深度序拼接的扁平 hex（`SPARSE_DEPTH * 32` 字节）。
+    pub path: String,
+}
+
+impl RevocationWitnessResponse {
+    /// 内核 witness → wire（单一转换点：root/path 编码口径只写在这里）。
+    pub fn from_witness(
+        delegation_hash: &[u8; 32],
+        w: &crate::revocation::NonMembershipWitness,
+    ) -> Self {
+        RevocationWitnessResponse {
+            delegation_hash: hex::encode(delegation_hash),
+            root: hex::encode(w.root),
+            path: hex::encode(
+                w.path
+                    .iter()
+                    .flat_map(|p| p.iter().copied())
+                    .collect::<Vec<u8>>(),
+            ),
+        }
+    }
+
+    /// wire → 电路 witness 口径（`meridian_core::zk::RevocationWitness`，path 按 32B
+    /// 分块还原）。长度 / hex 不合法即 `Err`（fail-closed，不静默截断）。
+    pub fn into_witness(self) -> Result<meridian_core::zk::RevocationWitness, String> {
+        let raw = hex::decode(&self.path).map_err(|e| format!("bad path hex: {e}"))?;
+        if raw.len() != crate::revocation::SPARSE_DEPTH * 32 {
+            return Err(format!(
+                "path must be {} bytes ({} x 32B), got {}",
+                crate::revocation::SPARSE_DEPTH * 32,
+                crate::revocation::SPARSE_DEPTH,
+                raw.len()
+            ));
+        }
+        let path = raw
+            .chunks_exact(32)
+            .map(|c| <[u8; 32]>::try_from(c).expect("chunks_exact(32)"))
+            .collect();
+        Ok(meridian_core::zk::RevocationWitness {
+            root: hex_to_bytes32(&self.root)?,
+            path,
+        })
+    }
+}
+
 /// 网关错误体（传输层，§11 补充表：E_AUTH / E_RATE_LIMITED / E_MALFORMED）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GatewayError {
@@ -254,5 +310,40 @@ mod tests {
         assert!(hex_to_bytes32(&hex::encode([1u8; 31])).is_err());
         assert!(hex_to_bytes32(&hex::encode([1u8; 33])).is_err());
         assert!(hex_to_bytes32("zz").is_err());
+    }
+
+    #[test]
+    fn revocation_witness_dto_roundtrip_preserves_root_and_path() {
+        // S-45：wire 扁平 hex ↔ 电路分块口径 roundtrip（root 逐字节、path 逐层还原）。
+        let set = crate::revocation::RevocationSet::new();
+        let dh = [0x5A; 32];
+        let w = set.non_membership_witness(&dh).expect("目标未撤销");
+        let dto = RevocationWitnessResponse::from_witness(&dh, &w);
+        assert_eq!(dto.delegation_hash, hex::encode(dh));
+        assert_eq!(dto.root, hex::encode(w.root));
+        assert_eq!(dto.path.len(), crate::revocation::SPARSE_DEPTH * 64);
+        let back = dto.into_witness().expect("roundtrip");
+        assert_eq!(back.root, w.root);
+        assert_eq!(back.path, w.path);
+    }
+
+    #[test]
+    fn revocation_witness_dto_rejects_bad_length_and_hex() {
+        let mk = |path: String| RevocationWitnessResponse {
+            delegation_hash: hex::encode([1u8; 32]),
+            root: hex::encode([2u8; 32]),
+            path,
+        };
+        // 长度错：少一层 / 多一字节 / 非 hex。
+        assert!(mk("00".repeat(255 * 32)).into_witness().is_err());
+        assert!(mk("00".repeat(256 * 32 + 1)).into_witness().is_err());
+        assert!(mk("zz".repeat(256 * 32)).into_witness().is_err());
+        // root 长度错。
+        let bad_root = RevocationWitnessResponse {
+            delegation_hash: hex::encode([1u8; 32]),
+            root: "00".to_string(),
+            path: "00".repeat(256 * 32),
+        };
+        assert!(bad_root.into_witness().is_err());
     }
 }

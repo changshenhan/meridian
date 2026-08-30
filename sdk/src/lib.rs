@@ -75,8 +75,10 @@ pub struct SdkClient {
     authorized: RwLock<HashMap<[u8; 32], (Did, SignedDelegation)>>,
     /// attestation 私钥标量（S-43，真 prover 用；占位口径全零不消费）。
     attestation_secret: [u8; 32],
-    /// 撤销非成员 witness（S-43；None = 占位口径，真 prover 会以 E_PROVER 拒绝）。
-    revocation: Option<RevocationWitness>,
+    /// 撤销非成员 witness（S-43 手动装配 / S-45 自动现取），按 delegation_hash 分桶
+    /// ——witness 是 **per-dh 事实**（路径由目标索引决定），跨委托复用会被电路断言 8
+    /// 重算根失配拒。无缓存的委托 = 占位口径（真 prover 以 E_PROVER 拒）。
+    revocations: RwLock<HashMap<[u8; 32], RevocationWitness>>,
     /// 重试策略（仅传输错误触发）。
     retry: RetryPolicy,
 }
@@ -101,7 +103,7 @@ impl SdkClient {
             delegation_nonce: AtomicU64::new(1),
             authorized: RwLock::new(HashMap::new()),
             attestation_secret: [0u8; 32],
-            revocation: None,
+            revocations: RwLock::new(HashMap::new()),
             retry: RetryPolicy::default(),
         }
     }
@@ -111,12 +113,18 @@ impl SdkClient {
         self.attestation_secret = secret;
     }
 
-    /// 配置撤销非成员 witness（S-43：聚合器 `RevocationSet::non_membership_witness`
-    /// 直出）。新鲜度与根换代的一致性见 TECH_SPEC §6.14 诚实边界 3 / §4.6 残余③
-    /// （S-44：聚合器侧绑定闸开启时，witness 取自重启前的中间状态会以 `E_REV_ROOT` 拒
-    /// ——按业务拒绝定局；自动刷新重试为后续项）。
-    pub fn set_revocation_witness(&mut self, w: RevocationWitness) {
-        self.revocation = Some(w);
+    /// 配置某委托的撤销非成员 witness（S-43：聚合器 `RevocationSet::non_membership_witness`
+    /// 直出；S-45 起按 delegation_hash 分桶——witness 是 per-dh 事实，跨委托复用会被
+    /// 电路断言 8 重算根失配拒）。
+    ///
+    /// 新鲜度（S-45）：`pay()` 对无缓存的委托自动现取（§6.7 witness 查询端点），被
+    /// `E_REV_ROOT` 拒（绑定闸开启 + witness 取自重启前的中间状态等窄窗口）时自动
+    /// 刷新重出（§6.14 诚实边界 3）。本方法保留给离线 / 测试口径的显式注入。
+    pub fn set_revocation_witness(&mut self, dh: [u8; 32], w: RevocationWitness) {
+        self.revocations
+            .write()
+            .expect("revocations poisoned")
+            .insert(dh, w);
     }
 
     /// 覆盖重试策略。
@@ -183,13 +191,22 @@ impl SdkClient {
         self.attestation_secret
     }
 
-    /// 撤销 witness（S-43）：None = 占位口径（`root` 全零 + 空 path），只够
-    /// `PlaceholderProver` 用——真 prover 会以 `E_PROVER` 拒绝（fail-closed）。
-    pub(crate) fn revocation_witness(&self) -> RevocationWitness {
-        self.revocation.clone().unwrap_or(RevocationWitness {
-            root: [0u8; 32],
-            path: Vec::new(),
-        })
+    /// 撤销 witness（S-43/S-45）：无缓存 = 占位口径（`root` 全零 + 空 path），只够
+    /// `PlaceholderProver` 用——真 prover 会以 `E_PROVER` 拒绝（fail-closed）。缓存的
+    /// 新鲜度由 [`crate::pay::pay`] 维护（未命中现取 + `E_REV_ROOT` 刷新）。
+    pub(crate) fn revocation_witness_for(&self, dh: &[u8; 32]) -> Option<RevocationWitness> {
+        self.revocations
+            .read()
+            .expect("revocations poisoned")
+            .get(dh)
+            .cloned()
+    }
+
+    pub(crate) fn store_revocation_witness(&self, dh: &[u8; 32], w: RevocationWitness) {
+        self.revocations
+            .write()
+            .expect("revocations poisoned")
+            .insert(*dh, w);
     }
 
     pub(crate) fn retry(&self) -> &RetryPolicy {
@@ -241,6 +258,28 @@ impl SdkClient {
             .next_nonce(dh)?
             .ok_or_else(|| SdkError::Local("delegation not registered on aggregator".into()))?;
         Ok(self.nonces.resync(dh, remote))
+    }
+
+    /// S-45 撤销 witness 显式刷新（镜像 [`Self::sync_nonce`] 口径，§6.7 / §6.14 诚实
+    /// 边界 3）：查询聚合器当刻撤销树快照（`GET /v1/revocation-witness`）并入库，返回
+    /// 该 witness。`pay()` 对无缓存的委托会自动现取，被 `E_REV_ROOT` 拒时也会自动刷新
+    /// 重出——本方法供调用方在 prove 前主动取新鲜度（离线装配 / 观测 / 预热）。
+    ///
+    /// `Ok(None)` = 目标已撤销（`E_REVOKED`）——无非成员 witness 可得，缓存不动（后续
+    /// `pay()` 走管线步 2b `E_REVOKED` 定局）。传输失败按 `SdkError::Transport` 上抛。
+    pub fn sync_revocation_witness(
+        &self,
+        dh: &[u8; 32],
+    ) -> Result<Option<RevocationWitness>, SdkError> {
+        // 先验授权上下文：与 pay() 同一前置闸，未授权委托不产生查询。
+        self.agent_for(dh)?;
+        match self.transport.revocation_witness(dh)? {
+            Some(w) => {
+                self.store_revocation_witness(dh, w.clone());
+                Ok(Some(w))
+            }
+            None => Ok(None),
+        }
     }
 }
 

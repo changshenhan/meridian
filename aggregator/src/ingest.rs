@@ -40,7 +40,7 @@ use crate::hist::LatencyHistogram;
 use crate::lattice::{ChainPublisher, EpochResult, NoopPublisher};
 use crate::proof::check_public_inputs_consistent;
 use crate::receipt::{IntentEnvelope, Receipt};
-use crate::revocation::RevocationSet;
+use crate::revocation::{NonMembershipWitness, RevocationSet};
 use crate::wal::{DecodedRecord, Wal};
 use crate::window::{EpochWindow, WindowEntry};
 
@@ -786,6 +786,15 @@ impl Aggregator {
     /// 撤销集当前根（下个 epoch 承诺时锚定；测试 / 观测）。
     pub fn revocation_root(&self) -> [u8; 32] {
         self.revocations.sparse_root()
+    }
+
+    /// 撤销非成员 witness 查询（S-45，§6.7）：供 prover 侧出真证明（§6.14 SDK 半边）。
+    /// 与 [`Self::revocation_root`] 同一压实实现——root 与 path 出自同一棵确定性树。
+    /// `None` = 目标已撤销（成员陈述不属于本接口语义，S-42 fail-closed；网关映射
+    /// `404 E_REVOKED`）。**只读事实面**：未注册的 delegation_hash 照常返回非成员
+    /// witness（撤销树覆盖完整 256-bit 索引空间），注册校验在摄取管线步 1。
+    pub fn revocation_witness(&self, dh: &[u8; 32]) -> Option<NonMembershipWitness> {
+        self.revocations.non_membership_witness(dh)
     }
 
     /// 某委托是否已撤销（测试 / 观测）。

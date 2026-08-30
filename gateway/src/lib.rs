@@ -19,7 +19,7 @@ use std::time::Instant;
 use meridian_aggregator::ingest::Aggregator;
 use meridian_aggregator::wire::{
     AuthorizeRequest, AuthorizeResponse, GatewayError, IntentEnvelopeDto, NextNonceResponse,
-    ReceiptDto,
+    ReceiptDto, RevocationWitnessResponse,
 };
 
 /// 传输层错误码（§11 补充表；不进 core `Error` 内核枚举）。
@@ -29,6 +29,10 @@ pub const E_MALFORMED: &str = "E_MALFORMED";
 /// 只读查询未命中（S-30a `/v1/receipts`）：不存在 / 已结算修剪 / 被拒。
 /// **404 ≠ 未支付**——终局保证在链上净额（§6.7 语义边界）。
 pub const E_NOT_FOUND: &str = "E_NOT_FOUND";
+/// 撤销 witness 查询（S-45 `/v1/revocation-witness`）目标已撤销——非成员陈述不属于该
+/// 目标（S-42 fail-closed，成员证明不由本接口给出）。复用 §11 主表内核码字符串（wire
+/// 层响应码，语义同主表「委托已撤销」），不进内核枚举实例化。
+pub const E_REVOKED: &str = "E_REVOKED";
 
 /// 网关配置（JSON 文件形态，§6.7）。
 ///
@@ -203,6 +207,9 @@ impl Gateway {
             ("GET", p) if p.starts_with("/v1/nonce/") => {
                 self.handle_nonce_lookup(bearer, &p["/v1/nonce/".len()..])
             }
+            ("GET", p) if p.starts_with("/v1/revocation-witness/") => {
+                self.handle_revocation_witness(bearer, &p["/v1/revocation-witness/".len()..])
+            }
             ("POST", _) | ("GET", _) => Response::error(404, E_MALFORMED, "unknown route"),
             _ => Response::error(405, E_MALFORMED, "method not allowed"),
         }
@@ -308,6 +315,36 @@ impl Gateway {
                 )
             }
             None => Response::error(404, E_NOT_FOUND, "delegation not registered"),
+        }
+    }
+
+    /// S-45 只读撤销非成员 witness 查询：`GET /v1/revocation-witness/{delegation_hash}`
+    /// （§6.7，§6.14 诚实边界 3 SDK 半边）。走租户闸（认证 + 限流）；GET 无 body。
+    /// 命中 → 200 + `RevocationWitnessResponse`（root + 深度 256 兄弟路径扁平 hex，同一
+    /// 棵确定性树）；目标已撤销 → 404 `E_REVOKED`（成员陈述不由本接口给出，S-42
+    /// fail-closed）。未注册的 delegation_hash 照常返回 witness（只读事实面，注册校验
+    /// 在摄取管线步 1）。
+    fn handle_revocation_witness(&self, bearer: Option<&str>, hash_hex: &str) -> Response {
+        if let Err(r) = self.gate(bearer) {
+            return r;
+        }
+        // 0x 前缀宽容（与 /v1/receipts、/v1/nonce 同口径）。
+        let hash_hex = hash_hex.strip_prefix("0x").unwrap_or(hash_hex);
+        let dh = match meridian_aggregator::wire::hex_to_bytes32(hash_hex) {
+            Ok(dh) => dh,
+            Err(e) => {
+                return Response::error(400, E_MALFORMED, format!("bad delegation_hash: {e}"))
+            }
+        };
+        match self.agg.revocation_witness(&dh) {
+            Some(w) => {
+                let dto = RevocationWitnessResponse::from_witness(&dh, &w);
+                Response::json(
+                    200,
+                    serde_json::to_string(&dto).expect("RevocationWitnessResponse serializes"),
+                )
+            }
+            None => Response::error(404, E_REVOKED, "delegation revoked"),
         }
     }
 
