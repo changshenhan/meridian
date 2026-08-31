@@ -462,8 +462,7 @@ pub fn fraud_candidates(
     // 的越界接受；接受根闸闭合时不产候选（检出信号 ⑥⑦ 仍由 `detect` 报出）。
     if acceptance_anchored {
         for r in &det.revoked_consumption {
-            let Some(c) =
-                evidence_for(rec, r.seq, chain.commitment_root, chain.acceptance_root)
+            let Some(c) = evidence_for(rec, r.seq, chain.commitment_root, chain.acceptance_root)
             else {
                 continue;
             };
@@ -474,8 +473,7 @@ pub fn fraud_candidates(
             });
         }
         for cs in &det.cross_shard_consumption {
-            let Some(c) =
-                evidence_for(rec, cs.seq, chain.commitment_root, chain.acceptance_root)
+            let Some(c) = evidence_for(rec, cs.seq, chain.commitment_root, chain.acceptance_root)
             else {
                 continue;
             };
@@ -943,7 +941,11 @@ mod tests {
         assert_eq!(cands.len(), 1);
         let c = &cands[0];
         assert_eq!(c.kind, KIND_REVOKED);
-        assert_eq!(c.intents.len(), 1, "kind3 单意图（BadFraudKind 同款计数闸）");
+        assert_eq!(
+            c.intents.len(),
+            1,
+            "kind3 单意图（BadFraudKind 同款计数闸）"
+        );
         let e = &c.intents[0];
         assert_eq!(e.accepted_at, T0 + 1_000);
         // 两条路径同批自检：承诺树 + 接受树重推 == 链上根。

@@ -2398,6 +2398,16 @@ contract BatchSettler {
 > `GetProcessMemoryInfo`（Windows），run-to-run 方差 ~0.2%，3% 阈值永不误报；**gate 强制、
 > 不受 `--fail-over` 放宽**）。
 
+> **S-66 实测回填（B7 基线重录，2026-08-31）**：P2-3 接受锚把 `acceptanceRoot` 纳入 B7
+> 管线测量（`b7_measure` 构造确定性接受时刻，`lattice::build_epoch` 出双树根，bench 侧
+> 注释锚定）——B7 在承诺树之外新增一棵 100k 叶 sha256 Merkle 树（接受叶 22B 原像），
+> **固有成本 +19ms**：`agg_kernel_b7_wall_ms` 48.1 → **67.0 ms**（`gate --record` 5 轮
+> 取最短重录；门禁比对轮实测 69.1/68.8，两轮 +43% 一致，非噪声）。B7 预算线
+> <1s / <1GB **不变**（余量 ~15×）；回归门禁以重录后的 baseline 为准。其余指标重录值
+> 全部在门内：`agg_kernel_ingest_ops` -10.5%（内含 WAL Intent 记录 116→124B 的真实
+> 小幅成本，±6% 噪声地板之上的最差项，< 15% 门禁）、`agg_kernel_rss_mib` 63.8 →
+> 63.4 MiB、其余 ±2% 内。B12 行的 S-18 历史锚 63.8 MiB 保留，以 baseline.json 现值为准。
+
 ### 8.3 可复现与验证门禁
 
 - **主门禁 = 本地流水线**：`scripts/verify.sh`（fmt → clippy `-D warnings` → `cargo test

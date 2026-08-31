@@ -722,17 +722,44 @@ mod tests {
         let path = tmp_path("revinter");
         let w = Wal::open(&path, 1000).unwrap();
         w.append_register(&sample_sd(), &[0x11; 32]).unwrap(); // 0 Register
-        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000, [0xEE; 20], 1_700_000_000)
-            .unwrap(); // 1 Intent
+        w.append_intent(
+            1,
+            [0xAB; 32],
+            [0xCD; 32],
+            5,
+            42,
+            1_700_000_000,
+            [0xEE; 20],
+            1_700_000_000,
+        )
+        .unwrap(); // 1 Intent
         w.append_revoke([0x01; 32]).unwrap(); // 2 Revoke
-        w.append_intent(2, [0xBB; 32], [0xCD; 32], 6, 43, 1_700_000_001, [0xFF; 20], 1_700_000_001)
-            .unwrap(); // 3 Intent
+        w.append_intent(
+            2,
+            [0xBB; 32],
+            [0xCD; 32],
+            6,
+            43,
+            1_700_000_001,
+            [0xFF; 20],
+            1_700_000_001,
+        )
+        .unwrap(); // 3 Intent
         w.append_epoch_seal(0, [0x77; 32], 2, 1_700_000_002)
             .unwrap(); // 4 EpochSeal
         w.append_revoke([0x02; 32]).unwrap(); // 5 Revoke
         w.append_netting(0, [0x88; 32], 1).unwrap(); // 6 Netting
-        w.append_intent(3, [0xCC; 32], [0xDD; 32], 7, 44, 1_700_000_003, [0x12; 20], 1_700_000_003)
-            .unwrap(); // 7 Intent
+        w.append_intent(
+            3,
+            [0xCC; 32],
+            [0xDD; 32],
+            7,
+            44,
+            1_700_000_003,
+            [0x12; 20],
+            1_700_000_003,
+        )
+        .unwrap(); // 7 Intent
         w.flush().unwrap();
         let (records, valid, truncated) = w.replay().unwrap();
         assert!(!truncated);
