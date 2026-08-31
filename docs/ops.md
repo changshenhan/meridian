@@ -65,7 +65,7 @@ WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪�
 | `ledger_consistent` | 独立重放 WAL 的 Intent 数 == `accepted_count` | 内存账本与崩溃恢复边界漂移（WAL 写入故障第一信号） |
 | `revocation_root_present` | 有撤销则撤销根必须非零 | 撤销未进 Merkle 承诺（聚合器内部不一致） |
 | `epoch_backlog` | `pending_sealed ≤ 3` | 结算滞后（长时间不 process_pending，风险集中在 BatchSettler 消费端） |
-| `replicas_converged`（仅多副本） | 全副本 `accepted_count` / `revoked_len` / `revocation_root` 相等 | 副本间账本推进或撤销承诺分歧（备份滞后/复制断档，S-39）——只报告不裁决，接管 WAL 人工核对 |
+| `replicas_converged`（仅多副本） | 全副本 `accepted_count` / `revoked_len` / `revocation_root` 三元组相等 **且** `state_digest` 逐字节相等（S-72 两腿，§6.12.1；失配腿见 detail `diverged=`） | `diverged=triple`：账本推进/撤销承诺分歧（备份滞后/复制断档，S-39）；`diverged=digest`（尤其 lag=0 时）：**同计数不同内容** = 账本内容分叉（REG 多注册 / LEDGER 金额 / 窗口内容），比滞后更严重——只报告不裁决，立即接管两副本 WAL 逐域人工比对 |
 
 > `wal_intents` 由 monitor 独立重放 WAL 得到——**不读聚合器内存**，否则 `ledger_consistent`
 > 变成自比，失去检查意义。
@@ -107,6 +107,7 @@ WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪�
 | `mist_rejected_total` 激增 | 环比 | 客户端配置漂移或重放攻击，查错误码分布 |
 | `mist_submit_duration_p99_seconds` | > 0.05（B6 目标 50 ms） | 热路径退化（分片争用 / WAL 慢盘 / 验证变贵），对照 `_bucket` 定位量级 |
 | `mist_cluster_replica_lag` | > 0（多副本） | 备份副本复制断档/滞后——failover 会丢账本尾部，查副本复制链路 |
+| `/healthz` `replicas_converged` degraded 且 detail `diverged=digest`、`lag=0` | 任一次 | **同计数不同内容**（S-72 digest 腿，§6.12.1）：三元组全等但账本内容分叉——复制链路静默写错（比断档更危险：滞后可见、写错不可见），立即停止 failover 并人工比对两副本账本逐域找分叉点 |
 | `mist_operator_slash_total` 增长 | 环比 | 运营者被成功欺诈挑战罚没（epoch voided）——最高优先安全事件，对照 `slash_kind_total{kind}` 与链上 `ChallengeSucceeded` 事件核查欺诈证明 |
 | `mist_operator_chain_read_ok` | 持续 = 0 | 链上读面失败（RPC 不可得/事件解码失败）——声誉快照停留在旧值；**不拉低 /healthz**（账本健康面与链上读面告警分离，TECH_SPEC §6.22.1 定夺 5），查 monitor `--rpc` 连通性与节点状态 |
 

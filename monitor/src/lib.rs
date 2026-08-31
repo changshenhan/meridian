@@ -14,7 +14,8 @@
 //! `histogram_quantile`），同样会话口径、不持久化。
 //!
 //! 多实例（S-39）：`cluster.rs` 聚合 N 个热备 WAL 副本（同一逻辑账本取 max，副本分歧
-//! 报 degraded）——口径见 TECH_SPEC §6.12。
+//! 报 degraded）——口径见 TECH_SPEC §6.12；收敛判定两腿（S-72）：三元组 ∧
+//! `state_digest` 账本指纹（同计数不同内容的分歧不再盲，§6.12.1）。
 //!
 //! 声誉面（S-65）：`reputation.rs` + `rpc.rs` 从 BatchSettler 事件派生只读指标
 //! （§6.17 决策 E——不进任何判定面；`--settler`/`--rpc` 同给同不给，缺省序列不出现）。

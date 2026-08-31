@@ -91,6 +91,14 @@ Mist 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互相�
   状态根与裁决史逐字节一致；在线摄取 ↔ WAL 重放 digest 等价（TECH_SPEC §6.26）。诚实
   边界：apply 是**记账面不是验证面**（不重验，S-10a 语义）；批内乱序收敛 ≠ 共识安全性
   （跨批流式乱序挂 L3-1）；digest 是**诊断面不是判定面**（无密码学承诺，不替代出证闸）。
+- **monitor 收敛指纹升级（S-72，2026-09-01）**：§6.26.1 定夺 6 点名的 L3-3「digest 比对」
+  半边提前兑现——`replicas_converged` 从 S-39 三元组（accepted/revoked_len/root，对
+  「同计数不同内容」全盲）升级为**两腿**：三元组 ∧ `Aggregator::state_digest()`。digest
+  在 restore 后计算一次（静默态语义，monitor 副本无在途写者；窗口域不含 per-process
+  `created_at`，跨副本可比）；收敛 detail 逐字节保持 S-39 格式，失配 detail 增
+  `diverged=<triple|digest>` + 各副本 digest 前缀；零合约/WAL/热路径改动，单实例
+  `/healthz` JSON 不变（TECH_SPEC §6.12.1）。诚实边界：digest 腿是启动时点快照
+  （monitor 运行期新推进不捕获）；告警信号非欺诈证据。
 
 ## 仓库结构
 

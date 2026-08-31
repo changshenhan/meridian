@@ -133,6 +133,10 @@ fn run(
 
         // 独立重放 WAL 数 Intent 记录（不信任聚合器内存的 accepted_count，否则自比）。
         let wal_intents = count_wal_intents(p)?;
+        // digest 腿（S-72，TECH_SPEC §6.12.1）：restore 完成后**计算一次**——digest 语义
+        // 定义在静默态（§6.26.2：重放完成 / 无在途写者），本进程副本只读不接热路径，
+        // digest 是 WAL 的确定性函数，启动后恒定；每次刮取重算是 O(账本) 纯浪费。
+        let state_digest = agg.state_digest();
         let snap = agg.snapshot();
         if snap.accepted_count != wal_intents {
             eprintln!(
@@ -146,6 +150,7 @@ fn run(
             agg: Arc::new(agg),
             wal_intents,
             prev: Mutex::new(None),
+            state_digest,
         });
     }
     let multi = replicas.len() > 1;
@@ -186,12 +191,14 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 单副本数据源：聚合器副本 + 独立 WAL Intent 计数 + 独立刮取窗口状态。
+/// 单副本数据源：聚合器副本 + 独立 WAL Intent 计数 + 独立刮取窗口状态 + 账本指纹
+/// （restore 后一次，收敛判定 digest 腿，S-72）。
 struct ReplicaScrape {
     name: String,
     agg: Arc<Aggregator>,
     wal_intents: u64,
     prev: Mutex<Option<(u64, Instant)>>,
+    state_digest: [u8; 32],
 }
 
 impl ReplicaScrape {
@@ -211,6 +218,7 @@ impl ReplicaScrape {
             ClusterView {
                 name: self.name.clone(),
                 snap,
+                state_digest: self.state_digest,
             },
             rate,
         )
