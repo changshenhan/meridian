@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
 use crate::replay::{JournalState, ReplayJournal};
-use mist_sdk::x402::{category_from_resource, X402_VERSION};
+use mist_sdk::x402::{
+    category_from_resource, network_canonical, ResourceInfo, X402_VERSION, X402_VERSION_V2,
+};
 use mist_sdk::{AgentWallet, HttpTransport, PayParams, SdkClient, SdkError};
 
 /// x402 标准 `exact` scheme 名（EIP-3009 载荷）。
@@ -95,6 +97,41 @@ pub struct ExactPayment {
     pub network: String,
     pub resource: String,
     pub payload: ExactPayload,
+}
+
+/// 标准 `exact` scheme 的 v2 `PAYMENT-SIGNATURE` 头 JSON（S-72，base64 前）。
+///
+/// v2 结构差异（TECH_SPEC §6.10）：顶层无 `scheme`/`network`/`resource` 字符串——
+/// scheme/network 进 [`ExactAcceptedV2`]，resource 是顶层 [`ResourceInfo`] 对象
+/// （402 声明的原样回显）。内层 `payload` 与 v1 同构。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactPaymentV2 {
+    pub x402_version: u32,
+    /// wire 可选（v2 spec）；桥校验强制要求——category 映射与资源绑定的来源。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<ResourceInfo>,
+    pub accepted: ExactAcceptedV2,
+    pub payload: ExactPayload,
+}
+
+/// v2 `accepted` 支付要求（校验必需 = scheme/network/amount；其余宽容可选）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactAcceptedV2 {
+    pub scheme: String,
+    /// CAIP-2 规范形（v1 字符串经 [`network_canonical`] 等价互通）。
+    pub network: String,
+    /// 原子单位金额字符串——v2 字段名，语义同 v1 `maxAmountRequired`。
+    pub amount: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pay_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<mist_sdk::x402::Eip3009Extra>,
 }
 
 /// `validAfter` / `validBefore` 的宽容反序列化（数字或十进制字符串）。
@@ -288,7 +325,7 @@ impl Eip3009Bridge {
         self.journal.is_some()
     }
 
-    /// 完整桥路径：绑定校验 → EIP-712 验签 → 重放闸 → 转投 Mist 摄取。
+    /// 完整桥路径（v1 wire，S-32）：绑定校验 → EIP-712 验签 → 重放闸 → 转投摄取。
     ///
     /// 返回意图哈希（摄取成功或重放命中）——调用方凭它走 S-30c 的网关回执查询。
     pub fn ingest(
@@ -310,8 +347,9 @@ impl Eip3009Bridge {
                 payment.scheme, EXACT_SCHEME
             )));
         }
-        // 2. 绑定校验（fail-fast → 402）。
-        if payment.network != binding.network {
+        // 2. 绑定校验（fail-fast → 402）。network 恒规范形比较（S-72：v1 字符串
+        //    与 CAIP-2 等价类互通；既有 v1 名配置零迁移）。
+        if network_canonical(&payment.network) != network_canonical(&binding.network) {
             return Err(BridgeError::Binding(format!(
                 "network mismatch: {}",
                 payment.network
@@ -323,7 +361,78 @@ impl Eip3009Bridge {
                 payment.resource
             )));
         }
-        let auth = &payment.payload.authorization;
+        // 3+. 验签 / 重放闸 / 摄取（v1/v2 共享核心）。
+        self.settle(&payment.payload, binding, now, &payment.resource)
+    }
+
+    /// 完整桥路径（v2 wire，S-72）：绑定校验 → EIP-712 验签 → 重放闸 → 转投摄取。
+    ///
+    /// v2 字段位置差异（TECH_SPEC §6.10）：network/amount 取自 `accepted`，
+    /// resource 是顶层 [`ResourceInfo`]（wire 可选但桥强制要求——category 映射
+    /// 与资源绑定的来源，官方 v2 client 恒回显）。校验强度与 v1 完全一致，
+    /// 只是 wire 位置不同。
+    pub fn ingest_v2(
+        &self,
+        payment: &ExactPaymentV2,
+        binding: &ResourceBinding,
+        now: u64,
+    ) -> Result<[u8; 32], BridgeError> {
+        // 1. wire 版本与 scheme（调用方按 scheme 分发，这里复核）。
+        if payment.x402_version != X402_VERSION_V2 {
+            return Err(BridgeError::BadFormat(format!(
+                "x402Version {} != {}",
+                payment.x402_version, X402_VERSION_V2
+            )));
+        }
+        if payment.accepted.scheme != EXACT_SCHEME {
+            return Err(BridgeError::BadFormat(format!(
+                "scheme {:?} != {:?}",
+                payment.accepted.scheme, EXACT_SCHEME
+            )));
+        }
+        // 2. 绑定校验（fail-fast → 402）。network 恒规范形比较（v1 名与 CAIP-2
+        //    等价类互通，S-72）。
+        if network_canonical(&payment.accepted.network) != network_canonical(&binding.network) {
+            return Err(BridgeError::Binding(format!(
+                "network mismatch: {}",
+                payment.accepted.network
+            )));
+        }
+        let resource = payment
+            .resource
+            .as_ref()
+            .map(|r| r.url.clone())
+            .ok_or_else(|| {
+                BridgeError::Binding(
+                    "resource.url required (category mapping + resource binding)".into(),
+                )
+            })?;
+        if resource != binding.resource {
+            return Err(BridgeError::Binding(format!(
+                "resource mismatch: {resource}"
+            )));
+        }
+        let accepted_amount: u64 = payment.accepted.amount.parse().map_err(|_| {
+            BridgeError::BadFormat(format!("bad amount {:?}", payment.accepted.amount))
+        })?;
+        if accepted_amount != binding.amount {
+            return Err(BridgeError::Binding(
+                "accepted.amount != configured amount".into(),
+            ));
+        }
+        // 3+. 验签 / 重放闸 / 摄取（v1/v2 共享核心）。
+        self.settle(&payment.payload, binding, now, &resource)
+    }
+
+    /// 共享核心（v1/v2）：EIP-712 验签 → 重放闸 → 转投 Mist 摄取。
+    fn settle(
+        &self,
+        payload: &ExactPayload,
+        binding: &ResourceBinding,
+        now: u64,
+        resource: &str,
+    ) -> Result<[u8; 32], BridgeError> {
+        let auth = &payload.authorization;
         let from = parse_addr20(&auth.from).map_err(bad_format("from"))?;
         let to = parse_addr20(&auth.to).map_err(bad_format("to"))?;
         if to != binding.pay_to {
@@ -342,16 +451,16 @@ impl Eip3009Bridge {
                 auth.valid_after, auth.valid_before
             )));
         }
-        // 3. EIP-712 验签（ecrecover，链下密码学）。
+        // EIP-712 验签（ecrecover，链下密码学；domain 约定 v1 = v2 未变）。
         let digest = eip3009_digest(&self.cfg.domain, auth)?;
-        let sig65 = parse_sig65(&payment.payload.signature)?;
+        let sig65 = parse_sig65(&payload.signature)?;
         let recovered = recover_address(&digest, &sig65)?;
         if recovered != from {
             return Err(BridgeError::BadSignature(
                 "recovered address != authorization.from".into(),
             ));
         }
-        // 4. 重放闸：同 payload 重放不再摄取。
+        // 重放闸：同 payload 重放不再摄取。
         let nonce = parse_hex32(&auth.nonce).map_err(bad_format("nonce"))?;
         if let Some(ih) = self
             .seen
@@ -361,8 +470,8 @@ impl Eip3009Bridge {
         {
             return Ok(*ih);
         }
-        // 5. 转投 Mist 摄取（垫付模型；全量 DSA 闸口照常生效）。传输失败经
-        //    BridgeError::Ingest(Transport) 上抛 → 调用方 503 fail-closed。
+        // 转投 Mist 摄取（垫付模型；全量 DSA 闸口照常生效）。传输失败经
+        // BridgeError::Ingest(Transport) 上抛 → 调用方 503 fail-closed。
         let memo = eip3009_memo(auth, &sig65);
         let expires_at = auth
             .valid_before
@@ -372,16 +481,16 @@ impl Eip3009Bridge {
                 delegation_hash: bc.delegation_hash,
                 recipient: to,
                 amount: value,
-                category: category_from_resource(&payment.resource),
+                category: category_from_resource(resource),
                 memo: Some(memo),
                 expires_at,
             };
             bc.client.pay(&params).map_err(BridgeError::Ingest)
         })?;
-        // 6. 重放闸登记：仅 accepted 登记（`?` 已上抛传输失败 / 业务拒绝不定局不登记——
-        //    业务拒绝重放会再次摄取并再次被同一闸口拒，不产生净额）。先内存（本进程
-        //    重放立即被挡）再落盘（S-33：跨重启去重；落盘失败 → [`BridgeError::Journal`]
-        //    → 调用方 503 fail-closed，见模块文档诚实边界）。
+        // 重放闸登记：仅 accepted 登记（`?` 已上抛传输失败 / 业务拒绝不定局不登记——
+        // 业务拒绝重放会再次摄取并再次被同一闸口拒，不产生净额）。先内存（本进程
+        // 重放立即被挡）再落盘（S-33：跨重启去重；落盘失败 → [`BridgeError::Journal`]
+        // → 调用方 503 fail-closed，见模块文档诚实边界）。
         let ih = receipt.intent_hash;
         self.seen
             .lock()

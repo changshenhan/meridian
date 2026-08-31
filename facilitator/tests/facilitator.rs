@@ -22,13 +22,15 @@ use mist_aggregator::wal::Wal;
 use mist_core::dsa::owner_signing_key_from_bytes;
 use mist_facilitator::eip3009::{
     eip3009_digest, keccak256, parse_addr20, Authorization, BridgeConfig, Eip3009Bridge,
-    Eip3009Domain, ExactPayload, ExactPayment, NoirAssembly,
+    Eip3009Domain, ExactAcceptedV2, ExactPayload, ExactPayment, ExactPaymentV2, NoirAssembly,
 };
 use mist_facilitator::{Facilitator, FacilitatorConfig};
 use mist_gateway::http::serve as gateway_serve;
 use mist_gateway::{Gateway, TenantConf, TenantTable};
 use mist_sdk::x402::{
-    base64url_encode, Fetch, HttpFetch, PaymentRequired, ResourceRequest, X402Client, X402Outcome,
+    base64_decode_flexible, base64_std_encode, base64url_encode, network_canonical, Fetch,
+    HttpFetch, PaymentRequired, PaymentRequiredV2, ResourceInfo, ResourceRequest, X402Client,
+    X402Outcome, PAYMENT_REQUIRED_HEADER, X402_VERSION_V2,
 };
 use mist_sdk::{AgentWallet, DelegationLimits, HttpTransport, RetryPolicy, SdkClient, SdkError};
 
@@ -151,12 +153,12 @@ fn malformed_payment_header_is_402_not_500() {
     // 坏 base64url。
     let r = f.handle("GET", "/", Some("not*valid!!"));
     assert_eq!(r.status, 402);
-    assert!(r.body.contains("bad X-PAYMENT encoding"), "{}", r.body);
+    assert!(r.body.contains("bad payment header encoding"), "{}", r.body);
 
     // base64url 合法但 JSON 不合法。
     let r = f.handle("GET", "/", Some(&base64url_encode(b"{not json")));
     assert_eq!(r.status, 402);
-    assert!(r.body.contains("bad X-PAYMENT payload"), "{}", r.body);
+    assert!(r.body.contains("bad payment payload"), "{}", r.body);
 }
 
 #[test]
@@ -208,11 +210,15 @@ fn scheme_network_resource_binding_enforced() {
     assert_eq!(r.status, 402);
     assert!(r.body.contains("resource mismatch"), "{}", r.body);
 
-    // 坏 intentHash hex。
+    // 坏 intentHash hex（S-72 起错误文案带 wire 头名——v1/v2 归一后可区分来源）。
     let h = payment_header("mist-v1", NETWORK, resource, "0xzz");
     let r = f.handle("GET", "/", Some(&h));
     assert_eq!(r.status, 402);
-    assert!(r.body.contains("bad intentHash hex"), "{}", r.body);
+    assert!(
+        r.body.contains("bad X-PAYMENT intentHash hex"),
+        "{}",
+        r.body
+    );
 
     // intentHash 长度不对（31 字节）。
     let h = payment_header(
@@ -972,4 +978,386 @@ fn e2e_bridge_with_noir_prover_pays_real_proof_into_bb_gateway() {
     drop(agg2);
     let _ = std::fs::remove_file(&wal);
     let _ = std::fs::remove_file(&wal2);
+}
+
+// ---------------------------------------------------------------------------
+// 7. S-72：x402 v2 wire 双协议——PAYMENT-REQUIRED 头 / PAYMENT-SIGNATURE 头 /
+//    CAIP-2 网络标识 / exact 桥 v2 形（TECH_SPEC §6.8/§6.9/§6.10）。
+// ---------------------------------------------------------------------------
+
+/// 构造 agent 侧 v2 `PAYMENT-SIGNATURE` 头（mist-v1 形：scheme/network 进 accepted）。
+fn v2_mist_header(network: &str, resource_url: &str, intent_hash_hex: &str) -> String {
+    let json = format!(
+        r#"{{"x402Version":2,"resource":{{"url":"{resource_url}"}},"accepted":{{"scheme":"mist-v1","network":"{network}","amount":"{amount}","asset":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","payTo":"{pay_to}","maxTimeoutSeconds":30}},"payload":{{"intentHash":"{intent_hash_hex}","seq":0,"spendNonce":0}}}}"#,
+        amount = AMOUNT,
+        pay_to = PAY_TO
+    );
+    base64_std_encode(json.as_bytes())
+}
+
+/// 裸 socket GET（带头名显式指定——v2 `PAYMENT-SIGNATURE` 场景）→ (status, head, body)。
+fn raw_get_with_header(url: &str, header_name: &str, value: &str) -> (u16, String, String) {
+    let rest = url.strip_prefix("http://").expect("http url");
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut s = std::net::TcpStream::connect(authority).expect("connect");
+    let req = format!(
+        "GET /{path} HTTP/1.1\r\nHost: {authority}\r\n{header_name}: {value}\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    let status: u16 = resp
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .expect("status line");
+    let (head, body) = resp.rsplit_once("\r\n\r\n").unwrap_or((resp.as_str(), ""));
+    (status, head.to_string(), body.to_string())
+}
+
+#[test]
+fn v2_402_advertises_payment_required_header() {
+    let f = facilitator("http://fac.example.com/weather");
+    let r = f.handle("GET", "/", None);
+
+    // v1 body 不动（既有 client 面零改动）。
+    let pr: PaymentRequired = serde_json::from_str(&r.body).expect("v1 body still parses");
+    assert_eq!(pr.x402_version, 1);
+
+    // v2 声明走头：标准 base64 的 v2 JSON，accepts 恒 CAIP-2。
+    let v2 = r
+        .headers
+        .iter()
+        .find(|(k, _)| k == PAYMENT_REQUIRED_HEADER)
+        .expect("402 must carry PAYMENT-REQUIRED header")
+        .1
+        .clone();
+    let decoded = base64_decode_flexible(&v2).expect("flexible decode");
+    let v2pr: PaymentRequiredV2 =
+        serde_json::from_slice(&decoded).expect("v2 header decodes to PaymentRequired v2");
+    assert_eq!(v2pr.x402_version, X402_VERSION_V2);
+    assert_eq!(v2pr.resource.url, "http://fac.example.com/weather");
+    assert_eq!(v2pr.accepts.len(), 1, "无桥 facilitator 只有 mist-v1 条目");
+    assert_eq!(v2pr.accepts[0].scheme, "mist-v1");
+    assert_eq!(v2pr.accepts[0].amount, AMOUNT);
+    assert_eq!(
+        v2pr.accepts[0].network,
+        network_canonical(NETWORK),
+        "v2 accepts 恒产 CAIP-2 规范形"
+    );
+    assert_eq!(v2pr.accepts[0].pay_to, PAY_TO);
+}
+
+#[test]
+fn v2_402_header_omitted_without_asset_graceful_degradation() {
+    // asset 未配置 → v2 schema 要求 asset 必填非空 → 不产 v2 头（v2 client 回落
+    // body 按 v1 语境重试，我们照收）。
+    let f = Facilitator::new(FacilitatorConfig {
+        gateway_addr: "127.0.0.1:1".into(),
+        gateway_bearer: "unused".into(),
+        resource: "http://fac.example.com/weather".into(),
+        pay_to: PAY_TO.into(),
+        amount: AMOUNT.into(),
+        network: NETWORK.into(),
+        asset: None,
+        max_timeout_seconds: 30,
+        protected_body: "ok".into(),
+    });
+    let r = f.handle("GET", "/", None);
+    assert_eq!(r.status, 402);
+    assert!(
+        !r.headers.iter().any(|(k, _)| k == PAYMENT_REQUIRED_HEADER),
+        "asset 未配置不得产 v2 头"
+    );
+}
+
+/// 纯分发绑定矩阵（不经 socket）：直接调 [`Facilitator::handle`]。
+fn dispatch_with_v2(header_value: &str) -> (u16, String) {
+    let f = facilitator("http://fac.example.com/weather");
+    let r = f.handle("GET", "/", Some(header_value));
+    (r.status, r.body)
+}
+
+#[test]
+fn v2_mist_v1_wire_bindings_and_caip2_interop() {
+    let ih = format!("0x{}", hex::encode([0x11u8; 32]));
+
+    // CAIP-2 与 v1 名等价类互通：cfg.network = "base"，client 发 "eip155:8453"
+    // → 绑定通过（网关 127.0.0.1:1 不可达 → 503 fail-closed = 绑定全过）。
+    let (status, body) = dispatch_with_v2(&v2_mist_header(
+        "eip155:8453",
+        "http://fac.example.com/weather",
+        &ih,
+    ));
+    assert_eq!(status, 503, "绑定通过应走到回执闸: {body}");
+
+    // 异链 CAIP-2 → network mismatch 402。
+    let (status, body) = dispatch_with_v2(&v2_mist_header(
+        "eip155:1",
+        "http://fac.example.com/weather",
+        &ih,
+    ));
+    assert_eq!(status, 402);
+    assert!(body.contains("network mismatch"), "{body}");
+
+    // v2 名义下发 v1 字符串同样等价互通。
+    let (status, _) = dispatch_with_v2(&v2_mist_header(
+        "base",
+        "http://fac.example.com/weather",
+        &ih,
+    ));
+    assert_eq!(status, 503, "v1 名在 v2 wire 上同样互通");
+
+    // resource 缺失 → 402（绑定必须成立）。
+    let json = format!(
+        r#"{{"x402Version":2,"accepted":{{"scheme":"mist-v1","network":"eip155:8453","amount":"{amount}","payTo":"{pay_to}"}},"payload":{{"intentHash":"{ih}"}}}}"#,
+        amount = AMOUNT,
+        pay_to = PAY_TO
+    );
+    let (status, body) = dispatch_with_v2(&base64_std_encode(json.as_bytes()));
+    assert_eq!(status, 402);
+    assert!(body.contains("resource binding required"), "{body}");
+
+    // 错 resource → 402。
+    let (status, body) = dispatch_with_v2(&v2_mist_header(
+        "eip155:8453",
+        "http://other.example.com/weather",
+        &ih,
+    ));
+    assert_eq!(status, 402);
+    assert!(body.contains("resource mismatch"), "{body}");
+}
+
+#[test]
+fn v1_wire_accepts_caip2_network_via_canonical_comparison() {
+    // v1 wire 同样吃等价类：cfg.network = "base"，client 发 "eip155:8453" → 通过
+    // （503 = 绑定全过、回执闸 fail-closed）。
+    let f = facilitator("http://fac.example.com/weather");
+    let h = payment_header(
+        "mist-v1",
+        "eip155:8453",
+        "http://fac.example.com/weather",
+        &format!("0x{}", hex::encode([0x12u8; 32])),
+    );
+    let r = f.handle("GET", "/", Some(&h));
+    assert_eq!(r.status, 503, "CAIP-2 在 v1 wire 上应互通: {}", r.body);
+}
+
+#[test]
+fn version_dispatch_is_by_x402_version_field_only() {
+    // 缺 x402Version → 402（判据唯一 = x402Version）。
+    let json = r#"{"scheme":"mist-v1","network":"base","resource":"http://fac.example.com/weather","payload":{"intentHash":"0x00"}}"#;
+    let (status, body) = dispatch_with_v2(&base64_std_encode(json.as_bytes()));
+    assert_eq!(status, 402);
+    assert!(body.contains("missing x402Version"), "{body}");
+
+    // 未知版本 → 402。
+    let json =
+        r#"{"x402Version":3,"accepted":{"scheme":"mist-v1","network":"eip155:8453"},"payload":{}}"#;
+    let (status, body) = dispatch_with_v2(&base64_std_encode(json.as_bytes()));
+    assert_eq!(status, 402);
+    assert!(body.contains("unsupported x402Version 3"), "{body}");
+}
+
+/// 起带 asset 的 facilitator（v2 402 头在场）。
+fn spawn_facilitator_v2(gateway_addr: &str, resource: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let f = Arc::new(Facilitator::new(FacilitatorConfig {
+        gateway_addr: gateway_addr.into(),
+        gateway_bearer: GATEWAY_KEY.into(),
+        resource: resource.into(),
+        pay_to: PAY_TO.into(),
+        amount: AMOUNT.into(),
+        network: NETWORK.into(),
+        asset: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into()),
+        max_timeout_seconds: 30,
+        protected_body: "{\"weather\":\"clear+28C\"}".into(),
+    }));
+    std::thread::spawn(move || {
+        let _ = mist_facilitator::http::serve(f, listener);
+    });
+    format!("http://{addr}/")
+}
+
+#[test]
+fn e2e_agent_negotiates_v2_wire_from_402_header() {
+    // 402 带 PAYMENT-REQUIRED 头 → SDK client 谈判 v2：PAYMENT-SIGNATURE 重放 →
+    // facilitator v2 mist 路径（CAIP-2 等价互通）→ 网关回执 → 200。
+    let (gw_addr, wal, agg) = spawn_gateway("e2e-v2-negotiate");
+    let resource = spawn_facilitator_v2(&gw_addr, "http://fac.example.com/weather");
+
+    let transport = HttpTransport::new(&gw_addr, GATEWAY_KEY);
+    let wallet = AgentWallet::from_seed([9u8; 32]);
+    let owner = owner_signing_key_from_bytes([7u8; 32]);
+    let mut client = SdkClient::new(wallet, Box::new(transport));
+    client.set_retry(RetryPolicy {
+        max_attempts: 3,
+        base_backoff_ms: 0,
+        max_backoff_ms: 0,
+    });
+    let rec = client.authorize(&owner, [1u8; 20], &limits()).unwrap();
+    let dh = rec.delegation_hash;
+
+    let x = X402Client::new(&client, &HttpFetch, dh);
+    let outcome = x
+        .request(&ResourceRequest::get(&resource))
+        .expect("v2-negotiated roundtrip");
+
+    match outcome {
+        X402Outcome::Paid { response, proof } => {
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"{\"weather\":\"clear+28C\"}".to_vec());
+            assert_eq!(agg.accepted_count(), 1);
+            let receipt = agg.receipt(&proof.intent_hash).expect("receipt queryable");
+            assert_eq!(receipt.seq, proof.seq);
+        }
+        X402Outcome::Free(_) => panic!("402 资源必须走支付路径"),
+    }
+
+    drop(client);
+    let _ = std::fs::remove_file(&wal);
+}
+
+/// v2 exact 桥 payload（真 EIP-3009 签名，v2 wire 形）。
+fn exact_payment_v2(spec: &ExactSpec, resource_url: &str) -> ExactPaymentV2 {
+    let from_key = k256::ecdsa::SigningKey::from_bytes(&spec.from_seed.into()).expect("from key");
+    let signer = k256::ecdsa::SigningKey::from_bytes(&spec.signer_seed.into()).expect("signer key");
+    let point = from_key.verifying_key().to_encoded_point(false);
+    let from: [u8; 20] = keccak256(&point.as_bytes()[1..65])[12..]
+        .try_into()
+        .expect("20 bytes");
+    let auth = Authorization {
+        from: format!("0x{}", hex::encode(from)),
+        to: spec.to.into(),
+        value: spec.value.into(),
+        valid_after: spec.valid_after,
+        valid_before: spec.valid_before,
+        nonce: format!("0x{}", hex::encode(spec.nonce)),
+    };
+    let digest = eip3009_digest(spec.domain, &auth).expect("digest");
+    let (sig, rid) = signer.sign_prehash_recoverable(&digest).expect("sign");
+    let mut sig65 = sig.to_bytes().to_vec();
+    sig65.push(rid.to_byte());
+    ExactPaymentV2 {
+        x402_version: X402_VERSION_V2,
+        resource: Some(ResourceInfo {
+            url: resource_url.into(),
+            description: None,
+            mime_type: None,
+        }),
+        accepted: ExactAcceptedV2 {
+            scheme: "exact".into(),
+            network: "eip155:8453".into(),
+            amount: AMOUNT.into(),
+            pay_to: Some(PAY_TO.into()),
+            asset: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into()),
+            max_timeout_seconds: Some(30),
+            extra: Some(mist_sdk::x402::Eip3009Extra {
+                name: spec.domain.name.clone(),
+                version: spec.domain.version.clone(),
+            }),
+        },
+        payload: ExactPayload {
+            signature: format!("0x{}", hex::encode(&sig65)),
+            authorization: auth,
+        },
+    }
+}
+
+#[test]
+fn e2e_exact_v2_bridge_signs_ingests_and_dedups() {
+    // 官方 v2 client（@x402/evm exact）的 wire 形：accepted 对象 + PAYMENT-SIGNATURE。
+    let (gw_addr, wal, agg) = spawn_gateway("e2e-eip3009-v2");
+    let url = spawn_facilitator_with_bridge(&gw_addr, "http://fac.example.com/weather", None);
+    let domain = Eip3009Domain {
+        name: "USD Coin".into(),
+        version: "2".into(),
+        chain_id: 8453,
+        verifying_contract: parse_addr20("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+            .expect("asset addr"),
+    };
+    let (after, before) = valid_window();
+
+    // v2 exact client 付款 → 桥摄取 → 真记账 → 200 放行。
+    let payment = exact_payment_v2(
+        &ExactSpec {
+            domain: &domain,
+            from_seed: [3u8; 32],
+            signer_seed: [3u8; 32],
+            to: PAY_TO,
+            value: AMOUNT,
+            valid_after: after,
+            valid_before: before,
+            nonce: [0x52; 32],
+        },
+        "http://fac.example.com/weather",
+    );
+    let header = base64_std_encode(&serde_json::to_vec(&payment).expect("serialize v2 exact"));
+    let (status, _, body) = raw_get_with_header(&url, "PAYMENT-SIGNATURE", &header);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, "{\"weather\":\"clear+28C\"}");
+    assert_eq!(agg.accepted_count(), 1, "v2 桥必须摄取恰一笔");
+
+    // 重放同 payload → 200 且不再摄取（重放闸对 v2 形同样生效）。
+    let (status2, _, _) = raw_get_with_header(&url, "PAYMENT-SIGNATURE", &header);
+    assert_eq!(status2, 200);
+    assert_eq!(agg.accepted_count(), 1, "replay must not re-ingest");
+
+    // 异链 CAIP-2 → 402 network mismatch（v2 绑定同样 fail-fast）。
+    let mut wrong_net = payment.clone();
+    wrong_net.accepted.network = "eip155:1".into();
+    let (status3, _, body3) = raw_get_with_header(
+        &url,
+        "PAYMENT-SIGNATURE",
+        &base64_std_encode(&serde_json::to_vec(&wrong_net).expect("serialize")),
+    );
+    assert_eq!(status3, 402, "{body3}");
+    assert!(body3.contains("network mismatch"), "{body3}");
+
+    // accepted.amount 与配置不符 → 402。
+    let mut wrong_amount = payment;
+    wrong_amount.accepted.amount = "999".into();
+    let (status4, _, body4) = raw_get_with_header(
+        &url,
+        "PAYMENT-SIGNATURE",
+        &base64_std_encode(&serde_json::to_vec(&wrong_amount).expect("serialize")),
+    );
+    assert_eq!(status4, 402, "{body4}");
+    assert!(body4.contains("accepted.amount"), "{body4}");
+
+    drop(agg);
+    let _ = std::fs::remove_file(&wal);
+}
+
+#[test]
+fn e2e_dual_headers_prefer_v2_over_v1() {
+    // 双头同带（socket 层归一）：v2 头给坏版本、v1 头给合法形——若 v2 被选中，
+    // 错误落在版本上而非回执查询上（对齐上游 payment-signature 优先序）。
+    let (gw_addr, wal, agg) = spawn_gateway("e2e-dual-headers");
+    let url = spawn_facilitator_v2(&gw_addr, "http://fac.example.com/weather");
+    let v2_bad = base64_std_encode(
+        br#"{"x402Version":9,"accepted":{"scheme":"mist-v1","network":"eip155:8453"},"payload":{}}"#,
+    );
+    let v1_ok = payment_header(
+        "mist-v1",
+        NETWORK,
+        "http://fac.example.com/weather",
+        &format!("0x{}", hex::encode([0x14u8; 32])),
+    );
+    let rest = url.strip_prefix("http://").expect("http url");
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut s = std::net::TcpStream::connect(authority).expect("connect");
+    let req = format!(
+        "GET /{path} HTTP/1.1\r\nHost: {authority}\r\nX-Payment: {v1_ok}\r\nPAYMENT-SIGNATURE: {v2_bad}\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(
+        resp.contains("unsupported x402Version 9"),
+        "v2 头必须优先于 v1: {resp}"
+    );
+    drop(agg);
+    let _ = std::fs::remove_file(&wal);
 }

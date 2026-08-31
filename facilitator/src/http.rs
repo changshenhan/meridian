@@ -1,12 +1,16 @@
 //! std-only HTTP/1.1 管道（S-30c，§6.7 gateway http 同先例，精简版）。
 //!
 //! 单请求 close 模式（agent 侧 `HttpFetch` 恒发 `Connection: close`）；只关心
-//! 请求行 / `X-PAYMENT` 头。分发一律交给 [`crate::Facilitator::handle`]（纯分发）。
+//! 请求行 / 支付头（S-72 起 `PAYMENT-SIGNATURE` v2 优先 / `X-PAYMENT` v1）与
+//! 附加响应头（`PAYMENT-REQUIRED` v2 声明）。分发一律交给
+//! [`crate::Facilitator::handle`]（纯分发）。
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
+
+use mist_sdk::x402::PAYMENT_HEADER_V2;
 
 use crate::{Facilitator, FacilitatorResponse, PAYMENT_HEADER};
 
@@ -40,6 +44,7 @@ fn handle_connection(facilitator: Arc<Facilitator>, stream: TcpStream) -> std::i
     }
 
     let mut payment: Option<String> = None;
+    let mut payment_v2: Option<String> = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h)? == 0 {
@@ -50,17 +55,23 @@ fn handle_connection(facilitator: Arc<Facilitator>, stream: TcpStream) -> std::i
             break;
         }
         if let Some((name, value)) = h.split_once(':') {
-            if name.trim().eq_ignore_ascii_case(PAYMENT_HEADER) {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case(PAYMENT_HEADER_V2) {
+                payment_v2 = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case(PAYMENT_HEADER) {
                 payment = Some(value.trim().to_string());
             }
         }
     }
+    // 双头同带时 v2 优先（对齐上游 `payment-signature || X-PAYMENT` 优先序，§6.8）。
+    let payment = payment_v2.or(payment);
 
     let resp = facilitator.handle(&method, &path, payment.as_deref());
     write_response(&mut writer, &resp)
 }
 
-/// 写响应；恒 `Connection: close`（单请求模型）。
+/// 写响应；恒 `Connection: close`（单请求模型）；附加头（`PAYMENT-REQUIRED`）在
+/// Content-Length 之前走线。
 fn write_response(w: &mut TcpStream, resp: &FacilitatorResponse) -> std::io::Result<()> {
     let status_text = match resp.status {
         200 => "OK",
@@ -71,11 +82,13 @@ fn write_response(w: &mut TcpStream, resp: &FacilitatorResponse) -> std::io::Res
         500..=599 => "Internal Server Error",
         _ => "OK",
     };
+    write!(w, "HTTP/1.1 {} {}\r\n", resp.status, status_text)?;
+    for (name, value) in &resp.headers {
+        write!(w, "{name}: {value}\r\n")?;
+    }
     write!(
         w,
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        resp.status,
-        status_text,
+        "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         resp.body.len()
     )?;
     w.write_all(resp.body.as_bytes())?;

@@ -16,8 +16,9 @@ use mist_aggregator::wal::Wal;
 use mist_core::dsa::owner_signing_key_from_bytes;
 
 use mist_sdk::x402::{
-    base64url_encode, category_from_resource, Fetch, HttpFetch, ResourceRequest, X402Client,
-    X402Outcome,
+    base64_decode_flexible, base64_std_encode, base64url_encode, category_from_resource, Fetch,
+    HttpFetch, ResourceRequest, X402Client, X402Outcome, PAYMENT_HEADER_V2,
+    PAYMENT_REQUIRED_HEADER,
 };
 use mist_sdk::{AgentWallet, DelegationLimits, InProcessAggregator, SdkClient, SdkError};
 
@@ -355,4 +356,185 @@ fn http_fetch_real_socket_roundtrip() {
 fn base64url_encode_integration_spot() {
     assert_eq!(base64url_encode(b"foobar"), "Zm9vYmFy");
     assert_eq!(base64url_encode(b""), "");
+}
+
+// ---------------------------------------------------------------------------
+// 8. S-72：v2 wire——402 带 `PAYMENT-REQUIRED` 头 → 谈判 v2 → `PAYMENT-SIGNATURE`
+//    重放（标准 base64 + accepted 回显）；双载体偏 v2；无条目 / 坏编码 / 二次 402。
+// ---------------------------------------------------------------------------
+
+/// v2 `PAYMENT-REQUIRED` 头值（标准 base64 的 v2 声明；CAIP-2 网络）。
+fn payment_required_v2_header(accepts_scheme: &str, amount: &str) -> String {
+    let json = format!(
+        r#"{{"x402Version":2,"resource":{{"url":"{resource}"}},"accepts":[{{"scheme":"{scheme}","network":"eip155:8453","amount":"{amount}","asset":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","payTo":"{pay_to}","maxTimeoutSeconds":30}}]}}"#,
+        resource = RESOURCE,
+        scheme = accepts_scheme,
+        amount = amount,
+        pay_to = PAY_TO
+    );
+    base64_std_encode(json.as_bytes())
+}
+
+/// 402 响应 + `PAYMENT-REQUIRED` 头（v2 声明载体；body 任意——server 关切）。
+fn response_402_v2(header_value: &str, body: String) -> mist_sdk::x402::ResourceResponse {
+    mist_sdk::x402::ResourceResponse {
+        status: 402,
+        headers: vec![
+            ("content-type".into(), "application/json".into()),
+            (PAYMENT_REQUIRED_HEADER.into(), header_value.into()),
+        ],
+        body: body.into_bytes(),
+    }
+}
+
+#[test]
+fn e2e_402_v2_header_negotiates_v2_wire() {
+    let (path, agg, client, dh) = setup("e2e-402-v2", limits());
+    let fetch = ScriptedFetch::new(vec![
+        // 第二次（重放）：资源服务器放行。
+        response(200, "{\"weather\":\"clear+28C\"}".into()),
+        // 第一次：402 + PAYMENT-REQUIRED 头（v2 声明）。
+        response_402_v2(&payment_required_v2_header("mist-v1", "10000"), "{}".into()),
+    ]);
+    let x = X402Client::new(&client, &fetch, dh);
+
+    let proof = match x.request(&ResourceRequest::get(RESOURCE)).unwrap() {
+        X402Outcome::Paid { response, proof } => {
+            assert_eq!(response.status, 200);
+            proof
+        }
+        X402Outcome::Free(_) => panic!("402 资源必须走支付路径"),
+    };
+
+    // 重放请求带 PAYMENT-SIGNATURE 头（非 X-PAYMENT），标准 base64 的 v2 JSON。
+    let requests = fetch.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].headers.is_empty(), "首请求不带支付头");
+    let header = &requests[1]
+        .headers
+        .iter()
+        .find(|(k, _)| k == PAYMENT_HEADER_V2)
+        .expect("重放必须带 PAYMENT-SIGNATURE 头")
+        .1;
+    assert!(
+        !requests[1].headers.iter().any(|(k, _)| k == "X-PAYMENT"),
+        "v2 流转不得再带 v1 头"
+    );
+    let json =
+        String::from_utf8(base64_decode_flexible(header).expect("decode v2 header")).expect("utf8");
+    assert!(json.contains("\"x402Version\":2"), "{json}");
+    // accepted 回显（服务器产出原样）+ 顶层 resource 回显；无顶层 scheme/network。
+    assert!(
+        json.contains(
+            "\"accepted\":{\"scheme\":\"mist-v1\",\"network\":\"eip155:8453\",\"amount\":\"10000\""
+        ),
+        "{json}"
+    );
+    assert!(
+        json.contains(&format!("\"resource\":{{\"url\":\"{RESOURCE}\"}}")),
+        "{json}"
+    );
+    assert!(json.contains("\"intentHash\":\"0x"), "{json}");
+    // 顶层键序 = x402Version → resource → accepted → payload：顶层无 v1 的
+    // scheme/network/resource 字符串键（只存在于 accepted / resource 对象内）。
+    assert!(
+        json.starts_with("{\"x402Version\":2,\"resource\":{\"url\":"),
+        "顶层形状不是 v2 形: {json}"
+    );
+
+    // 真实记账：金额取自 v2 accepted.amount；proof 走同一 pay 管线。
+    assert_eq!(agg.accepted_count(), 1);
+    assert_eq!(agg.total_spent(&dh), Some(10_000));
+    assert_eq!(agg.nonce_count(&dh), Some(1));
+    assert_eq!(proof.spend_nonce, 1);
+
+    drop(client);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn dual_carrier_402_prefers_v2_header() {
+    // §6.8 双载体取舍：v2 头 + v1 body 同带 → 谈判判据 = 头在场 → v2 流转。
+    let (path, agg, client, _dh) = setup("dual-carrier", limits());
+    let fetch = ScriptedFetch::new(vec![
+        response(200, "ok".into()),
+        response_402_v2(
+            &payment_required_v2_header("mist-v1", "10000"),
+            payment_required_body("mist-v1", "10000"),
+        ),
+    ]);
+    let x = X402Client::new(&client, &fetch, _dh);
+    assert!(matches!(
+        x.request(&ResourceRequest::get(RESOURCE)).unwrap(),
+        X402Outcome::Paid { .. }
+    ));
+    let requests = fetch.requests();
+    assert!(
+        requests[1]
+            .headers
+            .iter()
+            .any(|(k, _)| k == PAYMENT_HEADER_V2),
+        "双载体必须走 v2 头"
+    );
+    assert!(
+        !requests[1].headers.iter().any(|(k, _)| k == "X-PAYMENT"),
+        "v2 流转不得再带 v1 头"
+    );
+    assert_eq!(agg.accepted_count(), 1);
+
+    drop(client);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn v2_header_without_mist_entry_is_local_error() {
+    let (path, agg, client, _dh) = setup("v2-no-scheme", limits());
+    let fetch = ScriptedFetch::new(vec![response_402_v2(
+        &payment_required_v2_header("exact", "10000"),
+        "{}".into(),
+    )]);
+    let x = X402Client::new(&client, &fetch, _dh);
+
+    let err = x.request(&ResourceRequest::get(RESOURCE)).unwrap_err();
+    assert!(matches!(err, SdkError::Local(_)));
+    assert_eq!(agg.accepted_count(), 0, "未支付不得记账");
+
+    drop(client);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn v2_header_bad_encoding_is_local_error() {
+    let (path, agg, client, _dh) = setup("v2-bad-b64", limits());
+    let fetch = ScriptedFetch::new(vec![response_402_v2("not*valid!!", "{}".into())]);
+    let x = X402Client::new(&client, &fetch, _dh);
+
+    let err = x.request(&ResourceRequest::get(RESOURCE)).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("bad PAYMENT-REQUIRED encoding"), "{msg}");
+    assert_eq!(agg.accepted_count(), 0, "未支付不得记账");
+
+    drop(client);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn v2_second_402_error_names_payment_signature_header() {
+    let (path, agg, client, _dh) = setup("v2-second-402", limits());
+    let fetch = ScriptedFetch::new(vec![
+        response_402_v2(&payment_required_v2_header("mist-v1", "10000"), "{}".into()),
+        response_402_v2(&payment_required_v2_header("mist-v1", "10000"), "{}".into()),
+    ]);
+    let x = X402Client::new(&client, &fetch, _dh);
+
+    let err = x.request(&ResourceRequest::get(RESOURCE)).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("rejected by resource server"), "{msg}");
+    // v2 流转的错误信息点明重放头名（v1 同点位是 X-PAYMENT）。
+    assert!(msg.contains("after PAYMENT-SIGNATURE"), "{msg}");
+    // 网关侧已接受（钱已出），merchant 侧排查。
+    assert_eq!(agg.accepted_count(), 1);
+
+    drop(client);
+    let _ = std::fs::remove_file(&path);
 }

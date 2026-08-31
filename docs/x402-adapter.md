@@ -115,3 +115,10 @@ Base USDC，净额指令 `NetInstruction { recipient, amount }` 直接映射。
    重放闸持久化（S-32 诚实边界"持久化去重是后续项"）：**已完成（S-33，2026-08-30，
    TECH_SPEC §6.10）**——`ReplayJournal` append-only JSONL + 启动重建 + 落盘失败
    503 fail-closed；残余边界（磁盘故障窗口、日志线性增长）见 TECH_SPEC §6.10。
+5. x402 v2 wire 双协议：**已完成（S-72，2026-09-01，TECH_SPEC §6.8/§6.9/§6.10）**——
+   sdk + facilitator wire 层 v1/v2 双协议：`PAYMENT-SIGNATURE`/`PAYMENT-REQUIRED`
+   头 + CAIP-2 网络标识（`network_canonical` 规范形比较）+ v2 payload 结构
+   （`accepted` 对象、`amount` 字段名、标准 base64）；402 = v1 body 不动 + v2 头
+   声明；scheme 名 `mist-v1` 不改（与 x402 协议版本正交）。字段以上游
+   `specs/x402-specification-v2.md` / `typescript/packages/core` 实核定（任务书
+   `maxAmount` 猜测不成立，实际为 `maxAmountRequired`→`amount` 改名）。

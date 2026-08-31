@@ -935,17 +935,57 @@ fetch 拦截：标准 x402 资源服务器回 `402` 后，把 `paymentRequiremen
 `mist-v1`）映射成 [`SdkClient::pay`] 意图，支付后带 `X-PAYMENT` 头重放请求。
 crate：`sdk::x402`（std-only，与 crate 其余部分同同步口径）。
 
-**线格式（对齐 x402 v1 惯例；自定义 scheme 起步，上游注册路径跟进后标准化）**：
+**线格式（v1 基线 + S-72 起 v1/v2 双协议；scheme 名 `mist-v1` 是 Mist 自己的
+scheme 命名，与 x402 协议版本号正交，不随 v2 改名）**：
 
-- 402 响应体（消费侧字段，camelCase、金额恒字符串）：`{"x402Version": 1,
+- **v1（402 响应体消费侧，camelCase、金额恒字符串）**：`{"x402Version": 1,
   "accepts": [{"scheme", "network", "maxAmountRequired": "<原子单位字符串>",
   "resource": "<URL>", "description", "payTo": "<0x 20B>", "maxTimeoutSeconds",
   "asset"}]}`。v1 只消费 `scheme == "mist-v1"` 的条目（多条取首条）；无则
   `SdkError::Local`（不伪装成其它 scheme 的 client）。
-- `X-PAYMENT` 头（base64url 无 padding 的 JSON，`{"x402Version", "scheme":
-  "mist-v1", "network", "resource", "payload": {"intentHash": "<0x 32B>",
-  "seq", "spendNonce"}}`）。merchant 验证 = 对网关查 `GET /v1/receipts/{intentHash}`
-  （§6.7 S-30a），accepted 即放行——**信封不内嵌**（离线验签是 S-30c facilitator 缝）。
+- **v1（`X-PAYMENT` 头，base64url 无 padding 的 JSON）**：`{"x402Version",
+  "scheme": "mist-v1", "network", "resource", "payload": {"intentHash":
+  "<0x 32B>", "seq", "spendNonce"}}`。merchant 验证 = 对网关查
+  `GET /v1/receipts/{intentHash}`（§6.7 S-30a），accepted 即放行——**信封不内嵌**
+  （离线验签是 S-30c facilitator 缝）。
+- **v2（S-72，上游 `@x402/*` v2 wire；字段以上游 `specs/x402-specification-v2.md`
+  与 `typescript/packages/core` 为准核实）**：付款请求头 `PAYMENT-SIGNATURE`、
+  402 声明头 `PAYMENT-REQUIRED`（标准 base64 的 JSON，body 另说）、网络标识
+  CAIP-2。与 v1 的结构性差异：① `PaymentPayload v2 = {x402Version: 2,
+  resource?: ResourceInfo, accepted: PaymentRequirements, payload: {...}}`——
+  **顶层无 `scheme`/`network`/`resource` 字符串**，scheme/network 从 `accepted`
+  取；② `PaymentRequirements v2` 的 `maxAmountRequired` **改名 `amount`**，
+  `resource`/`description`/`mimeType` 移出到 402 顶层 `resource: ResourceInfo`
+  对象（`{url, description?, mimeType?, ...}`），`outputSchema` 删除（Mist 从未
+  产出，无迁移负担）；③ 402 的协议信息走 `PAYMENT-REQUIRED` **头**（body 是
+  server 实现关切，上游 v2 恒 `{}`）。
+- **双协议取舍（S-72 定夺）**：
+  - **版本判据唯一 = 载荷里的 `x402Version` 字段**（1 → v1 形、2 → v2 形）；
+    头名只决定"从哪里读"，不作版本判据。`x402Version` 缺失 = 拒（402）。
+  - **收端双头名双字母表**：facilitator 同时听 `X-PAYMENT` 与
+    `PAYMENT-SIGNATURE`（都带时 v2 优先，对齐上游 `payment-signature ||
+    X-PAYMENT` 优先序）；解码用"双字母表宽容 base64"（标准 `+/` 与 URL-safe
+    `-_` 均收、padding 可选）——上游 v2 发标准 base64，Mist v1 发 base64url
+    无 padding，收端统一兼容。**v1 发端维持 base64url 无 padding 不动**（既有
+    wire 兼容），**v2 发端用标准 base64**（与上游 `encodePaymentSignatureHeader`
+    互操作）。
+  - **402 输出双载体**：body 维持 v1 形不动（既有 v1 client 面零改动）+
+    新增 `PAYMENT-REQUIRED` 响应头（标准 base64 的 v2 `PaymentRequired` JSON，
+    `accepts` 恒产 CAIP-2 规范形）。`asset` 未配置时不产该头（v2 schema 要求
+    `asset` 必填非空；v2 client 缺头自动回落 body→按 v1 语境重试，我们照收——
+    优雅降级）。**error 402**（绑定失败等）不带 v2 头（v2 schema 要求
+    `accepts` 至少 1 条），回落语义同上。
+  - **网络标识互通**：`network_canonical()` 把已知 v1 名（`base`/`base-sepolia`/
+    `ethereum`/`sepolia`）映射 `eip155:8453/84532/1/11155111`，其余原样透传
+    （任意 CAIP-2 如 Anvil `eip155:31337` 直通）；**比较恒在规范形上进行**——
+    v1 字符串与 CAIP-2 等价类互通，既有 v1 配置（`MIST_NETWORK=base`）零迁移。
+  - **结算响应头**：Mist 继续不产出 `X-PAYMENT-RESPONSE`/`PAYMENT-RESPONSE`
+    （诚实边界不变：结算 = epoch 语义，对账走网关查询）。已核实上游 axios v2
+    wrapper 对缺结算头 try/catch 不硬失败——v2 client 互操作不受影响。
+  - **client 侧谈判**：`X402Client` 402 时先读 `PAYMENT-REQUIRED` 头（v2 优先，
+    与"输出偏 v2"对称）→ v2 流转（resource.url 供 category/memo 映射，
+    `PAYMENT-SIGNATURE` + 标准 base64 发送，`accepted` 原样回显）；无头回落
+    body v1 解析 → v1 流转原样（既有 v1 用例零改动）。
 
 **字段映射（x402 → SpendIntent，docs/x402-adapter.md §3）**：
 
@@ -958,6 +998,10 @@ crate：`sdk::x402`（std-only，与 crate 其余部分同同步口径）。
 | `maxTimeoutSeconds` | `intent.expires_at` | `now + maxTimeout`（缺省 60s）——支付有效期绑定服务器要求 |
 | `spend_nonce` | `NonceManager` | 幂等语义 §6.6 不变 |
 | `network` / `asset` | 回显进 payload | v1 仅 Base USDC，网关部署配置裁决 |
+
+v2（S-72）同表映射，字段名差异：`maxAmountRequired` → `amount`；`resource`
+映射源 = 402 顶层 `resource.url`（v2 requirements 无 resource 字段）；`network`
+为 CAIP-2 规范形（`network_canonical` 后语义同上）。
 
 **执行流**：`X402Client::request` → `Fetch::fetch`（HTTP 执行器接缝）→ 非 402 原样
 返回（`X402Outcome::Free`）→ 402 → 映射 → `SdkClient::pay`（固定 nonce + 幂等重试，
@@ -986,19 +1030,25 @@ close 模式）；axum/tokio 虽允许（merchant 侧不在内核热路径）但
 **分发逻辑（`Facilitator::handle` 纯分发，单测不经 socket）**：
 
 - `GET /healthz` → `200`；其它路径 = 单一受保护资源（v1）。
-- 无 `X-PAYMENT` → `402` + paymentRequirements JSON（`scheme: mist-v1`，
-  wire 类型复用 `sdk::x402` 的 `PaymentRequired`/`PaymentRequirements` Serialize）。
-- 带 `X-PAYMENT` → base64url 解码（`sdk::x402::base64url_decode`，宽容 padding）→
-  `PaymentPayload` 解析 → 校验 `scheme` / `network` / `resource` 与配置一致 →
+- 无支付头 → `402` + paymentRequirements JSON（`scheme: mist-v1`，wire 类型复用
+  `sdk::x402` 的 `PaymentRequired`/`PaymentRequirements` Serialize）+ **S-72 起
+  附 `PAYMENT-REQUIRED` 响应头**（标准 base64 的 v2 形声明，§6.8 双协议取舍；
+  `asset` 未配置则省）。
+- 带支付头（`PAYMENT-SIGNATURE` v2 优先 / `X-PAYMENT` v1，§6.8）→ 双字母表宽容
+  base64 解码（`sdk::x402::base64_decode_flexible`）→ 按 `x402Version` 归一化
+  （v1：顶层 `scheme`/`network`/`resource`；v2：`accepted.scheme`/`accepted.network`
+  + 顶层 `resource.url`）→ 校验 `scheme` / `network`（`network_canonical` 规范形
+  比较，v1 字符串与 CAIP-2 等价类互通）/ `resource` 与配置一致 →
   `HttpTransport::receipt(intent_hash)` 查网关（S-30a）：
   - `Ok(Some(_))` → `200` 受保护资源内容；
   - `Ok(None)` → `402`（**404 ≠ 未支付**语义下"不可验证即不放行"——未结算/被拒/
     过期统一回 402，错误信息区分）；
   - `Err(_)`（网关传输失败）→ `503` **fail-closed**（验证面不可用绝不放行）。
 
-**诚实边界（v1）**：单资源模型（无路由/鉴权中间件）；明文 HTTP（TLS 反代终结）；
-不产出 `X-PAYMENT-RESPONSE`（对账走网关查询）；结算侧（epoch claim、对账导出）
-不在本件——参考实现演示的是"merchant 怎么接"，不是生产 facilitator。
+**诚实边界（v1；S-72 后仍成立）**：单资源模型（无路由/鉴权中间件）；明文 HTTP
+（TLS 反代终结）；不产出 `X-PAYMENT-RESPONSE`/`PAYMENT-RESPONSE` 结算头（对账走
+网关查询；已核实上游 axios v2 wrapper 缺头不硬失败）；结算侧（epoch claim、对账
+导出）不在本件——参考实现演示的是"merchant 怎么接"，不是生产 facilitator。
 
 **三角色 e2e 验收**：X402Client（agent，HttpFetch）→ facilitator `402` → `pay`
 （经真网关 + 真聚合器）→ `X-PAYMENT` 重放 → facilitator 查网关回执 → `200`；
@@ -1021,13 +1071,25 @@ EIP-3009 域参数，x402 exact 惯例）；`mist-v1` 条目与其余字段不�
 
 **桥接流程（`X-PAYMENT` scheme == `"exact"` 时）**：
 
-1. 解析标准 payload：`{"x402Version", "scheme": "exact", "network", "resource",
-   "payload": {"signature": "<0x 65B r||s||v>", "authorization": {"from", "to",
-   "value": "<原子单位字符串>", "validAfter", "validBefore", "nonce":
-   "<0x 32B>"}}}`（camelCase，与 §6.8 同 wire 惯例）。
-2. 绑定校验（fail-fast → 402）：`network` / `resource` 与配置一致；
-   `authorization.to == payTo`；`value == maxAmountRequired`（原子单位，超 u64
-   拒）；`validAfter <= now < validBefore`。
+1. 解析标准 payload（S-72 起双协议形，内层 `payload` 同构）：
+   - **v1**：`{"x402Version": 1, "scheme": "exact", "network", "resource",
+     "payload": {"signature": "<0x 65B r||s||v>", "authorization": {"from", "to",
+     "value": "<原子单位字符串>", "validAfter", "validBefore", "nonce":
+     "<0x 32B>"}}}`（camelCase，与 §6.8 同 wire 惯例）。
+   - **v2**：`{"x402Version": 2, "resource?: ResourceInfo", "accepted":
+     {"scheme": "exact", "network": "<CAIP-2>", "amount", "asset", "payTo",
+     "maxTimeoutSeconds", "extra": {name, version}}, "payload": {同 v1 内层}}`——
+     顶层无 `scheme`/`network`/`resource` 字符串（§6.8 结构差异 ①），scheme/
+     network/amount 从 `accepted` 取。
+2. 绑定校验（fail-fast → 402）：`network` 与配置一致（`network_canonical`
+   规范形比较，S-72 起 v1 字符串与 CAIP-2 等价类互通）；
+   v1 另校验 `resource` 与配置一致（v2 无 requirement 级 resource 字段——
+   `accepted` 由服务器产出、client 原样回显，绑定天然成立；跨资源重放仍被
+   网关回执的 `memo = sha256(resource)` 绑定挡住，§6.8 字段映射表）；
+   `authorization.to == payTo`；`value == 金额要求`（v1 = `maxAmountRequired` /
+   v2 = `accepted.amount`，原子单位，超 u64 拒）；`validAfter <= now <
+   validBefore`。EIP-712 domain（`extra.name`/`version` + 配置 chainId/
+   verifyingContract）v1 = v2 未变（上游同约定）。
 3. **EIP-712 验签**（ecrecover，链下密码学）：domain（`name` / `version` /
    `chainId` / `verifyingContract` 来自配置）+ `TransferWithAuthorization`
    typehash → keccak256 → k256 `recover_from_prehash`（v ∈ {0,1,27,28} 宽容）→
@@ -3039,6 +3101,24 @@ contract BatchSettler {
 
 ## 14. 活文档说明
 
+- **2026-09-01 x402 v2 wire format 双协议支持（S-72，老板任务书"支持 x402 v2 协议，
+  同时保持 v1 兼容"；编号沿用任务书——与 §6.12.1 的 S-72 monitor 收敛为不同任务，
+  老板重发该号）**：sdk + facilitator 的 wire 层升级 v1/v2 双协议（§6.8/§6.9/§6.10
+  同步修订）。**字段依据上游实核定**（本地 clone `D:\eco-attach\x402` HEAD `dffb81c4`：
+  `specs/x402-specification-v2.md` + `typescript/packages/core`），任务书 wire 对照表的
+  `maxAmount` 猜测**不成立**——v2 实际是 `maxAmountRequired` 改名 `amount`；
+  另两项任务书未列的关键结构差异：v2 payload 顶层无 `scheme`/`network`（进
+  `accepted`）、402 协议信息走 `PAYMENT-REQUIRED` 头。**双协议取舍**：版本判据唯一
+  = `x402Version`；收端双头名（v2 优先）+ 双字母表宽容 base64；发端 v1 维持
+  base64url、v2 用标准 base64；402 = v1 body 不动 + v2 头声明（asset 未配置 /
+  error 402 不产 v2 头，v2 client 回落 body 按 v1 语境重试，优雅降级）；网络标识
+  `network_canonical` 规范形比较（v1 名 ↔ CAIP-2 等价类互通，既有 `MIST_NETWORK=base`
+  零迁移）；scheme 名 `mist-v1` 不改（与 x402 协议版本正交，§6.8 表述同步更新）。
+  **为何 golden / 锚不受影响**：x402 wire 层在网关摄取面之外（§6.7 /v1/receipts 只认
+  intentHash），`state_digest` 指纹域 = 账本副本状态（§6.12.1），x402 头名/编码/
+  网络标识不进任何 digest 原像；DSAv1 前缀、种子魔数、域分隔符均不涉及。端到端
+  互操作验证：npm `@x402/axios` + `@x402/evm` v2 client 打本地 facilitator（桥 exact
+  路径，链下验签零 gas）。
 - **2026-09-01 全面改版 Meridian→Mist（S-71，老板拍板"那就全面改版。叫做Mist就行"）**：
   全仓更名——crate 名（mist-core / mist-aggregator / mist-sdk / mist-gateway /
   mist-facilitator / mist-monitor / mist-mcp / mist-bench 等）、env 变量（MERIDIAN_*→MIST_*）、

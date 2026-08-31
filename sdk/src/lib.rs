@@ -47,9 +47,11 @@ pub use pay::{NonceManager, PayParams, PayReceipt, RetryPolicy};
 pub use transport::{DropFirstTransport, InProcessAggregator, ResponseLossTransport, Transport};
 pub use transport_http::HttpTransport;
 pub use x402::{
-    base64url_encode, category_from_resource, Eip3009Extra, Fetch, HttpFetch, MistPayload,
-    PaymentPayload, PaymentRequired, PaymentRequirements, ResourceRequest, ResourceResponse,
-    X402Client, X402Outcome, X402Proof,
+    base64_decode_flexible, base64_std_encode, base64url_encode, category_from_resource,
+    network_canonical, Eip3009Extra, Fetch, HttpFetch, MistPayload, PaymentPayload,
+    PaymentPayloadV2, PaymentRequired, PaymentRequiredV2, PaymentRequirements,
+    PaymentRequirementsV2, ResourceInfo, ResourceRequest, ResourceResponse, X402Client,
+    X402Outcome, X402Proof, PAYMENT_HEADER_V2, PAYMENT_REQUIRED_HEADER, X402_VERSION_V2,
 };
 
 use std::collections::HashMap;
