@@ -15,15 +15,22 @@
 //!
 //! 多实例（S-39）：`cluster.rs` 聚合 N 个热备 WAL 副本（同一逻辑账本取 max，副本分歧
 //! 报 degraded）——口径见 TECH_SPEC §6.12。
+//!
+//! 声誉面（S-65）：`reputation.rs` + `rpc.rs` 从 BatchSettler 事件派生只读指标
+//! （§6.17 决策 E——不进任何判定面；`--settler`/`--rpc` 同给同不给，缺省序列不出现）。
 
 pub mod cluster;
 pub mod health;
 pub mod metrics;
+pub mod reputation;
+pub mod rpc;
 pub mod server;
 
 pub use cluster::{cluster_samples, evaluate_cluster, render_cluster_metrics, ClusterView};
 pub use health::{evaluate, HealthCheck, HealthReport};
 pub use metrics::{render_prometheus, PromSample};
+pub use reputation::{fetch_reputation, render_reputation, ReputationSnapshot};
+pub use rpc::JsonRpc;
 pub use server::{serve, Report, Reporter};
 
 use std::path::Path;

@@ -891,10 +891,12 @@ name = "meridian-monitor"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "hex",
  "meridian-aggregator",
  "meridian-core",
  "serde",
  "serde_json",
+ "sha3",
 ]
 
 [[package]]

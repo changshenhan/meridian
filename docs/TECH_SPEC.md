@@ -1555,7 +1555,7 @@ P2-3 定夺**（与跨分片 kind 共享包含验证骨架，边际成本低，�
 | **P2-2** | DSA 委托→运营者绑定面（独立映射不进哈希，owner 注册期写入）+ 聚合器摄取绑定闸（Contract 模式 RPC 读）+ 存量委托 fail-open 口径。**已落地（S-62，2026-08-31，§6.19）**——写入形态定夺收窄为「owner 私钥一次性交易 `bindOperator`」（§6.19.1），存量委托由 owner 补绑收窄 fail-open 残余 | 决策 A/B | 中 |
 | **P2-3** | BatchSettler「跨分片消费」欺诈证明 kind +（P2-3 开工时定夺）「过时撤销根」kind。**开工定夺已完成（S-63，2026-08-31，§6.20）**：两个 kind 的朴素形态均不可健全实现（接受时刻墙，§6.20.1），健全形态 = 平行接受承诺树 acceptanceRoot（§6.20.2），规模重估「中」→「大」，**次序调到 P2-4 之后**（P2-4 无墙可独立落地） | P2-2 | 大 |
 | **P2-4** | OperatorRegistry（append-only 金额调度 + 运营者名册）+ 多实例部署流程与文档。**已落地（S-64，2026-08-31，§6.21）**——BatchSettler 逐字节不动，读取点定在部署流程（定夺 1），名册 = self-registration 绑定实证（定夺 4），deploy.rs 三参构造潜伏缺陷顺带修复 | 决策 D | 中 |
-| **P2-5** | 声誉派生（monitor 面只读指标） | 决策 E | 小 |
+| **P2-5** | 声誉派生（monitor 面只读指标）。**已落地（S-65，2026-08-31，§6.22）**——零合约改动，信源定夺为事件 + 合约余额（不走事件差，定夺 2），真 anvil 锚 = verifier_drill 幕 4 | 决策 E | 小 |
 | **P2-6/L3** | 共享账本共识（多写者同一账本） | 决策 A 在本阶段**不实施**；前置 = P2-1..5 实证 + 独立共识设计轮 | 大 / blocked |
 
 **次序约束（与审计冻结清单的关系，S-58）**：冻结纪律在**外聘审计启动时**才生效
@@ -1572,7 +1572,9 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
   kind）未上线**，且其朴素形态已被定夺为不可健全实现（§6.20.1）；绑定闸只挡「绑他方的
   后续意图」，存量未绑定委托 fail-open 如故（§6.19.5）。**P2-4 已落地**（S-64，§6.21）：
   OperatorRegistry 调度/名册是**记录面不是强制面**——跳过注册表、偏离调度、registrar
-  降额均不被密码学阻止，只被全史与快照公开（§6.21.4）。P2-5 仍为设计轮产出。
+  降额均不被密码学阻止，只被全史与快照公开（§6.21.4）。**P2-5 已落地**（S-65，§6.22）：
+  声誉指标从 BatchSettler 事件 + 合约余额派生（monitor 面），读失败 fail-visible 不清零、
+  解码失败 fail-closed、缺省无参时序列完全不出现（定夺 4-6）。P2-6/L3 仍为设计轮产出。
 - **不可改绑**（v1 口径，P2-2 落地时钉进合约）：改绑窗口内旧账本在途意图的预算消费
   不可回滚 = 双花面。迁移路径 = owner 撤销旧委托 + 注册新委托（预算重置的代价由
   owner 承担，链上全程可见）。
@@ -1951,6 +1953,95 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
   v2 → 实例2，两实例冻结值各持其部署版本）。
 - `registry_flow.rs` 进 verify 步 10；coverage 门禁下新合约行/函数/分支 100%（无豁免边）；
   audit-scope §1 文件清单 + §5 计数、contracts/README 计数同步重对齐（§6.17.3 次序约束）。
+
+### 6.22 P2-5 声誉派生 monitor 面（实施，2026-08-31）
+
+**定位**：§6.17 决策 E 的实施砖——链上罚没历史的只读派生指标，落在 monitor 的 Prometheus
+导出面。**零合约改动**（BatchSettler / DSA / OperatorRegistry 逐字节不动，不触碰审计冻结面
+§6.17.3），聚合器 / 网关判定面零改动（决策 E：声誉不进任何判定路径——本节全部产出都是
+`/metrics` 序列，消费方只有人与告警器）。
+
+#### 6.22.1 定夺记录（先改后码）
+
+1. **信源 = BatchSettler 事件 + 合约余额，不读名册。** 事件从 JSON-RPC `eth_getLogs`
+   （`address = settler`，`fromBlock: 0x0` → `latest`）取四类：`Commit` / `Settled` /
+   `ChallengeSucceeded` / `Claimed`；余额走 `eth_getBalance(settler, "latest")`。
+   **不读 OperatorRegistry**（§6.21.4 锚：声誉面从事件派生而不读名册，刷名册无收益）。
+2. **在押债券不走「事件差」。** voided epoch 的债券金额不在任何事件里
+   （`ChallengeSucceeded` 只带 epochId/challenger/kind），`Σcommit − Σclaimed − Σvoided_bond`
+   的第三项不可得，事件差是**结构性高估**——不做。合同余额是链上事实，暴露
+   `meridian_operator_contract_balance_wei`，help 注明构成（在押债券 + 未领取结算资金 +
+   未领取挑战者押金退款 / 结算留存），不做「净债券」的假装精确。事件侧同时暴露
+   `bond_committed_wei`（Σ `Commit.bondedAmount`，债券承诺累计上界）与
+   `bond_claimed_wei`（Σ `Claimed.amount`，运营者已领取额）两个互补口径。
+3. **罚没计数口径。** `slash_total` = `ChallengeSucceeded` 事件数（= voided epoch 数 =
+   罚没次数），按 kind 分解 `slash_kind_total{kind}`（kind 值 = 合约 `uint8` 十进制）。
+   `ChallengeRejected`（押金销毁）**不是罚没**，不产声誉指标——押金方向与运营者无关。
+4. **缺省口径逐字节不变。** 不带 `--settler` / `--rpc` 时声誉序列**完全不出现**——不产
+   零值序列（「无数据」≠「零罚没」，零值序列会被刮取告警误读成清白证明）。两参同给同不给，
+   半装配启动即退（§6.19.3 同款）。单实例单 settler：分片模型无全局账本视图，monitor 只能
+   按运营者分别聚合（§6.17.4），多运营者 = 多 monitor 实例。
+5. **读失败 fail-visible，绝不清零。** 抓取 Err → `meridian_operator_chain_read_ok 0`，
+   保留上一次成功快照继续渲染（把指标清零会被误读为「罚没归零」= 洗白方向的假信号）；
+   从未成功过 → 只渲染 `chain_read_ok 0`，无其他声誉序列。链上读面失败**不**拉低
+   `/healthz`（healthz 是账本健康面 §6.12；两者告警分离，ops.md 告警表单列一行）。
+6. **事件解码失败 fail-closed。** topic0 命中四类之一但字段解不出（data 字数不足等）→
+   整次抓取 Err（按定夺 5 保留旧快照 + read_ok 0）。**丢一条 `ChallengeSucceeded` =
+   罚没被抹掉一行，是洗白方向**，绝不静默跳过；未知 topic0（`RefundWithdrawn` /
+   `ChallengeRejected` 等非声誉事件）跳过。
+7. **监控面不进判定面**（决策 E 落地形态）：monitor 无任何合约写调用、无判定消费方；
+   指标用途限于展示与告警。
+
+#### 6.22.2 指标面（label：`settler` = 0x 40 hex 合约地址）
+
+| 指标 | 来源 | 说明 |
+|---|---|---|
+| `meridian_operator_epochs_committed_total` | `Commit` 事件计数 | 已提交 epoch 数（含后被 voided 的） |
+| `meridian_operator_epochs_settled_total` | `Settled` 事件计数 | 已结算 epoch 数 |
+| `meridian_operator_slash_total` | `ChallengeSucceeded` 计数 | 罚没次数（= voided epoch 数） |
+| `meridian_operator_slash_kind_total{kind}` | `ChallengeSucceeded` 按 kind | 罚没 kind 分解 |
+| `meridian_operator_bond_committed_wei` | Σ `Commit.bondedAmount` | 债券承诺累计（在押上界） |
+| `meridian_operator_bond_claimed_wei` | Σ `Claimed.amount` | 运营者已领取额 |
+| `meridian_operator_contract_balance_wei` | `eth_getBalance` | 合约余额（构成见定夺 2） |
+| `meridian_operator_chain_read_ok` | 抓取健康 | 1 = 本轮抓取成功 / 0 = 失败（保留旧值） |
+
+全部 gauge（crate 既有口径：计数语义由刮取器按增量处理，不加 counter 语义误导）。
+wei 值经 f64 渲染，> 2^53 按浮点舍入（help 注明）。
+
+#### 6.22.3 实现面
+
+- `monitor/src/rpc.rs`：std-only JSON-RPC 客户端（TcpStream 单次 HTTP/1.1 往返，
+  `Connection: close`，url 只收 `http://host:port`——§6.19.3 网关绑定读同款形态与同款
+  坑位教训：读失败一律 Err 上抛，绝不吞成空结果）。
+- `monitor/src/reputation.rs`：log 解码（topics/data → 事件）+ 快照累计 + Prometheus 渲染
+  + `fetch_reputation`（getLogs + getBalance 两调用，任一失败整轮 Err）。
+- `monitor/src/bin/main.rs`：`--settler <0x40hex> --rpc <url>` 装配 `ReputationReporter`
+  包裹既有 Reporter（单/多副本两种模式都追加声誉序列；health 原样透传）。
+- topic0 常量 = keccak256(事件签名)，sha3 crate（workspace 既有）现算 + 测试钉字面量
+  （`cast keccak` 独立锚，§6.19.3 selector 锚定同纪律）。
+
+#### 6.22.4 真 anvil 锚（verifier_drill 幕 4）
+
+P2-1 演练（§6.18）三幕已产出真实链上事件（3 commit / 3 settle / kind1+kind2 两次罚没），
+追加**幕 4 = 声誉面核对**：monitor `fetch_reputation` 对同一 settler 抓取，断言
+`epochs_committed=3`、`epochs_settled=3`、`slash_total=2`、kind 分解 `{1:1, 2:1}`、
+`bond_committed=3×challengeBond`、`chain_read_ok=1`，合同余额 ∈ [0, 3×challengeBond]。
+事件解码路径的链上真实性由幕 2/3 的真实罚没交易保证——fake-RPC 单测只证解码 / 渲染 /
+装配 / fail-visible 逻辑，不证链上事件形状。
+
+#### 6.22.5 诚实边界
+
+- **全历史扫描**：每次刮取从 `fromBlock: 0x0` 重扫，O(全史事件数)——本砖不做增量游标 /
+  区间缓存（量级待生产数据，记为后续面）。
+- **reorg**：`latest` 视图读数，重组会改写历史事件集；monitor 不做确认策略，计数按最新
+  视图重建（不保证单调）。本地 anvil 无 reorg；生产刮取间隔远小于重组深度时窗口极小，
+  记录在案。
+- **合同余额 ≠ 净债券**（定夺 2）：含未领取结算资金与退款留存，三个金额指标互补阅读，
+  不产单值「净债券」。
+- **f64 渲染精度**：wei > 2^53 按浮点舍入（Prometheus 文本格式约束）。
+- **声誉无抗 Sybil 语义**（决策 E 只读派生不改这一点，L4 覆盖）；罚没次数 ≠ 罚没金额。
+- **监控面是事实面不是审计面**：合约判定、监控告警均不消费声誉做决策（决策 E）；
+  多运营者全局视图不存在（§6.17.4）。
 
 ---
 

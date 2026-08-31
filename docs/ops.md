@@ -50,6 +50,10 @@ curl http://127.0.0.1:9100/metrics   # Prometheus 文本（v0.0.4 exposition for
 
 # 多副本热备组（S-39）：--wal 可重复传，一个端点聚合整组（TECH_SPEC §6.12）
 meridian-monitor --wal /data/replicas/primary.wal --wal /data/replicas/standby.wal --port 9100
+
+# 声誉面（S-65）：追加 BatchSettler 事件派生的只读运营者指标（--settler/--rpc 同给同不给，
+# 缺省两参不给 = 声誉序列完全不出现，TECH_SPEC §6.22）
+meridian-monitor --wal /data/meridian.wal --settler 0x<40hex> --rpc http://127.0.0.1:8545 --port 9100
 ```
 
 WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪造健康）。
@@ -85,6 +89,8 @@ WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪�
 | `meridian_cluster_accepted_total` | gauge | 副本间 accepted_count **max**（热备副本组同一逻辑账本，最新推进副本；**求和会双计备份副本**） |
 | `meridian_cluster_replica_lag` | gauge | 副本间 accepted_count max−min（备份滞后笔数，0 = 收敛） |
 | `meridian_cluster_pending_sealed` | gauge | 副本间最差结算滞后（max，取最差副本） |
+| `meridian_operator_*`（S-65 声誉面，TECH_SPEC §6.22） | gauge | 仅 `--settler`+`--rpc` 装配时出现：epochs_committed/settled、slash_total、slash_kind_total{kind}、bond_committed/claimed_wei、contract_balance_wei——全部从 BatchSettler 事件 + 余额派生，**不进任何判定面**（决策 E） |
+| `meridian_operator_chain_read_ok` | gauge | 1 = 本轮链上抓取成功 / 0 = 失败（失败保留上次快照继续渲染，绝不清零——清零会被误读为「罚没归零」） |
 
 **诚实边界**：吞吐是刮取窗口均值，不是 p99；p99 由 S-35 热路径直方图提供（桶上界近似，
 会话计数不持久化——崩溃恢复后从 0 起）。直方图埋点为固定桶原子增量 + 两次 `Instant::now()`，
@@ -101,6 +107,8 @@ WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪�
 | `meridian_rejected_total` 激增 | 环比 | 客户端配置漂移或重放攻击，查错误码分布 |
 | `meridian_submit_duration_p99_seconds` | > 0.05（B6 目标 50 ms） | 热路径退化（分片争用 / WAL 慢盘 / 验证变贵），对照 `_bucket` 定位量级 |
 | `meridian_cluster_replica_lag` | > 0（多副本） | 备份副本复制断档/滞后——failover 会丢账本尾部，查副本复制链路 |
+| `meridian_operator_slash_total` 增长 | 环比 | 运营者被成功欺诈挑战罚没（epoch voided）——最高优先安全事件，对照 `slash_kind_total{kind}` 与链上 `ChallengeSucceeded` 事件核查欺诈证明 |
+| `meridian_operator_chain_read_ok` | 持续 = 0 | 链上读面失败（RPC 不可得/事件解码失败）——声誉快照停留在旧值；**不拉低 /healthz**（账本健康面与链上读面告警分离，TECH_SPEC §6.22.1 定夺 5），查 monitor `--rpc` 连通性与节点状态 |
 
 ## 6. 与 S-15 后续的接缝
 

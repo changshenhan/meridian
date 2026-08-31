@@ -22,6 +22,14 @@ pub trait Reporter {
     fn report(&self) -> Report;
 }
 
+/// Box 装箱的 Reporter 仍是 Reporter（S-65 声誉面用 `Box<dyn Reporter + Send + Sync>`
+/// 包裹单/多副本数据源后递给 `serve`）。
+impl<R: Reporter + ?Sized> Reporter for Box<R> {
+    fn report(&self) -> Report {
+        (**self).report()
+    }
+}
+
 /// 阻塞服务：绑定 `addr`，逐连接处理 `/healthz`、`/metrics`，其余 404。
 pub fn serve(addr: &str, reporter: impl Reporter + Send + Sync + 'static) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;

@@ -275,7 +275,41 @@ async fn run_drill() -> Result<()> {
     challenge_and_assert(&provider, &settler, &settler_verifier, 2, &cands3[0]).await?;
     println!("OK 幕 3 challenge(kind=2) 成功 → voided + 债券罚没给验证者 + claim 拒");
 
-    println!("OK: P2-1 验证者挑战演练三幕全过（诚实静默 / kind1 漏单 / kind2 低付，Anvil 全绿）");
+    // ============================================================
+    // 幕 4 —— P2-5 声誉面核对（TECH_SPEC §6.22.4）：monitor 只读派生 vs 本会话
+    // 真实链上事件（3 commit / 3 settle / kind1+kind2 两次罚没）。事件解码路径的
+    // 链上真实性由幕 2/3 的真实罚没交易保证。
+    // ============================================================
+    let rpc = meridian_monitor::rpc::JsonRpc::new(RPC_URL).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let settler_hex = format!("0x{}", hex::encode(settler_addr));
+    let rep = meridian_monitor::reputation::fetch_reputation(&rpc, &settler_hex)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    assert_eq!(rep.epochs_committed, 3, "幕 1-3 各 commit 一次");
+    assert_eq!(rep.epochs_settled, 3, "幕 1-3 各 settle 一次（含被 voided 的）");
+    assert_eq!(rep.slash_total, 2, "幕 2 kind1 + 幕 3 kind2 两次罚没");
+    assert_eq!(rep.kind_counts.get(&1), Some(&1));
+    assert_eq!(rep.kind_counts.get(&2), Some(&1));
+    // bond_committed_wei 的口径是 Commit.bondedAmount（commit 债券 BOND），不是
+    // challengeBond()（挑战押金，bond_on_chain）——两者金额不同，首版在此翻过车。
+    assert_eq!(
+        rep.bond_committed_wei,
+        3 * BOND,
+        "Σ Commit.bondedAmount = 3 × commit 债券 BOND"
+    );
+    // 合同余额 ≤ 3×BOND：构成含未领取结算资金/退款留存（§6.22.5），不等于净债券；
+    // 本演练实态 = 幕 1 未罚没的 1×BOND（幕 2/3 债券已罚没给验证者出金、结算资金已退）。
+    assert!(rep.contract_balance_wei <= 3 * BOND);
+    let metrics = meridian_monitor::reputation::render_reputation(&rep, &settler_hex)
+        + &meridian_monitor::reputation::render_read_ok(&settler_hex, true);
+    assert!(metrics.contains("meridian_operator_slash_total{settler="));
+    assert!(metrics.contains("meridian_operator_chain_read_ok{settler="));
+    println!(
+        "OK 幕 4 声誉面核对：monitor 派生（commit=3 settle=3 slash=2 kind={{1:1,2:1}} \
+         bond_committed={} wei）与本会话链上事件一致",
+        rep.bond_committed_wei
+    );
+
+    println!("OK: P2-1 验证者挑战演练三幕全过（诚实静默 / kind1 漏单 / kind2 低付，Anvil 全绿）+ P2-5 声誉面核对（幕 4）");
     Ok(())
 }
 

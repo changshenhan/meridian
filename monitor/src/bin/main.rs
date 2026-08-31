@@ -7,6 +7,10 @@
 //! 数据口径：本进程 `restore_from_wal` **N ≥ 1 个**聚合器副本（只读视图，**不**接热路径）。
 //! 单副本 = S-15 既有单实例口径（逐字节不变）；多副本 = S-39 集群聚合（热备副本组，
 //! 同一逻辑账本取 max，副本分歧报 degraded——TECH_SPEC §6.12）。
+//!
+//! 声誉面（S-65，TECH_SPEC §6.22）：`--settler <0x..>` + `--rpc <url>` 同给同不给时，
+//! 追加从 BatchSettler 事件派生的只读运营者声誉序列（决策 E：不进任何判定面）。
+//! 缺省两参不给 = 声誉序列完全不出现（既有输出逐字节不变）。
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -19,12 +23,18 @@ use meridian_monitor::cluster::{evaluate_cluster, render_cluster_metrics, Cluste
 use meridian_monitor::count_wal_intents;
 use meridian_monitor::health::evaluate;
 use meridian_monitor::metrics::{rate_from_delta, render_prometheus};
+use meridian_monitor::reputation::{
+    fetch_reputation, render_read_ok, render_reputation, ReputationSnapshot,
+};
+use meridian_monitor::rpc::JsonRpc;
 use meridian_monitor::server::{serve, Report, Reporter};
 
 fn main() {
     let mut wal_paths: Vec<PathBuf> = Vec::new();
     let mut port: u16 = 9100;
     let mut once = false;
+    let mut settler: Option<String> = None;
+    let mut rpc_url: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -40,10 +50,20 @@ fn main() {
                     .expect("--port must be a number")
             }
             "--once" => once = true,
+            "--settler" => {
+                settler = Some(args.next().expect("--settler <0xaddr>"));
+            }
+            "--rpc" => {
+                rpc_url = Some(args.next().expect("--rpc <url>"));
+            }
             "--help" | "-h" => {
                 println!("usage: meridian-monitor [--wal <path>]... [--port <n>] [--once]");
                 println!(
                     "  --wal 可重复传多个 = 热备副本组集群聚合（instance label = WAL 文件名）"
+                );
+                println!(
+                    "  --settler <0x..> + --rpc <url> = 声誉面（BatchSettler 事件派生，\
+                     同给同不给，TECH_SPEC §6.22）"
                 );
                 return;
             }
@@ -57,7 +77,15 @@ fn main() {
         wal_paths.push(PathBuf::from("meridian.wal"));
     }
 
-    match run(&wal_paths, port, once) {
+    let reputation = match meridian_monitor::reputation::parse_reputation_args(settler, rpc_url) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("meridian-monitor: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    match run(&wal_paths, port, once, reputation) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("meridian-monitor: {e}");
@@ -66,7 +94,12 @@ fn main() {
     }
 }
 
-fn run(wal_paths: &[PathBuf], port: u16, once: bool) -> std::io::Result<i32> {
+fn run(
+    wal_paths: &[PathBuf],
+    port: u16,
+    once: bool,
+    reputation: Option<(JsonRpc, String)>,
+) -> std::io::Result<i32> {
     // 副本名 = WAL 文件名 stem，作多副本模式的 instance label；重名会撞 Prometheus
     // 序列（不同目录同名文件），启动即报错，不猜（TECH_SPEC §6.12 实例标签）。
     let mut names: Vec<String> = Vec::with_capacity(wal_paths.len());
@@ -117,6 +150,17 @@ fn run(wal_paths: &[PathBuf], port: u16, once: bool) -> std::io::Result<i32> {
     }
     let multi = replicas.len() > 1;
     let reporter = ClusterReporter { replicas, multi };
+    // 声誉面（S-65）：包裹既有 Reporter——health 原样透传，metrics 追加声誉序列
+    //（§6.22.1 定夺 5：链上读面失败不拉低 /healthz，两者告警分离）。
+    let reporter: Box<dyn Reporter + Send + Sync> = match reputation {
+        None => Box::new(reporter),
+        Some((rpc, settler)) => Box::new(ReputationReporter {
+            inner: Box::new(reporter),
+            rpc,
+            settler,
+            last_good: Mutex::new(None),
+        }),
+    };
 
     if once {
         let r = reporter.report();
@@ -203,5 +247,44 @@ impl Reporter for ClusterReporter {
             health: evaluate_cluster(&views, &wal_intents),
             metrics: render_cluster_metrics(&views, &rates),
         }
+    }
+}
+
+/// 声誉面 Reporter（S-65，TECH_SPEC §6.22）：每轮刮取现场抓取 BatchSettler 事件 +
+/// 余额，追加为 `/metrics` 声誉序列。失败语义（§6.22.1 定夺 5）：
+/// - 抓取 Ok → 快照替换 + `chain_read_ok 1`；
+/// - 抓取 Err → **保留上一次成功快照**继续渲染 + `chain_read_ok 0`（清零会被误读为
+///   「罚没归零」= 洗白方向假信号）；从未成功 → 只渲染 `chain_read_ok 0`；
+/// - /healthz 不受影响（账本健康面与链上读面告警分离）。
+struct ReputationReporter {
+    inner: Box<dyn Reporter + Send + Sync>,
+    rpc: JsonRpc,
+    settler: String,
+    last_good: Mutex<Option<ReputationSnapshot>>,
+}
+
+impl Reporter for ReputationReporter {
+    fn report(&self) -> Report {
+        let mut r = self.inner.report();
+        match fetch_reputation(&self.rpc, &self.settler) {
+            Ok(snap) => {
+                *self.last_good.lock().unwrap() = Some(snap);
+            }
+            Err(e) => {
+                eprintln!(
+                    "meridian-monitor: warning: 声誉面抓取失败（保留上次快照，\
+                     chain_read_ok=0）：{e}"
+                );
+            }
+        }
+        let guard = self.last_good.lock().unwrap();
+        match &*guard {
+            Some(snap) => {
+                r.metrics.push_str(&render_reputation(snap, &self.settler));
+                r.metrics.push_str(&render_read_ok(&self.settler, true));
+            }
+            None => r.metrics.push_str(&render_read_ok(&self.settler, false)),
+        }
+        r
     }
 }
