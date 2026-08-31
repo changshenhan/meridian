@@ -86,24 +86,70 @@ async fn deploy_with_receipt<P: Provider>(
 }
 
 /// 发送一笔调用交易并等回执（写面统一走裸交易：dry-run 不经此路径，live provider 带
-/// 钱包签名；与 deploy_with_receipt 同款风格）。
-async fn send_tx<P: Provider>(provider: &P, to: Address, calldata: Vec<u8>) -> Result<()> {
+/// 钱包签名；与 deploy_with_receipt 同款风格）。返回回执供调用方打印 tx hash / gas
+/// （Sepolia 彩排对账口径：每笔上链交易都要留下可核查的 hash 与 gas）。
+async fn send_tx<P: Provider>(
+    provider: &P,
+    to: Address,
+    calldata: Vec<u8>,
+) -> Result<alloy::rpc::types::TransactionReceipt> {
     let tx = TransactionRequest::default()
         .with_to(to)
         .with_input(Bytes::from(calldata));
     let pending = Provider::send_transaction(provider, tx).await?;
     let receipt = pending.get_receipt().await?;
     anyhow::ensure!(receipt.status(), "交易失败：status 0（to {to}）");
-    Ok(())
+    Ok(receipt)
+}
+
+/// 写后读的滞后重试。公共 RPC（如 sepolia.base.org）在负载均衡背后，刚挖出的块在个别
+/// 滞后节点上尚未可见——交易回执已确认上链，紧随的 eth_call 却可能打到旧状态（Base
+/// Sepolia 首次彩排实测踩中：appendSchedule 已落账，`currentSchedule()` 读回在滞后节点
+/// revert `ScheduleEmpty`，本地 anvil 单节点不可复现）。部署后的交叉核对读统一走重试：
+/// 任何错误退避重试数次，仍失败才上抛——真 revert 重试完照样失败（错误不被吞），
+/// 滞后读被吸收；本地 anvil 零成本直通。
+async fn read_retry<T, F, Fut>(mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const RETRIES: usize = 5;
+    for attempt in 0..RETRIES {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt + 1 < RETRIES => {
+                eprintln!(
+                    "  ⚠ RPC 读回失败（滞后节点？重试 {}/{}）：{e}",
+                    attempt + 1,
+                    RETRIES - 1
+                );
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("重试循环必在 RETRIES 次内返回")
 }
 
 /// 通用部署主体（对 Provider 泛型化 → dry-run / live 两种 provider 形态各 monomorphize 一次）。
-async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> Result<()> {
+/// `live_operator`：live 模式的操作者 = 本地签名者地址。公共 RPC 的 `eth_accounts` 恒返回
+/// 空集（解锁账户是 anvil 概念），不能作为操作者来源——Base Sepolia 首次彩排实测踩中
+/// （OperatorRegistry 以 registrar=0x0 构造 → 构造期 `ZeroRegistrar` revert，彩排原样复现）。
+async fn run<P: Provider>(
+    provider: &P,
+    live: bool,
+    gas_limit: Option<u64>,
+    live_operator: Address,
+) -> Result<()> {
     wait_for_chain(provider).await?; // 等待 RPC 就绪（anvil 起链 / 目标链握手）
     let chain_id = provider.get_chain_id().await?;
     let (chain_name, explorer) = chain_meta(chain_id);
     let accounts = provider.get_accounts().await?;
-    let operator_addr = accounts.first().copied().unwrap_or(Address::ZERO);
+    let operator_addr = if live {
+        live_operator
+    } else {
+        accounts.first().copied().unwrap_or(Address::ZERO)
+    };
     let gas_price = provider.get_gas_price().await?;
 
     println!("══════════════════════════════════════════════════════════");
@@ -115,7 +161,7 @@ async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> R
     );
     println!(
         "  操作者    : {operator_addr}{}",
-        if accounts.is_empty() {
+        if !live && accounts.is_empty() {
             "（dry-run 未带私钥，未知）"
         } else {
             ""
@@ -193,7 +239,7 @@ async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> R
     let challenge_bond: u128 = env_or("MERIDIAN_CHALLENGE_BOND", "100000000000000000")
         .parse()
         .context("MERIDIAN_CHALLENGE_BOND 非法（wei 整数）")?;
-    send_tx(
+    let receipt = send_tx(
         provider,
         registry_addr,
         IOperatorRegistry::appendScheduleCall {
@@ -204,17 +250,21 @@ async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> R
     )
     .await
     .context("appendSchedule 失败")?;
+    println!(
+        "  ✅ appendSchedule tx   → {}（gas {}）",
+        receipt.transaction_hash, receipt.gas_used
+    );
     let registry = IOperatorRegistry::new(registry_addr, provider);
-    let sched = registry.currentSchedule().call().await?;
+    let sched = read_retry(|| async { Ok(registry.currentSchedule().call().await?) }).await?;
     anyhow::ensure!(
         sched.challengeBond == U256::from(challenge_bond) && sched.bond == U256::from(bond),
         "调度读数与写入值不一致（appendSchedule 未生效？）"
     );
     println!(
-        "  ✅ appendSchedule      → bond {} wei / challengeBond {} wei（schedule #{}/{})",
+        "  ✅ appendSchedule 调度 → bond {} wei / challengeBond {} wei（schedule #{}/{})",
         sched.bond,
         sched.challengeBond,
-        registry.scheduleCount().call().await?,
+        read_retry(|| async { Ok(registry.scheduleCount().call().await?) }).await?,
         if bond == 1_000_000_000_000_000_000 && challenge_bond == 100_000_000_000_000_000 {
             "缺省"
         } else {
@@ -251,7 +301,8 @@ async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> R
     deployed.push(("BatchSettler", addr));
 
     let settler_c = IBatchSettler::new(addr, provider);
-    let bond_on_chain = settler_c.challengeBond().call().await?;
+    let bond_on_chain =
+        read_retry(|| async { Ok(settler_c.challengeBond().call().await?) }).await?;
     anyhow::ensure!(
         bond_on_chain == sched.challengeBond,
         "challengeBond() 回读 {} 与调度读数 {} 不一致",
@@ -260,21 +311,25 @@ async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> R
     );
 
     // S-64 名册 self-registration（绑定实证）：调用者必须是实例 operator（部署方 = operator）。
-    send_tx(
+    let receipt = send_tx(
         provider,
         registry_addr,
         IOperatorRegistry::registerOperatorCall { settler: addr }.abi_encode(),
     )
     .await
     .context("registerOperator 失败（调用者必须是 BatchSettler.operator() 本尊）")?;
-    let entry = registry.operators(U256::ZERO).call().await?;
+    println!(
+        "  ✅ registerOperator tx → {}（gas {}）",
+        receipt.transaction_hash, receipt.gas_used
+    );
+    let entry = read_retry(|| async { Ok(registry.operators(U256::ZERO).call().await?) }).await?;
     anyhow::ensure!(
         entry.settler == addr && entry.operator == operator_addr,
         "名册快照回读不一致"
     );
     println!(
-        "  ✅ registerOperator    → 名册 #{}（settler {addr}，challengeBond 快照 {} wei）",
-        registry.operatorCount().call().await?,
+        "  ✅ registerOperator 名册 → 名册 #{}（settler {addr}，challengeBond 快照 {} wei）",
+        read_retry(|| async { Ok(registry.operatorCount().call().await?) }).await?,
         entry.challengeBond
     );
 
@@ -322,12 +377,13 @@ async fn main() -> Result<()> {
         let key = std::env::var("MERIDIAN_OPERATOR_KEY")
             .context("--live 需要 env MERIDIAN_OPERATOR_KEY（部署方 = 操作者 operator 私钥）")?;
         let signer: PrivateKeySigner = key.parse().context("MERIDIAN_OPERATOR_KEY 解析失败")?;
+        let live_operator = signer.address();
         let provider = ProviderBuilder::new()
             .wallet(signer)
             .connect_http(rpc.parse()?);
-        run(&provider, true, gas_limit).await
+        run(&provider, true, gas_limit, live_operator).await
     } else {
         let provider = ProviderBuilder::new().connect_http(rpc.parse()?);
-        run(&provider, false, gas_limit).await
+        run(&provider, false, gas_limit, Address::ZERO).await
     }
 }
