@@ -266,3 +266,49 @@ curl -X POST https://gw.example.com/v1/admin/revocations \
 **诚实边界**：链上 `RevocationRegistry.revoke` 不会自动进聚合器（v1 无链上监听器），
 链上撤销 → 聚合器撤销之间是运营者人工传播，窗口期风险由运营者债券罚没兜底（§6.5）；
 管理操作经 TLS 终结点之后执行（§7）；批量撤销 v1 不做（单请求单 dh，逐笔确认根推进）。
+
+## 9. 多运营者多实例部署流程（S-64，TECH_SPEC §6.21）
+
+Phase 2 决策 A（分片模型）：每张委托在授权期绑定唯一运营者（S-62 `DSA.bindOperator`），
+各运营者跑完整 v1 栈（ledger / gateway / BatchSettler 实例各一套）。本节是「新增一个
+运营者实例」的标准流程，锚定 `OperatorRegistry`（append-only 金额调度 + 运营者名册）。
+
+### 9.1 金额调度（决策 D，§6.17 决策 D / §6.21.1）
+
+- 债券（commit `msg.value`）与挑战押金（`BatchSettler.challengeBond`）的**建议值**由
+  `OperatorRegistry.appendSchedule(bond, challengeBond)` 追加（仅 `registrar`）；旧条目
+  永不改写、无删除路径，链上全史可审计。
+- **不做运行时 setter**：调度只被**未来部署**读取，任何在役 BatchSettler 实例的
+  immutable 金额不可被触碰（registrar 触不到在役实例判定面——这是与被否决的 setter
+  信任面的本质区别）。
+- 零金额构造性拒绝（`ZeroScheduleAmount`）：零债券 = 挑战赔付归零 = 乐观安全归零；
+  零押金 = 复活垃圾挑战面。
+- 换金额路径 = **追加新调度 + 重部署实例**（新实例注册进名册，旧实例照常在役至退役）。
+
+### 9.2 新运营者实例上线（deploy.rs 全流程）
+
+```bash
+cd contracts && forge build
+MERIDIAN_RPC_URL=<rpc> MERIDIAN_OPERATOR_KEY=0x... MERIDIAN_BOND=<wei> MERIDIAN_CHALLENGE_BOND=<wei>   cargo run --release --manifest-path contracts/rust-smoke/Cargo.toml --bin deploy -- --live
+```
+
+部署顺序（脚本自动完成）：DSA(无参) → RevocationRegistry(DSA) → OperatorRegistry
+(registrar = 部署方) → `appendSchedule`（初值取 `MERIDIAN_BOND` / `MERIDIAN_CHALLENGE_BOND`，
+缺省 1 ETH / 0.1 ETH）→ BatchSettler(operator, asset, **challengeBond ← currentSchedule()
+读数**) → `registerOperator(settler)`。脚本自带两道核对：调度读数与写入值一致 +
+部署后 `challengeBond()` 回读与调度读数一致（单一事实源在链上）。
+
+### 9.3 运营者名册（读面与纪律）
+
+- `registerOperator(settler)` 是 **self-registration 绑定实证**：调用者必须是
+  `BatchSettler(settler).operator()` 本尊（链上 immutable getter 复核），注册时快照
+  `asset` / `challengeBond` 固化值——名册 = 每实例实际金额的公开台账，任何人可与调度
+  历史交叉核对。
+- 名册 append-only：无移除/停用；同一运营者可注册多个实例（= 重部署换金额路径）。
+  退役信号 = 名册条目时间戳之后事件缺失（声誉面从 BatchSettler 事件派生，P2-5）。
+
+**诚实边界（部署面不强制）**：运营者可以跳过注册表、或部署偏离当刻调度的金额——
+不被密码学阻止，只被名册快照/缺席公开（选型与验证者据此可查）。registrar 抬价/降额
+影响的是后续部署的起点值，全史可审计；金额无下限校验（1 wei 债券合法——下限本身是
+又一个不可调常量，靠可见性而非代码挡）。`registry_flow.rs`（verify 步 10）是本节全链
+演练：调度 ×2 代 → 双实例各持其部署版本 → 名册快照回读 → 负向组 6 例全拒。

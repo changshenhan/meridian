@@ -248,6 +248,9 @@ if { command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; } \
     # P2-1 验证者挑战演练（TECH_SPEC §6.18）：镜像复算检出 commit≠settle → 欺诈证明 →
     # challenge 全链（三幕：诚实静默 / kind1 漏单 / kind2 低付）。零合约改动，debug 够。
     run "verifier_drill" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run --quiet --bin verifier_drill'
+    # P2-4 多运营者多实例部署流程演练（TECH_SPEC §6.21.3）：append-only 调度 ×2 代 →
+    # 两 BatchSettler 实例各持其部署版本 → 名册 self-registration 快照 → 负向组 6 例全拒。
+    run "registry_flow" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run --quiet --bin registry_flow'
 else
     skip "forge/anvil 未找到 → rust-smoke 门禁跳过"
 fi

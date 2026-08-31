@@ -597,7 +597,8 @@ pub trait Ingest {
     （本合约目前唯一权限角色 `operator` 也是 immutable，同口径）。金额随 gas 价格/债券规模
     的运行时自适应挂 Phase 2 多运营者（那时本就有治理结构可挂靠）——**设计轮定夺
     （2026-08-31，§6.17 决策 D / 砖 P2-4）：append-only 金额调度 + 实例固化，仍不做
-    运行时 setter**。**部署期 fail-fast 闸**：
+    运行时 setter。**已落地（S-64，§6.21）**：OperatorRegistry 持有 append-only 调度
+    （读取点在部署流程，BatchSettler 构造 ABI 不动），名册快照公开每实例固化值**。**部署期 fail-fast 闸**：
     `challengeBond_ == 0` 构造即 revert（`ZeroChallengeBond`）——零押金部署等于静默回退到
     S-38 之前的垃圾挑战面，构造期挡下比事后靠人眼发现可靠。
   - 其余押金语义与 S-38 逐字不变（金额来源换成 `challengeBond` 读取，四处使用点无一处
@@ -1553,7 +1554,7 @@ P2-3 定夺**（与跨分片 kind 共享包含验证骨架，边际成本低，�
 | **P2-1** | 验证者挑战演练：独立账本复算检出 commit≠settle → 欺诈证明提交工具链，本地 anvil 全链演练（人为错账 → 第三方检出 → challenge → voided + 罚没）。**已落地（S-61，2026-08-31，§6.18）** | 决策 C，**零合约改动** | 小 |
 | **P2-2** | DSA 委托→运营者绑定面（独立映射不进哈希，owner 注册期写入）+ 聚合器摄取绑定闸（Contract 模式 RPC 读）+ 存量委托 fail-open 口径。**已落地（S-62，2026-08-31，§6.19）**——写入形态定夺收窄为「owner 私钥一次性交易 `bindOperator`」（§6.19.1），存量委托由 owner 补绑收窄 fail-open 残余 | 决策 A/B | 中 |
 | **P2-3** | BatchSettler「跨分片消费」欺诈证明 kind +（P2-3 开工时定夺）「过时撤销根」kind。**开工定夺已完成（S-63，2026-08-31，§6.20）**：两个 kind 的朴素形态均不可健全实现（接受时刻墙，§6.20.1），健全形态 = 平行接受承诺树 acceptanceRoot（§6.20.2），规模重估「中」→「大」，**次序调到 P2-4 之后**（P2-4 无墙可独立落地） | P2-2 | 大 |
-| **P2-4** | OperatorRegistry（append-only 金额调度 + 运营者名册）+ 多实例部署流程与文档 | 决策 D | 中 |
+| **P2-4** | OperatorRegistry（append-only 金额调度 + 运营者名册）+ 多实例部署流程与文档。**已落地（S-64，2026-08-31，§6.21）**——BatchSettler 逐字节不动，读取点定在部署流程（定夺 1），名册 = self-registration 绑定实证（定夺 4），deploy.rs 三参构造潜伏缺陷顺带修复 | 决策 D | 中 |
 | **P2-5** | 声誉派生（monitor 面只读指标） | 决策 E | 小 |
 | **P2-6/L3** | 共享账本共识（多写者同一账本） | 决策 A 在本阶段**不实施**；前置 = P2-1..5 实证 + 独立共识设计轮 | 大 / blocked |
 
@@ -1569,7 +1570,9 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 - **P2-2 已落地**（S-62，§6.19）：链上绑定面 + 摄取绑定闸 + JSON-RPC 读装配有测试锚定；
   P2-3 开工定夺已完成（S-63，§6.20）但**未实现**——**跨分片双花的密码学封堵（P2-3 事后
   kind）未上线**，且其朴素形态已被定夺为不可健全实现（§6.20.1）；绑定闸只挡「绑他方的
-  后续意图」，存量未绑定委托 fail-open 如故（§6.19.5）。P2-4/P2-5 仍为设计轮产出。
+  后续意图」，存量未绑定委托 fail-open 如故（§6.19.5）。**P2-4 已落地**（S-64，§6.21）：
+  OperatorRegistry 调度/名册是**记录面不是强制面**——跳过注册表、偏离调度、registrar
+  降额均不被密码学阻止，只被全史与快照公开（§6.21.4）。P2-5 仍为设计轮产出。
 - **不可改绑**（v1 口径，P2-2 落地时钉进合约）：改绑窗口内旧账本在途意图的预算消费
   不可回滚 = 双花面。迁移路径 = owner 撤销旧委托 + 注册新委托（预算重置的代价由
   owner 承担，链上全程可见）。
@@ -1859,12 +1862,103 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 同款，不上链）不受本定夺影响。
 - 读面无最终性保障（6.19.3）；缓存进程内不持久化（重启冷读，可用性自伤方向安全）。
 
+### 6.21 P2-4 OperatorRegistry：append-only 金额调度 + 运营者名册（实施，2026-08-31）
+
+**定位**：§6.17 决策 D 的实施砖——新合约 `OperatorRegistry`（`contracts/src/OperatorRegistry.sol`）
+持有 append-only 的债券/押金金额调度与运营者名册，并为多运营者多实例部署提供流程与发现面。
+**BatchSettler 逐字节不动**（冻结面纪律 + S-50 构造语义已锚定），本砖是纯增量合约。
+
+#### 6.21.1 定夺记录（先改后码）
+
+1. **「新实例读取当刻值固化」的读取点在部署流程，不在构造器内部。** 让 `BatchSettler`
+   构造器收注册表地址并读数，会把注册表写入者抬升为全部未来实例金额的链上决定者，并把
+   注册表地址焊进已冻结的构造 ABI（S-50 口径级联）。定夺：部署流程（`deploy.rs` /
+   §6.21.3 演练）读 `currentSchedule()` 后作为构造参数直传 + 部署后回读
+   `challengeBond()` 交叉核对（S-50「单一事实源在链上」同口径）——固化结果等价
+   （immutable、逐部署一版），冻结面零触碰。
+2. **调度写入者 = `registrar`（immutable，部署 OperatorRegistry 的主体）。** 决策 D 的
+   信任面论证在此层收窄为：registrar **触不到任何在役实例的判定面**（调度只被未来部署
+   读取，存量实例各持其部署版本），每次追加即事件 + 数组追加、无改写/删除路径、全史
+   链上可审计。这与 S-50 否决的运行时 setter 性质不同：setter 直接改写判定面金额。
+3. **调度条目只增不改、追加即生效。** `ScheduleEntry{bond, challengeBond, writtenAt}`
+   追加后即成为「之后的部署」读取的当刻值（无预约生效窗口——生效时刻 = 追加交易时刻，
+   诚实边界见 §6.21.4）。`bond == 0` 或 `challengeBond == 0` 构造性拒绝
+   （`ZeroScheduleAmount`）：零债券 = 挑战赔付归零 = 乐观安全归零；零押金 = 复活垃圾
+   挑战面（S-50 `ZeroChallengeBond` 同语义，防未来部署直接撞构造 revert）。
+4. **名册写入形态 = self-registration 绑定实证。** `registerOperator(settler)` 的调用者
+   必须是 `BatchSettler(settler).operator()` 本尊（链上读 immutable getter；无代码 /
+   不匹配即 revert）。名册条目因此不可伪造：注册一条 = 声明对链上一个真实存在的
+   BatchSettler 实例的 operator 归属，任何人可独立复核。写入面**无需 registrar 权限**
+   （registrar 也无法替别人注册）——注册是 permissionless-but-provable。
+5. **注册时快照固化值。** 条目 `OperatorEntry{operator, settler, asset, challengeBond,
+   registeredAt}` 的后三者从实例 immutable getter 现场读出 = 决策 D「存量实例各持其
+   部署版本的值」的链上事实源，可与调度历史交叉核对（该实例部署时点的当刻调度值）。
+   同一运营者可注册多个实例（决策 D 的换金额路径 = 重部署 + 新实例注册），流水
+   append-only，无移除/停用路径。
+6. **记录面不是强制面。** 运营者完全可以不经注册表部署 BatchSettler、或部署偏离当刻
+   调度的金额（BatchSettler 构造参数仍直传，本砖不加任何强制钩子）。注册表的价值 =
+   ①金额决策的链上全史（可审计）；②实例固化值的公开台账（选型/验证者/monitor 读面，
+   P2-5 输入）；③多实例部署流程的锚。偏离与跳过经快照/缺席公开可见，不密码学阻止。
+
+#### 6.21.2 合约接口（OperatorRegistry.sol）
+
+- **读面**：`registrar`、`schedule(uint256)` / `scheduleCount()`、`currentSchedule()`
+  （空调度 revert `ScheduleEmpty`——部署流程不该在无调度时部署）、`operators(uint256)` /
+  `operatorCount()`、`isSettlerListed(settler)`、`settlerCount(operator)`。
+- **写面**：`appendSchedule(bond, challengeBond)`（仅 registrar，追加 + 事件）；
+  `registerOperator(settler)`（permissionless，绑定实证 + 快照 + 事件）。
+- **错误**：`ZeroRegistrar` / `NotRegistrar` / `ZeroScheduleAmount` / `ScheduleEmpty` /
+  `SettlerAlreadyListed(settler)` / `NotSettlerOperator(settler, expected, actual)`。
+- 本合约不持有资金、不做任何外部调用写状态（`registerOperator` 只对 settler 做只读
+  staticcall 取 getter）——零重入面，覆盖门禁下无豁免边。
+
+#### 6.21.3 多实例部署流程（deploy.rs + registry_flow 演练）
+
+- **部署顺序**（构造参数依赖链）：DSA(无参) → RevocationRegistry(DSA) →
+  OperatorRegistry(registrar = operator) → `appendSchedule`（初始调度，金额取
+  `MERIDIAN_BOND` / `MERIDIAN_CHALLENGE_BOND`，缺省 1 ETH / 0.1 ETH）→
+  BatchSettler(operator, asset, challengeBond ← `currentSchedule()` 读数) →
+  `registerOperator(settler)`。
+- **顺带修复 deploy.rs 潜伏缺陷**：S-50 把 BatchSettler 构造改为三参后，`deploy.rs` 仍传
+  两参——verify 步 10 只做编译门禁（S-15a），运行时部署必然 revert。本砖接线时修复，
+  并把部署后回读 `challengeBond()` 与调度读数交叉核对。
+- **`registry_flow.rs` anvil 演练**（verify 步 10 接线）：v1 调度 → settler1（读 v1）→
+  注册 → v2 调度 → settler2（读 v2）→ 注册 → 断言（调度历史 2 条且 entry0 不变 /
+  两实例冻结值各自不同 / 重复注册拒 / 非 operator 注册拒 / v1 实例 `challengeBond()`
+  不受 v2 影响）——决策 D「动态性来自调度 + 重部署，不来自 setter」的全链实证。
+
+#### 6.21.4 诚实边界
+
+- **registrar 写面是部署授权方信任面**：可追加任意金额（含 1 wei 债券——金额无下限，
+  下限本身是又一个不可调常量）。缓解不是密码学而是可见性：全史可审计 + 部署读数公开 +
+  名册快照把每个实例实际固化的值公开。registrar 抬价/降额影响的是「未来部署的起点值」，
+  决策 D 的 governor 论证（抬价 = 审查欺诈证明、降零 = 复活垃圾挑战）在此层同样成立，
+  只是作用域从「全部在役实例」收窄为「后续部署」。
+- **无预约生效窗口**：追加即生效，被部署读数窗口夹住的调度变更 = 部署方读到旧值（事后
+  可由 writtenAt 与部署交易时刻对账发现，不可阻止）。
+- **名册不验证字节码型号**：只验证 `operator()` 归属 + 快照 getter 读数。一个自制的
+  「假 settler」只要 `operator()` 返回调用者也能注册——但决策 E 的声誉面从 BatchSettler
+  **事件**（罚没/voided）派生而不读名册，刷名册无收益；快照读数本身仍是该地址的公开事实。
+- **名册无移除/停用**：退役运营者条目永留。声誉面不读名册状态（决策 E），不产生
+  「停用即洗白」面；条目时间戳与后续事件缺失即事实上的退役信号。
+- **部署面不强制**（定夺 6）：跳过注册表 / 偏离调度的部署不被阻止，只被公开。
+
+#### 6.21.5 测试与门禁
+
+- forge `OperatorRegistry.t.sol`：调度正/负向（零 registrar / 非 registrar / 两种零金额
+  分支 / 空调度读数 / 追加历史不可变）+ 名册正/负向（成功快照回读 / 非 operator /
+  EOA settler / 重复 settler / 同 operator 多实例）+ 决策 D 全链流（v1 → 实例1 →
+  v2 → 实例2，两实例冻结值各持其部署版本）。
+- `registry_flow.rs` 进 verify 步 10；coverage 门禁下新合约行/函数/分支 100%（无豁免边）；
+  audit-scope §1 文件清单 + §5 计数、contracts/README 计数同步重对齐（§6.17.3 次序约束）。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）
 
-五个合约在 `contracts/src/`（S-11 增 `IntentHelper.sol` / `Merkle.sol` 交叉实现；
-forge test **97 用例**全绿，见 `contracts/README.md`）。签名与语义以代码为准，此处为契约要点。
+六个合约在 `contracts/src/`（S-11 增 `IntentHelper.sol` / `Merkle.sol` 交叉实现；S-64 增
+`OperatorRegistry.sol`；forge test **109 用例**全绿，见 `contracts/README.md`）。签名与语义
+以代码为准，此处为契约要点。
 
 ```solidity
 // DSA.sol —— 委托注册（Contract 模式 + 撤销锚点来源）+ 运营者绑定面（S-62，§6.19）
@@ -1881,6 +1975,27 @@ contract DSA {
     function operatorOf(bytes32 delegationHash) external view returns (address);
     error AlreadyRegistered(); error BadOwnerSignature(); error HighS(); error MalformedABI();
     error NotRegistered(); error NotDelegationOwner(); error AlreadyBound(); error ZeroOperator();
+}
+
+// OperatorRegistry.sol —— P2-4（S-64，§6.21）：append-only 金额调度 + 运营者名册
+//（决策 D：动态性来自调度 + 重部署，不来自 setter；记录面不是强制面，§6.21.1 定夺 6）
+contract OperatorRegistry {
+    struct ScheduleEntry { uint256 bond; uint256 challengeBond; uint64 writtenAt; }
+    struct OperatorEntry { address operator; address settler; address asset;
+                           uint256 challengeBond; uint64 registeredAt; }   // 注册时快照
+    address public immutable registrar;
+    // 调度：旧条目永不改写、无删除路径；currentSchedule() = 末条（未来部署读取的当刻值）
+    function appendSchedule(uint256 bond, uint256 challengeBond) external; // 仅 registrar
+    function currentSchedule() external view returns (ScheduleEntry memory);
+    // 名册：self-registration 绑定实证——调用者必须 = BatchSettler(settler).operator()，
+    // 注册时快照 asset/challengeBond 固化值；append-only 无移除/停用；settler 去重。
+    function registerOperator(address settler) external;   // permissionless（可证明归属）
+    function operators(uint256) external view returns (OperatorEntry memory);
+    function isSettlerListed(address settler) external view returns (bool);
+    function settlerCount(address operator) external view returns (uint256);
+    error ZeroRegistrar(); error NotRegistrar(); error ZeroScheduleAmount();
+    error ScheduleEmpty(); error SettlerAlreadyListed(address);
+    error NotSettlerOperator(address settler, address expected, address actual);
 }
 
 // RevocationRegistry.sol —— 独立撤销表（仅 owner 可撤销）

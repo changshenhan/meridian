@@ -14,6 +14,7 @@
 | `IntentHelper.sol` / `Merkle.sol` | 欺诈证明的 sha256 Merkle 交叉实现 | 高（安全性依赖与 Rust 侧逐字节一致） |
 | `DSA.sol` | 委托登记 + 运营者绑定面（S-62：`dh → operator` 独立映射，owner 私钥一次性写入不可改绑；登记/绑定错误 → 支付路由错分片或闸被伪装绕过） | 中 |
 | `RevocationRegistry.sol` | 撤销锚点 | 中 |
+| `OperatorRegistry.sol`（S-64，P2-4） | 金额调度 + 运营者名册（**不持有资金**、无写状态外呼）；registrar 写面决定未来部署的债券/押金起点值（在役实例判定面不可触） | 低 |
 
 链下交叉一致性（第二审计对象）：
 
@@ -104,12 +105,15 @@
 
 **合约面（forge）**：
 
-- forge **97/97**（S-38 押金制负向组改 `_challengeRejected` 断言；S-50 押金参数化 2 例；
+- forge **109/109**（S-38 押金制负向组改 `_challengeRejected` 断言；S-50 押金参数化 2 例；
   S-58 覆盖缺口 6 例：claim push 失败回滚可重试 / 挑战者拒收赔付整笔回滚 / kind1 多意图
   → BadFraudKind / kind2 目标行越界 / kind2 混入伪造意图 → BadInclusionProof /
   withdrawRefund push 失败可重试；S-62 绑定面 7 例：成功 + 事件 / 未注册 / 非 owner /
-  重绑 / 零地址 / 未绑定读数零地址 / owner 自绑；USDC 套件含 false 返回与 revert 冒泡
-  两种 token 失败语义）。
+  重绑 / 零地址 / 未绑定读数零地址 / owner 自绑；S-64 OperatorRegistry 12 例：调度
+  正/负向（零 registrar / 非 registrar / 两种零金额分支 / 空调度读数 / 追加历史不可变）
+  + 名册正/负向（成功快照回读 / 非 operator / EOA settler / 重复 settler / 同 operator
+  多实例）/ 决策 D 全链流（v1→实例1→v2→实例2 各持其部署版本）；USDC 套件含 false 返回
+  与 revert 冒泡两种 token 失败语义）。
 - **invariant fuzz**（2026-08-31，四步路径 ②）：`test/BatchSettlerInvariant.t.sol`
   64 runs × depth 256，三条全局不变量（资金守恒 ghost 记账 / 状态机单调 / voided 后
   claim 必拒），handler 覆盖 commit/settle 三模式/窗口内双路挑战/warp 过窗 claim。

@@ -14,6 +14,8 @@ src/
   DSA.sol              委托注册（Contract 模式 + 撤销锚点来源）+ 运营者绑定面
                        （S-62：dh → operator 独立映射，owner 私钥一次性写入不可改绑）
   RevocationRegistry.sol  撤销注册表（仅 owner 可撤销）
+  OperatorRegistry.sol   P2-4：append-only 金额调度 + 运营者名册（S-64，TECH_SPEC §6.21，
+                          不持有资金；决策 D「调度 + 重部署，不来自 setter」）
   BatchSettler.sol     乐观批量结算 v2（operator 守卫 / commit 锚定撤销根 / settle 存
                        net[]+结算资金 / 延迟 claim / challenge 完整验证 + 罚没；
                        S-28 asset 参数化：原生 ETH / ERC-20）
@@ -25,6 +27,9 @@ test/
   DSA.t.sol              14 个用例（注册 7 + S-62 运营者绑定 7：owner 私钥一次性写入/
                          不可改绑/零地址禁/未绑定读数零地址）
   RevocationRegistry.t.sol 3 个用例
+  OperatorRegistry.t.sol 12 个用例（S-64：调度 7 —— append-only 历史/零 registrar/
+                         非 registrar/两种零金额/空调度读数；名册 5 —— 绑定实证快照/
+                         非 operator/EOA settler/重复 settler/调度换代双实例）
   BatchSettler.t.sol     45 个用例（挑战正反/去重/跨收款人/窗口/罚没账/void 后 claim）
   MockUSDC.sol           S-28 测试替身（最小 ERC-20，6 decimals + 黑名单，失败返回 false）
   BatchSettlerUsdc.t.sol 12 个用例（token 模式 settle 拉款/ETH 禁入/claim/双资产退款/黑名单）
@@ -67,7 +72,8 @@ S-11 新增两处交叉实现：
 ```bash
 cd contracts
 forge build
-forge test          # 97 用例全绿（S-62：注册 7 + 绑定 7 + Revocation 3 + Settler 45
+forge test          # 109 用例全绿（S-62：注册 7 + 绑定 7 + Revocation 3 + Settler 45
+                    #   + OperatorRegistry 12（S-64：调度 7 + 名册 5）
                     #   + USDC 12 + IntentHelper 5 + Merkle 7 + Differential 8 + Invariant 3）
 cd rust-smoke && cargo run   # anvil 部署 + 全链路（需先 forge build 产出 out/）
 ```

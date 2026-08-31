@@ -33,6 +33,42 @@ sol! {
         function isRevoked(bytes32 delegationHash) external view returns (bool);
     }
 
+    /// S-64（TECH_SPEC §6.21）：P2-4 OperatorRegistry —— append-only 金额调度 + 运营者
+    /// 名册。写面：appendSchedule（仅 registrar）/ registerOperator（绑定实证）。
+    #[sol(rpc)]
+    interface IOperatorRegistry {
+        struct ScheduleEntry {
+            uint256 bond;
+            uint256 challengeBond;
+            uint64 writtenAt;
+        }
+        struct OperatorEntry {
+            address operator;
+            address settler;
+            address asset;
+            uint256 challengeBond;
+            uint64 registeredAt;
+        }
+        event ScheduleAppended(uint256 indexed index, uint256 bond, uint256 challengeBond);
+        event OperatorRegistered(address indexed operator, address indexed settler, uint256 challengeBond);
+        error ZeroRegistrar();
+        error NotRegistrar();
+        error ZeroScheduleAmount();
+        error ScheduleEmpty();
+        error SettlerAlreadyListed(address settler);
+        error NotSettlerOperator(address settler, address expected, address actual);
+        function appendSchedule(uint256 bond, uint256 challengeBond) external;
+        function registerOperator(address settler) external;
+        function currentSchedule() external view returns (ScheduleEntry memory);
+        function schedule(uint256 index) external view returns (uint256, uint256, uint64);
+        function scheduleCount() external view returns (uint256);
+        function operatorCount() external view returns (uint256);
+        function operators(uint256 index) external view returns (OperatorEntry memory);
+        function isSettlerListed(address settler) external view returns (bool);
+        function settlerCount(address operator) external view returns (uint256);
+        function registrar() external view returns (address);
+    }
+
     #[sol(rpc)]
     interface IBatchSettler {
         struct NetInstruction {
@@ -149,7 +185,11 @@ pub fn make_env(
             now,
         },
     };
-    IntentEnvelope { intent, agent_sig, proof }
+    IntentEnvelope {
+        intent,
+        agent_sig,
+        proof,
+    }
 }
 
 /// spawn anvil（stdout/stderr 丢弃；错误即失败）。
@@ -176,18 +216,26 @@ pub async fn wait_for_chain(provider: &impl Provider) -> Result<()> {
 
 /// 快进链上时间到挑战窗口之后。
 pub async fn fast_forward(provider: &impl Provider) -> Result<()> {
-    provider.anvil_increase_time(CHALLENGE_WINDOW_SECS + 1).await?;
+    provider
+        .anvil_increase_time(CHALLENGE_WINDOW_SECS + 1)
+        .await?;
     provider.anvil_mine(Some(1), None).await?;
     Ok(())
 }
 
 /// 读取 forge out/ 产物创建字节码并部署；返回合约地址。
-pub async fn deploy(provider: &impl Provider, artifact_rel: &str, constructor_args: &[u8]) -> Result<Address> {
+pub async fn deploy(
+    provider: &impl Provider,
+    artifact_rel: &str,
+    constructor_args: &[u8],
+) -> Result<Address> {
     let artifact_path = format!("{}/../out/{artifact_rel}", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(&artifact_path)
         .with_context(|| format!("read artifact {artifact_path}（先跑 forge build）"))?;
     let v: serde_json::Value = serde_json::from_str(&text)?;
-    let obj = v["bytecode"]["object"].as_str().context("artifact 缺 bytecode.object")?;
+    let obj = v["bytecode"]["object"]
+        .as_str()
+        .context("artifact 缺 bytecode.object")?;
     let mut input = hex::decode(obj.trim_start_matches("0x"))?;
     input.extend_from_slice(constructor_args);
 
