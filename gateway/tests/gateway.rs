@@ -1576,3 +1576,62 @@ fn e2e_connection_refused_is_transport_retry_candidate() {
         "connection refused must be a transport error: {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 撤销观察面配置（S-67，TECH_SPEC §6.24）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_revocation_watch_default_omitted_roundtrip_kept() {
+    let base = Config {
+        listen: "127.0.0.1:9400".into(),
+        max_connections: 16,
+        read_timeout_ms: 1000,
+        max_body_bytes: 1024,
+        tenants: HashMap::new(),
+        admin_key: None,
+        revocation_peers: Vec::new(),
+        revocation_watch: None,
+    };
+    // 缺省（不配置观察面）：序列化不出现 revocation_watch 键（缺省口径逐字节不变）。
+    let s = serde_json::to_string(&base).unwrap();
+    assert!(
+        !s.contains("revocation_watch"),
+        "缺省口径序列化不得出现观察面节: {s}"
+    );
+
+    // 配置观察面：roundtrip 保留（bin 装配消费同一形状）。
+    let with_watch = Config {
+        revocation_watch: Some(meridian_gateway::watch::RevocationWatchConf {
+            rpc_url: "http://127.0.0.1:8545".into(),
+            registry_address: format!("0x{}", "33".repeat(20)),
+            poll_interval_ms: 15_000,
+        }),
+        ..base
+    };
+    let s = serde_json::to_string(&with_watch).unwrap();
+    assert!(s.contains("revocation_watch"));
+    let back: Config = serde_json::from_str(&s).unwrap();
+    let watch = back.revocation_watch.as_ref().expect("watch kept");
+    assert_eq!(watch.rpc_url, "http://127.0.0.1:8545");
+    assert_eq!(watch.poll_interval_ms, 15_000);
+
+    // 完整配置文件形态（poll_interval_ms 缺省）反序列化。
+    let file_form = r#"{
+        "listen": "127.0.0.1:9400",
+        "tenants": {},
+        "revocation_watch": {
+            "rpc_url": "http://127.0.0.1:8545",
+            "registry_address": "0x3300000000000000000000000000000000000033"
+        }
+    }"#;
+    let from_file: Config = serde_json::from_str(file_form).unwrap();
+    let watch = from_file
+        .revocation_watch
+        .as_ref()
+        .expect("watch from file");
+    assert_eq!(
+        watch.poll_interval_ms, 15_000,
+        "缺省 15000ms（§6.24.1 定夺 6）"
+    );
+}

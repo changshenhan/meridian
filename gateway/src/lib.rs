@@ -15,11 +15,15 @@
 //!   撤销事件流的运营者入口）补进网络操作面——此前只有进程内调用，运营者无从触发。
 //! - 撤销跨副本传播（S-59）：配置 `revocation_peers` 后撤销一次调用即达全组（本地先
 //!   撤销，再并行 fanout，逐对端结果 fail-visible）；空配置 = 单副本口径逐字节不变。
+//! - 撤销观察面（S-67，§6.24）：配置 `revocation_watch` 后内置旁路线程刮链上
+//!   `Revoked` 事件自动落本账本（决策 F：每运营者独立链上监听）；不配置 = 不观察，
+//!   缺省口径逐字节不变。
 //! - 部署拓扑（S-56）：TLS 由反代终结（§6.7 部署拓扑节 / ops.md §7）——网关恒明文 +
 //!   回环绑定，反代是信任边界但**不是认证边界**（代理注入头不是信任锚，测试钉死）。
 
 pub mod binding;
 pub mod http;
+pub mod watch;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -72,6 +76,11 @@ pub struct Config {
     /// 单副本口径逐字节不变（撤销只作用于本进程）。
     #[serde(default)]
     pub revocation_peers: Vec<RevocationPeer>,
+    /// 撤销观察面（S-67，TECH_SPEC §6.24）：链上 `RevocationRegistry.Revoked` 事件
+    /// 观察线程（决策 F：每运营者独立链上监听是 P2 硬前置）。缺省 None = 不观察
+    ///（缺省口径逐字节不变，序列化不出现本节）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_watch: Option<watch::RevocationWatchConf>,
 }
 
 /// 撤销 fanout 对端（S-59）。`url` 必须 `http://`——网关恒明文（S-56 部署口径），

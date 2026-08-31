@@ -159,6 +159,12 @@
   fail-closed 不进缓存 / 不可变读缓存 / 缺省无闸口径不变）+ gateway 侧 fake JSON-RPC
   socket e2e（真实 HTTP/1.1 往返：三态 × 短返回 × RPC error × 连接不可得，selector
   对 `cast sig` 独立锚定，装配三环境变量全或无 fail-fast）。
+- 撤销观察面（S-67，§6.24）：gateway 内置链上 `Revoked` 事件观察（决策 F，零合约
+  改动）——fake JSON-RPC 真 socket 单测（双事件落账 / 重复轮查重 + WAL 不膨胀 / 脏
+  日志逐条跳过 / 日志地址不符绝不消费 / json-rpc error 与连接失败 Err 上抛不吞成
+  无事件）+ topic0 对 `cast keccak` 独立锚定 + 配置负向组（https / 坏地址 / 零间隔）
+  + 缺省不配置时序列化逐字节不变。诚实边界：观察面是尽力而为非共识（滞后由债券
+  罚没 + kind3 兜底）；全史重扫无分页（§6.22.5 同缝）。
 
 **ZK/装配面（范围外声明的对照证据）**：
 

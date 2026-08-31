@@ -215,7 +215,8 @@ server {
 
 ## 8. 运营撤销流程（S-57，TECH_SPEC §6.7 撤销面）
 
-委托撤销事件流（§4.6）：链上 `DSA.revoke`（owner）→ **运营者传播进聚合器**。传播入口 =
+委托撤销事件流（§4.6）：链上 `RevocationRegistry.revoke`（owner；事件 `Revoked`）→
+**运营者传播进聚合器**（人工：下方端点 / fanout；自动：§8.1 观察面）。人工传播入口 =
 网关管理端点 `POST /v1/admin/revocations`（admin key 门面，同 `/v1/admin/tenants`）：
 
 ```bash
@@ -271,8 +272,36 @@ curl -X POST https://gw.example.com/v1/admin/revocations \
 最后防线不是传播机制。**新意图的 `E_REVOKED` 拒绝即时生效于本进程**；撤销根上链随
 下个密封 epoch（≤ 1 epoch）。
 
-**诚实边界**：链上 `RevocationRegistry.revoke` 不会自动进聚合器（v1 无链上监听器），
-链上撤销 → 聚合器撤销之间是运营者人工传播，窗口期风险由运营者债券罚没兜底（§6.5）；
+### 8.1 链上撤销观察面（S-67，TECH_SPEC §6.24）
+
+配置 `revocation_watch` 节后，网关起旁路线程每 `poll_interval_ms`（缺省 15000）刮一次
+`RevocationRegistry.Revoked` 事件（全史区间 `fromBlock: 0x0`），链上撤销自动落本账本
+（决策 F：每运营者独立链上监听是 P2 硬前置）——人工传播（上节端点 / fanout）之外的
+自动兜底：
+
+```json
+{ "listen": "127.0.0.1:9400", "...": "...",
+  "revocation_watch": {
+    "rpc_url": "http://127.0.0.1:8545",
+    "registry_address": "0x<RevocationRegistry-40hex>",
+    "poll_interval_ms": 15000
+  } }
+```
+
+- **三个撤销来源汇于同一入口**（admin API / 对端 fanout / 链上观察），幂等语义统一；
+  重复消费由观察面查重（已撤销的 dh 不重复落账）。观察面**不 fanout**——链上事件是
+  全组共同事实源，每个副本各自观察同一事件流。
+- 启动日志 `revocation_watch: on`；观察线程轮询失败打 stderr 一行（`revocation watch:
+  poll failed: ...`）下一轮重试，**不退进程**（admin API / fanout 撤销路径仍可达）；
+  静默轮询（无事件无脏日志）不打日志。
+- **观察滞后** = 撤销生效延迟 ≤ 轮询间隔 + RPC 延迟（缺省 ~15s + RPC 往返）；观察面
+  失灵期间撤销延迟无限延长——`poll failed` 日志连续出现 = 观察面病了，先查 RPC 端点
+  与 `registry_address` 配置，撤销兜底退回人工传播（上节）。
+
+**诚实边界**：观察面是尽力而为不是共识——轮询间隔内的撤销在本账本仍可被接受，窗口期
+风险由运营者债券罚没兜底（§6.5，kind3 出证见 §6.23）；观察面未装配 / 挂掉 / 漏读 =
+「撤销观察缺席」的运营者过失形态（链上可罚）。轮询是全史重扫，生产 RPC 的区块区间
+上限（如 10k 块）未做分页——本地/测试链口径，生产量级待数据（TECH_SPEC §6.22.5 同缝）。
 管理操作经 TLS 终结点之后执行（§7）；批量撤销 v1 不做（单请求单 dh，逐笔确认根推进）。
 
 ## 9. 多运营者多实例部署流程（S-64，TECH_SPEC §6.21）

@@ -84,11 +84,52 @@ fn main() {
     };
     let agg = Arc::new(agg);
 
+    // 撤销观察面（S-67，TECH_SPEC §6.24，决策 F）：配置 `revocation_watch` 节后起
+    // 旁路线程刮链上 `Revoked` 事件自动落本账本。配置期 fail-fast（坏 url / 坏地址 /
+    // 零间隔启动即退——静默接受只会变成运行时必败的观察面）；轮询失败 fail-visible
+    // 重试（stderr 一行），绝不退进程——观察面挂掉不阻网关服务（admin API / fanout
+    // 撤销路径仍可达）。不配置 = 不观察（缺省口径逐字节不变）。
+    if let Some(watch_conf) = &cfg.revocation_watch {
+        let watch = meridian_gateway::watch::RevocationWatch::new(
+            &watch_conf.rpc_url,
+            &watch_conf.registry_address,
+            watch_conf.poll_interval_ms,
+        )
+        .unwrap_or_else(|e| panic!("bad revocation_watch config: {e}"));
+        let interval = watch.interval();
+        let watch_agg = Arc::clone(&agg);
+        std::thread::Builder::new()
+            .name("revocation-watch".into())
+            .spawn(move || loop {
+                match watch.poll_once(&watch_agg) {
+                    Ok(s) => {
+                        // 静默轮询（seen=0 fresh=0 skipped=0）不刷屏；有事件或有脏
+                        // 日志才打一行。
+                        if s.fresh > 0 || s.skipped > 0 {
+                            eprintln!(
+                                "revocation watch: seen {} fresh {} skipped {}",
+                                s.seen, s.fresh, s.skipped
+                            );
+                        }
+                    }
+                    // fail-visible：每轮失败一行 + 下一轮重试（定夺 5）。
+                    Err(e) => eprintln!("revocation watch: poll failed: {e}"),
+                }
+                std::thread::sleep(interval);
+            })
+            .expect("spawn revocation watch thread");
+    }
+
     let listener =
         TcpListener::bind(&cfg.listen).unwrap_or_else(|e| panic!("bind {}: {e}", cfg.listen));
     let tenants = cfg.tenants.len();
     let admin = if cfg.admin_key.is_some() { "on" } else { "off" };
     let peers = cfg.revocation_peers.len();
+    let watch = if cfg.revocation_watch.is_some() {
+        "on"
+    } else {
+        "off"
+    };
     // S-59：对端 url 配置期 fail-fast（坏 url 只会变成撤销时的必败 fanout）。
     for peer in &cfg.revocation_peers {
         if let Err(e) = peer.parse_url() {
@@ -97,7 +138,7 @@ fn main() {
     }
     let gw = Arc::new(Gateway::new(agg, &cfg));
     eprintln!(
-        "meridian-gateway listening on {} (tenants: {tenants}, max_conn: {}, admin: {admin}, revocation_peers: {peers}, operator binding: {})",
+        "meridian-gateway listening on {} (tenants: {tenants}, max_conn: {}, admin: {admin}, revocation_peers: {peers}, revocation_watch: {watch}, operator binding: {})",
         cfg.listen,
         cfg.max_connections,
         if binding_on { "on" } else { "off" }

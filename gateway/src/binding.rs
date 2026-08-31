@@ -65,56 +65,70 @@ impl JsonRpcBinding {
 
     /// 单次 `eth_call`：返回 ABI 解码前的原始返回字节。
     fn eth_call(&self, to: &OperatorAddress, data: &[u8]) -> Result<Vec<u8>, String> {
-        let addr = format!("{}:{}", self.host, self.port);
         let params = serde_json::json!([
             { "to": format!("0x{}", hex::encode(to)), "data": format!("0x{}", hex::encode(data)) },
             "latest"
         ]);
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": params,
-        })
-        .to_string();
-
-        let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
-            .map_err(|e| format!("set timeout {addr}: {e}"))?;
-        let req = format!(
-            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream
-            .write_all(req.as_bytes())
-            .and_then(|_| stream.write_all(body.as_bytes()))
-            .map_err(|e| format!("write {addr}: {e}"))?;
-        let mut resp = Vec::new();
-        stream
-            .read_to_end(&mut resp)
-            .map_err(|e| format!("read {addr}: {e}"))?;
-
-        let text = String::from_utf8_lossy(&resp);
-        let (_, resp_body) = text
-            .split_once("\r\n\r\n")
-            .ok_or_else(|| format!("rpc {addr}: malformed response (no header/body split)"))?;
-        let v: serde_json::Value =
-            serde_json::from_str(resp_body).map_err(|e| format!("rpc {addr}: bad json: {e}"))?;
-        if let Some(err) = v.get("error") {
-            return Err(format!("rpc {addr}: json-rpc error: {err}"));
-        }
-        let result = v
-            .get("result")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| format!("rpc {addr}: missing result"))?;
+        let result = rpc_post(&self.host, self.port, self.timeout, "eth_call", params)?;
         let raw = result
-            .strip_prefix("0x")
-            .ok_or_else(|| format!("rpc {addr}: result missing 0x prefix"))?;
-        hex::decode(raw).map_err(|e| format!("rpc {addr}: bad result hex: {e}"))
+            .as_str()
+            .and_then(|s| s.strip_prefix("0x"))
+            .ok_or_else(|| "rpc eth_call: result missing 0x string".to_string())?;
+        hex::decode(raw).map_err(|e| format!("rpc eth_call: bad result hex: {e}"))
     }
+}
+
+/// 单次 JSON-RPC POST 往返骨架（§6.19.3 `eth_call` 与 §6.24 `eth_getLogs` 共用，
+/// S-67 抽取——TCP 连接/超时/请求行/响应切分/错误上抛行为逐字节不变）。返回
+/// `result` 字段原值；json-rpc `error` / 缺 result / 非 JSON 响应一律 Err（fail-closed
+/// 上抛，本层绝不把读失败翻译成业务默认值）。
+pub(crate) fn rpc_post(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let addr = format!("{}:{}", host, port);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    })
+    .to_string();
+
+    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|_| stream.set_write_timeout(Some(timeout)))
+        .map_err(|e| format!("set timeout {addr}: {e}"))?;
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(req.as_bytes())
+        .and_then(|_| stream.write_all(body.as_bytes()))
+        .map_err(|e| format!("write {addr}: {e}"))?;
+    let mut resp = Vec::new();
+    stream
+        .read_to_end(&mut resp)
+        .map_err(|e| format!("read {addr}: {e}"))?;
+
+    let text = String::from_utf8_lossy(&resp);
+    let (_, resp_body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("rpc {addr}: malformed response (no header/body split)"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(resp_body).map_err(|e| format!("rpc {addr}: bad json: {e}"))?;
+    if let Some(err) = v.get("error") {
+        return Err(format!("rpc {addr}: json-rpc error: {err}"));
+    }
+    v.get("result")
+        .cloned()
+        .ok_or_else(|| format!("rpc {addr}: missing result"))
 }
 
 impl OperatorBinding for JsonRpcBinding {

@@ -844,8 +844,9 @@ HTTP 先例；网关层分配（JSON 解析）不进内核热路径。内核 `Ag
     **链上承诺随下个密封 epoch**（§4.6）。运营者交叉确认：同 dh 再查
     `/v1/revocation-witness/{dh}` → `404 E_REVOKED`，其余委托 witness 根 = 响应根。
 - **语义边界（诚实）**：撤销即时生效于**本进程**（该委托新意图 `E_REVOKED` 拒）。
-  链上 `RevocationRegistry` 的 revoke 与本端点是两级独立动作（链上撤销不自动进聚合器，
-  v1 无链上监听器——运营者负责传播，§4.6 债券罚没兜底「已撤销仍消费」窗口）。
+  链上 `RevocationRegistry` 的 revoke 与本端点是两级独立动作（链上撤销不自动经本端点
+  进聚合器——自动兜底由撤销观察面承担（S-67，§6.24），人工传播走本端点 / S-59 fanout，
+  §4.6 债券罚没兜底「已撤销仍消费」窗口）。
 
 **撤销跨副本传播（S-59，§6.7 管理面）**：
 
@@ -1479,7 +1480,7 @@ P2 各实施砖开工前必须先回填本节定夺项（先改后码纪律在�
 |---|---|---|---|
 | 1 | 结算写者 | `BatchSettler.operator` = `address public immutable`，`onlyOperator` 守 commit/settle/withdrawRefund | 多运营者各自提交各自 epoch |
 | 2 | 预算强制层 | §4.5 设计决策：预算累计状态留在聚合器确定性账本（**off-chain**），靠债券约束诚实记账 | **跨账本双花**：两张独立账本各自持有同一委托的 `BudgetState`，同一 `total_cap` 可被各消费一次，任何单账本内部不可见此超支 |
-| 3 | 撤销观察 | v1 无链上监听器，「运营者负责传播」（§4.6 债券罚没兜底）；S-59 fanout 是**单运营者**副本组内传播（尽力而为非共识） | 每运营者独立的链上撤销观察面 |
+| 3 | 撤销观察 | v1 无链上监听器，「运营者负责传播」（§4.6 债券罚没兜底）；S-59 fanout 是**单运营者**副本组内传播（尽力而为非共识）。**已落地（S-67，§6.24）**：gateway 内置链上 `Revoked` 事件观察线程 | 每运营者独立的链上撤销观察面 |
 | 4 | 挑战押金金额 | 部署期构造参数 `immutable challengeBond`（S-50），运行时 setter 被否决（governor 双向作恶论证） | 金额随 gas 价格/债券规模的适应性 |
 | 5 | 声誉分 | §6.5 行 2 挂账「债券罚没 + 声誉分（Phase 2）」 | 派生源与暴露面 |
 | 6 | Sybil 防护 | §10 表「质押绑定 + 履约证明（L4 spec 覆盖）」 | L4 范围，本设计轮不展开 |
@@ -1547,7 +1548,9 @@ BatchSettler 罚没/voided 事件；声誉 = monitor 面派生指标（罚没次
 在多运营者下失效：S-59 fanout 只覆盖单运营者副本组内，分片后漏看的运营者会接受已撤销
 委托。兜底仍是债券罚没（§4.6），且过错事后可证（`RevocationRegistry` 撤销交易时间戳
 ≤ commit 时间 ⇒ 可证用过时撤销根）；**是否把「过时撤销根」做成独立欺诈证明 kind 挂
-P2-3 定夺**（与跨分片 kind 共享包含验证骨架，边际成本低，倾向做）。
+P2-3 定夺**（与跨分片 kind 共享包含验证骨架，边际成本低，倾向做——已按接受锚后置落地，
+S-66 kind3/§6.20.4）。**观察面本体已落地（S-67，§6.24）**：gateway 进程内置
+`Revoked` 事件观察线程，链上撤销自动进本账本。
 
 #### 6.17.3 分期砖单
 
@@ -1576,7 +1579,9 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
   OperatorRegistry 调度/名册是**记录面不是强制面**——跳过注册表、偏离调度、registrar
   降额均不被密码学阻止，只被全史与快照公开（§6.21.4）。**P2-5 已落地**（S-65，§6.22）：
   声誉指标从 BatchSettler 事件 + 合约余额派生（monitor 面），读失败 fail-visible 不清零、
-  解码失败 fail-closed、缺省无参时序列完全不出现（定夺 4-6）。P2-6/L3 仍为设计轮产出。
+  解码失败 fail-closed、缺省无参时序列完全不出现（定夺 4-6）。**决策 F 观察面已落地**
+  （S-67，§6.24）：gateway 内置链上 `Revoked` 事件观察线程（零合约改动，尽力而为非
+  共识）。P2-6/L3 仍为设计轮产出。
 - **不可改绑**（v1 口径，P2-2 落地时钉进合约）：改绑窗口内旧账本在途意图的预算消费
   不可回滚 = 双花面。迁移路径 = owner 撤销旧委托 + 注册新委托（预算重置的代价由
   owner 承担，链上全程可见）。
@@ -2169,6 +2174,96 @@ P2-1 演练（§6.18）三幕已产出真实链上事件（3 commit / 3 settle /
   新增 kind3/4 分支零豁免，`_verifyAcceptanceInclusion` 的 leafIndex 预检按不可达边
   删除，拦截由 `_verifyInclusion` 承担）；audit-scope §1/§4/§5 与 contracts/README
   重对齐（§6.17.3 次序约束）。
+
+### 6.24 撤销观察面（实施，2026-08-31，S-67）
+
+**定位**：§6.17.1 挂账点 3 / 决策 F「每运营者独立链上监听是 P2 硬前置」的实施砖。
+运营者网关进程内置旁路观察线程：`eth_getLogs` 刮 `RevocationRegistry.Revoked` 事件 →
+解析 delegation_hash → 本账本 `Aggregator::revoke`。**零合约改动**（信源事件自 S-11
+存在，`Revoked(bytes32 indexed delegationHash, address indexed by)`）——不触碰审计冻结面。
+观察面把「链上撤销 → 聚合器撤销」从运营者人工传播（S-57 API / S-59 fanout 都要有人
+发起）变为自动兜底，撤销生效延迟从 ∞ 收窄到 ≤ 轮询间隔 + RPC 延迟。
+
+#### 6.24.1 定夺记录（先改后码）
+
+1. **落点 = gateway 进程内置观察线程，不是独立 bin、不是 monitor**。消费对象是本进程
+   聚合器账本（决策 F：每运营者对自己的账本负责）；gateway 已持有 `Arc<Aggregator>`、
+   std-only JSON-RPC 先例（§6.19.3 binding.rs）与撤销面装配点（S-57/S-59）。独立 bin
+   要么经 admin API 回环打本进程（多一跳 + admin key 配置纠缠），要么需要账本句柄
+   跨进程（不存在）。monitor 是只读观测面（决策 E），给它加写路径 = 越权破「monitor
+   不进判定面」口径。
+2. **消费前查重：`is_revoked(dh)` 为真即跳过，不打 `revoke`**。事实：`Aggregator::revoke`
+   的 WAL append 在 `fresh` 检查**之前**无条件执行——重复调用会写重复 WAL 记录；观察
+   轮询是重复消费形态（定夺 3），不查重 = WAL 每轮膨胀。查重是内存 HashSet 读。竞态
+   窗口（admin 并发撤销插在查重与 revoke 之间）最坏后果 = 一条重复 WAL 记录（恢复侧
+   重放幂等，语义无害），不加锁。
+3. **每轮全史重扫（`fromBlock: "0x0"`），不做增量游标**——与 §6.22.5 monitor 声誉面
+   同款口径。增量游标有 reorg 漏读窗口（事件重排到更晚块 → 游标已过 → 永久漏，漏 =
+   已撤销继续接受 = kind3 可罚本体的观察面自伤）；全史重扫 + 定夺 2 查重 = 重复消费
+   天然幂等；撤销低频（人级操作）。诚实边界：O(全史) getLogs 每轮 + 生产 RPC 的区间
+   上限（如 10k 块）未做分页——与 §6.22.5 同缝，两条观察面一起收后续面；v1 运行环境
+   是本地/测试链。
+4. **观察面不 fanout**。链上事件是全组**共同事实源**——每个副本各自观察同一事件流
+   （决策 F 语义）；观察面打 S-59 fanout = 把事实经 API 面复制一遍（对端本来就会自己
+   看到）。fanout 保持单一职责（API 撤销的组内加速器），观察保持单一职责（链 → 本账本）。
+   三个撤销来源（S-57 admin API / S-59 对端 fanout / 本观察面）汇于同一入口
+   `Aggregator::revoke`，幂等语义统一。
+5. **失败语义：fail-visible 重试，不 panic 不退进程**。单轮 getLogs 失败 → stderr 一行
+   + 下一轮重试；观察面挂掉不阻网关服务（admin API / fanout 撤销路径仍可达）。诚实
+   边界：观察面静默失灵 = 撤销生效延迟无限延长 = kind3 可罚本体的敞口——v1 无
+   观察 lag 健康指标（记录不做，monitor 侧后续面）。
+6. **配置 = `Config.revocation_watch: Option<RevocationWatchConf>`**（config.json 节，
+   serde default + `skip_serializing_if`——缺省 None 时序列化逐字节不变）。字段
+   `rpc_url` + `registry_address`（20B hex，必填）+ `poll_interval_ms`（缺省 15000，
+   显式给 0 拒——轮询间隔 0 = 打死 RPC）。不用 env：观察面是部署拓扑配置（与
+   `revocation_peers` 同面）；不复用绑定闸 `MERIDIAN_RPC_URL`：绑定闸「三同给同不给」
+   的半装配语义与观察面装配无关，纠缠只会制造「配了绑定忘了 watch」的静默漏配。
+   url 只收 `http://host:port`（std-only 无 TLS，§6.7 口径）。
+7. **日志解析防线：topic0 + 日志地址双重校验**。topic0 = `keccak("Revoked(bytes32,address)")`
+   （sha3 现算，测试面以 foundry keccak 字面量独立锚定——§6.19.3 selector 同纪律，
+   不手算）；getLogs 请求带 `address` 过滤，但解析层再校验 `log.address == registry`
+   ——RPC 端过滤是实现行为不是协议保证，混入其他合约同名事件的后果 = 撤销错误的 dh。
+   topic0 不匹配 / topic 数量错 / 坏 hex / 地址不符的日志**逐条跳过并计数**（fail-visible
+   进返回 stats），绝不 panic——刮取面对脏数据鲁棒，干净数据靠双重过滤保证。
+8. **驱动形态：`poll_once(&self, agg) -> Result<PollStats, String>` 单步接口**，
+   线程只是 `loop { poll_once; sleep(interval) }` 驱动器——单测直接驱动不 sleep，
+   真实线程行为由装配面覆盖。
+9. **验证形态：fake JSON-RPC 服务器真 TCP 往返**（§6.19.3 先例：客户端按
+   `Content-Length` 精确读——`read_to_end` 等对端关写半会死锁）+ 真 Aggregator
+   （缺省 FormatVerifier 配置）。`Revoked` 事件形状由 forge 既有用例锚定（事件在
+   S-11 起有 vm.expectEmit 覆盖），观察面消费的是日志形状不是链上行为；**anvil 端到端
+   演练不做**（fake 响应按 anvil 实际返回形状构造，与 §6.22.3 fake-RPC + 真链上事件
+   同款分工）——诚实边界记录在案。
+10. **与 kind3 的语义关系（文档钉）**：判定面消费链上 `revokedAt`（§6.23 守卫），观察面
+    快慢不影响判定正确性，只影响本账本的撤销生效窗口长度；观察面失灵 = kind3 可罚
+    本体的运营者过失形态具象（§6.23.2「撤销观察缺席」在生产形态 = 观察面未装配 / 挂掉
+    / 漏读）——债券罚没语义不变。
+
+#### 6.24.2 诚实边界
+
+- **观察面是尽力而为不是共识**：轮询间隔内的撤销在本账本仍可接受（预算快路径无
+  Contract 模式 `isRevoked` 读时），窗口期风险由债券罚没兜底（§6.5 / kind3）。ZK 模式
+  的撤销根绑定闸（S-44）挡的是「证明用旧根」，不挡「接受后才撤销」。
+- 全史重扫的成本面与 reorg 语义见定夺 3（§6.22.5 同缝）；无观察 lag 指标（定夺 5）。
+- fake RPC 单测证解析与消费语义，不证真 anvil 日志流形状（定夺 9）。
+- 观察面只覆盖 `RevocationRegistry.Revoked`——`DSA` 层面无撤销事件（撤销只经注册表），
+  绑定事件（`OperatorBound`）不消费：绑定闸走摄取面同步读（§6.19.2），事后对账不归
+  观察面。
+
+#### 6.24.3 工件与测试
+
+- `gateway/src/watch.rs`：`RevocationWatchConf`（配置解析 + url/地址/interval 校验）、
+  `RevocationWatch`（getLogs 客户端 + 解析 + `poll_once`）、`PollStats{seen, fresh,
+  skipped}`、topic0 常量锚定测试。
+- `gateway/src/binding.rs`：HTTP/JSON-RPC 往返骨架抽 `pub(crate)` 共用（`eth_call` 与
+  `eth_getLogs` 同骨架，行为逐字节不变）。
+- `Config.revocation_watch` 装配 + bin 起线程 + 启动日志；缺省 None 口径逐字节不变。
+- 测试（gateway watch 单测 + 真 socket）：双事件消费 / 重复轮查重（revoked_len 不变 +
+  WAL 不膨胀）/ 脏日志逐条跳过（topic0 错 / topic 缺 / 坏 hex / 地址不符）/ 地址不符
+  防线 / json-rpc error 与连接失败 Err 上抛 / 配置负向组（https / 坏地址 / 零间隔）/
+  缺省 None 序列化不出现。
+- ops.md 撤销面诚实边界收口（「v1 无链上监听器」段落改写）+ audit-scope §5 链上面
+  基线补观察面条目。
 
 ---
 
