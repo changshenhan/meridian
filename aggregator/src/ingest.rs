@@ -8,7 +8,13 @@
 //! 读面不可得 `E_BIND_BACKEND`，不可变绑定读缓存）** → 验证明（`SpendVerifier`，登记以返回值为准）→ 公共输入与信封一致性 → 预留窗口槽
 //! → nonce 去重 + 幂等 + 预算检查记账（分片锁内**分配 seq**）→ 定稿（accepted 才入承诺）→
 //! WAL 追加 → 满窗即封。已封 epoch 由 `process_pending` 结算（`lattice::build_epoch`：
-//! 承诺根/净额/净额根 + WAL EpochSeal/Netting 记录 + 上链 seam）。
+//! 承诺根/净额/净额根 + **接受锚 acceptanceRoot（P2-3 §6.23）** + WAL EpochSeal/Netting
+//! 记录 + 上链 seam）。
+//!
+//! 接受时刻锚（P2-3 §6.23.1 定夺 2）：`submit_inner` 入口的 `now_fn()` 快照即 acceptedAt
+//! ——零新增热路径时钟读，随 `WindowEntry.accepted_at` 入窗、随 WAL Intent 尾字段落盘
+//! （崩溃恢复可重建），`build_epoch` 派生平行接受树；不变量 `acceptedAt ≤ sealedAt` 由
+//! 「密封只能发生在最后一次接受之后」构造性成立。
 //!
 //! 并发一致性（关键不变量）：
 //! - **同委托内 seq 序 == 账本应用序**：seq 在 `try_commit` 的分片锁内 `fetch_add`——同委托
@@ -49,8 +55,9 @@ use crate::window::{EpochWindow, WindowEntry};
 /// resolve 闭包忽略 seq）；seq 供只读回执查询（S-30a `receipt()`）。
 type IntentRef = ([u8; 20], u64, u64);
 /// WAL 重放的已接受意图元组：
-/// (seq, intent_hash, delegation_hash, spend_nonce, amount, now, recipient)。
-type ReplayIntent = (u64, [u8; 32], [u8; 32], u64, u64, u64, [u8; 20]);
+/// (seq, intent_hash, delegation_hash, spend_nonce, amount, now, recipient, accepted_at)。
+/// `accepted_at` = 接受时刻锚（P2-3 §6.23，旧格式 WAL = 0 哨兵）。
+type ReplayIntent = (u64, [u8; 32], [u8; 32], u64, u64, u64, [u8; 20], u64);
 
 /// 摄取配置。
 #[derive(Debug, Clone)]
@@ -387,8 +394,8 @@ impl WindowManager {
         }
     }
 
-    fn finalize(&self, r: &SlotReservation, seq: u64, accepted: bool) {
-        r.window.finalize(r.slot, seq, accepted);
+    fn finalize(&self, r: &SlotReservation, seq: u64, accepted_at: u64, accepted: bool) {
+        r.window.finalize(r.slot, seq, accepted_at, accepted);
     }
 
     /// 满窗即封（提交后调用；加速 lattice 处理）。
@@ -458,7 +465,8 @@ impl WindowManager {
             let slot = w
                 .reserve(e.intent_hash)
                 .expect("restore tail fits one window");
-            w.finalize(slot, e.seq, true);
+            // accepted_at 随 WAL Intent 记录重放重建（P2-3 §6.23：接受锚崩溃后可恢复）。
+            w.finalize(slot, e.seq, e.accepted_at, true);
         }
         // current.created_at = build 时的 now_fn()（本进程启动时刻）；时间密封以恢复点为界。
     }
@@ -746,6 +754,7 @@ impl Aggregator {
                 amount,
                 now,
                 recipient,
+                accepted_at,
             } = rec
             {
                 intents.push((
@@ -756,6 +765,7 @@ impl Aggregator {
                     *amount,
                     *now,
                     *recipient,
+                    *accepted_at,
                 ));
             }
         }
@@ -764,12 +774,13 @@ impl Aggregator {
         let tail: Vec<WindowEntry> = intents
             .iter()
             .filter(|t| t.0 >= sealed_accepted_count)
-            .map(|(seq, ih, ..)| WindowEntry {
+            .map(|(seq, ih, _, _, _, _, _, accepted_at)| WindowEntry {
                 seq: *seq,
                 intent_hash: *ih,
+                accepted_at: *accepted_at,
             })
             .collect();
-        for (seq, ih, dh, spend_nonce, amount, now, recipient) in intents {
+        for (seq, ih, dh, spend_nonce, amount, now, recipient, _accepted_at) in intents {
             let reg = agg.registry.lookup(&dh).ok_or_else(|| {
                 std::io::Error::other("WAL replay: intent for unregistered delegation")
             })?;
@@ -961,12 +972,14 @@ impl Aggregator {
         ) {
             Ok(seq) => seq,
             Err(e) => {
-                self.windows.finalize(&slot, 0, false);
+                self.windows.finalize(&slot, 0, 0, false);
                 return self.reject(ih, e);
             }
         };
         // 9. 定稿（accepted 入承诺）+ WAL。
-        self.windows.finalize(&slot, seq, true);
+        // accepted_at = 入口 now 快照（§6.23.1 定夺 2）：窗口槽与 WAL Intent 同一时刻锚，
+        // 保证恢复重建的接受树与在线构建的逐位一致。
+        self.windows.finalize(&slot, seq, now, true);
         if let Err(e) = self.wal.append_intent(
             seq,
             ih,
@@ -975,6 +988,7 @@ impl Aggregator {
             pi.amount,
             pi.now,
             pi.recipient,
+            now,
         ) {
             panic!("WAL failure (durability backbone): {e}");
         }
@@ -1043,12 +1057,14 @@ impl Aggregator {
         self.wal
             .append_netting(se.epoch_id, res.netting_root, res.net.len() as u64)
             .expect("WAL failure (durability backbone)");
-        // 上链 seam（S-11 真实交易后端；失败由运营者重试）。
+        // 上链 seam（S-11 真实交易后端；失败由运营者重试）。acceptanceRoot 随承诺根同批
+        // 上链（P2-3 §6.23：平行接受树，kind3/4 守卫的包含证明锚）。
         self.publisher
             .commit(
                 se.epoch_id,
                 res.commitment_root,
                 res.revocation_root,
+                res.acceptance_root,
                 se.sealed_at,
             )
             .expect("publisher commit failed");

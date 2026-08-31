@@ -5,7 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::ext::AnvilApi;
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
@@ -21,9 +21,14 @@ sol! {
     #[sol(rpc)]
     interface IDSA {
         event DelegationRegistered(bytes32 indexed delegationHash, address indexed owner);
+        /// P2-3（TECH_SPEC §6.19/§6.23）：运营者绑定面（kind4 锚）——一次性写 + 事件。
+        event OperatorBound(bytes32 indexed delegationHash, address indexed operator);
         function registerDelegation(bytes calldata delegationABI, bytes calldata ownerSig) external;
         function ownerOf(bytes32 delegationHash) external view returns (address);
         function isRegistered(bytes32 delegationHash) external view returns (bool);
+        function bindOperator(bytes32 delegationHash, address operator) external;
+        function boundAt(bytes32 delegationHash) external view returns (uint64);
+        function operatorOf(bytes32 delegationHash) external view returns (address);
     }
 
     #[sol(rpc)]
@@ -31,6 +36,8 @@ sol! {
         event Revoked(bytes32 indexed delegationHash, address indexed by);
         function revoke(bytes32 delegationHash) external;
         function isRevoked(bytes32 delegationHash) external view returns (bool);
+        /// P2-3：kind3 守卫的撤销时刻锚（0 = 未撤销）。
+        function revokedAt(bytes32 delegationHash) external view returns (uint64);
     }
 
     /// S-64（TECH_SPEC §6.21）：P2-4 OperatorRegistry —— append-only 金额调度 + 运营者
@@ -84,41 +91,102 @@ sol! {
             uint64 spendNonce;
             bytes memo;
             uint64 expiresAt;
+            /// P2-3 接受时刻锚（§6.23）：kind3/4 时间守卫输入（kind1/2 随证据携带但合约不校验）。
+            uint64 acceptedAt;
             uint64 seq;
             uint256 leafIndex;
             uint256 acceptedCount;
             bytes32[] siblings;
+            /// P2-3 平行接受树兄弟路径（与承诺路径同叶序同深度，§6.23.1 定夺 6）。
+            bytes32[] acceptanceSiblings;
         }
         struct FraudProof {
             uint8 kind;
             uint256 targetNetIndex;
             IntentProof[] intents;
         }
-        event Commit(uint256 indexed epochId, bytes32 commitmentRoot, bytes32 revocationRoot, uint256 bondedAmount);
+        event Commit(uint256 indexed epochId, bytes32 commitmentRoot, bytes32 revocationRoot, bytes32 acceptanceRoot, uint64 sealedAt, uint256 bondedAmount);
         event Settled(uint256 indexed epochId, bytes32 nettingRoot, uint64 netCount);
         event ChallengeSucceeded(uint256 indexed epochId, address indexed challenger, uint8 kind);
+        /// P2-3：证明自洽但守卫判不成立（NotFraud 等）→ 驳回 + 押金销毁、epoch 不动。
+        event ChallengeRejected(uint256 indexed epochId, address indexed challenger, uint8 reason);
         event Claimed(uint256 indexed epochId, address indexed recipient, uint256 amount);
         /// P2-1 验证者读取面（TECH_SPEC §6.18.2）：自动 getter 对 struct 内数组成员整体
-        /// 省略（实测 ABI outputs 无 net[]）——本绑定只声明 getter 实际返回的 10 个字段。
+        /// 省略（实测 ABI outputs 无 net[]）。S-66 读面拆分：Epoch 13 字段后，13 元组单
+        /// getter 在 legacy codegen（forge coverage 关优化编译）超出栈上限不可编译（13
+        /// 个隐式返回槽恒活跃，最小 13 元组函数同爆，与函数体无关）→ 拆为 `epochs()`
+        /// （9 静态字段）+ `epochStatus()`（4 状态位）；验证者经 [`epoch_snapshot`]
+        /// （本文件）合并读取，下游消费面零迁移。
         struct EpochView {
             bytes32 commitmentRoot;
             bytes32 revocationRoot;
+            bytes32 acceptanceRoot;
+            uint64 sealedAt;
+            uint64 committedAt;
             uint256 bondedAmount;
             uint256 settlementFunded;
             uint64 settledAt;
             bytes32 nettingRoot;
+        }
+        struct EpochStatus {
             bool committed;
             bool settled;
             bool challenged;
             bool voided;
         }
-        function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot) external payable;
+        function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot, bytes32 acceptanceRoot, uint64 sealedAt) external payable;
         function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot) external payable;
         function claim(uint256 epochId, uint256 netIndex) external;
         function challenge(uint256 epochId, FraudProof calldata fp) external payable;
         function challengeBond() external view returns (uint256);
+        function operator() external view returns (address);
         function epochs(uint256 epochId) external view returns (EpochView memory);
+        function epochStatus(uint256 epochId) external view returns (EpochStatus memory);
     }
+}
+
+/// 验证者合并快照（拆分前 EpochView 全 13 字段同构：字段名/类型逐一保持，下游
+/// `view.xxx` 消费面零迁移）。
+#[derive(Debug, Clone)]
+pub struct EpochSnapshot {
+    pub commitment_root: B256,
+    pub revocation_root: B256,
+    pub acceptance_root: B256,
+    pub sealed_at: u64,
+    pub committed_at: u64,
+    pub bonded_amount: U256,
+    pub settlement_funded: U256,
+    pub settled_at: u64,
+    pub netting_root: B256,
+    pub committed: bool,
+    pub settled: bool,
+    pub challenged: bool,
+    pub voided: bool,
+}
+
+/// 验证者读面合并（S-66 拆分后的两次读合成）：`epochs()` + `epochStatus()`。
+pub async fn epoch_snapshot<P: Provider>(
+    settler: &IBatchSettler::IBatchSettlerInstance<&P>,
+    epoch_id: u64,
+) -> Result<EpochSnapshot> {
+    let id = U256::from(epoch_id);
+    let v = settler.epochs(id).call().await?;
+    let s = settler.epochStatus(id).call().await?;
+    Ok(EpochSnapshot {
+        commitment_root: v.commitmentRoot,
+        revocation_root: v.revocationRoot,
+        acceptance_root: v.acceptanceRoot,
+        sealed_at: v.sealedAt,
+        committed_at: v.committedAt,
+        bonded_amount: v.bondedAmount,
+        settlement_funded: v.settlementFunded,
+        settled_at: v.settledAt,
+        netting_root: v.nettingRoot,
+        committed: s.committed,
+        settled: s.settled,
+        challenged: s.challenged,
+        voided: s.voided,
+    })
 }
 
 pub const RPC_URL: &str = "http://127.0.0.1:8545";

@@ -26,10 +26,15 @@ const ACCEPTED: u64 = 1;
 const REJECTED: u64 = 2;
 
 /// 承诺格的一格（§6.3 步骤 A 的 L 条目）。
+///
+/// P2-3（§6.23）增 `accepted_at`：接受时刻（聚合器自派时钟的入口快照，定夺 2）——
+/// 平行接受树 `acceptance_root` 的叶输入（`acceptance_leaf(seq, accepted_at)`），承诺
+/// 「意图何时被接受」，kind3/kind4 守卫的时间下界锚。不改承诺叶原像（§6.20.1 否决路线 1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowEntry {
     pub seq: u64,
     pub intent_hash: [u8; 32],
+    pub accepted_at: u64,
 }
 
 /// 预留槽失败。
@@ -67,6 +72,7 @@ impl EpochWindow {
                 entry: UnsafeCell::new(WindowEntry {
                     seq: 0,
                     intent_hash: [0u8; 32],
+                    accepted_at: 0,
                 }),
                 state: AtomicU64::new(PENDING),
             })
@@ -115,18 +121,24 @@ impl EpochWindow {
             *self.slots[idx].entry.get() = WindowEntry {
                 seq: 0, // 占位；real seq 在 finalize 写入
                 intent_hash,
+                accepted_at: 0, // 同上；接受时刻在 finalize 写入
             };
         }
         self.slots[idx].state.store(PENDING, Ordering::Release);
         Ok(idx)
     }
 
-    /// 决定某槽的最终状态。accepted=true 时写入最终 seq 并入承诺；false 作废（seq 留空）。
-    /// 单写者：槽数据（含 seq）只在置 ACCEPTED 前被本线程写，密封者在读到 ACCEPTED 后才读。
-    pub fn finalize(&self, slot: usize, seq: u64, accepted: bool) {
+    /// 决定某槽的最终状态。accepted=true 时写入最终 seq 与接受时刻并入承诺；false 作废
+    ///（两者留空）。单写者：槽数据（seq/accepted_at）只在置 ACCEPTED 前被本线程写，密封者
+    /// 在读到 ACCEPTED 后才读。
+    ///
+    /// `accepted_at` = 摄取入口的 `now_fn()` 快照（§6.23.1 定夺 2，零新增热路径时钟读）。
+    pub fn finalize(&self, slot: usize, seq: u64, accepted_at: u64, accepted: bool) {
         if accepted {
             unsafe {
-                (*self.slots[slot].entry.get()).seq = seq;
+                let e = &mut *self.slots[slot].entry.get();
+                e.seq = seq;
+                e.accepted_at = accepted_at;
             }
         }
         self.slots[slot].state.store(
@@ -168,13 +180,14 @@ mod tests {
     fn single_accepted_entry_seals() {
         let w = EpochWindow::new(8);
         let slot = w.reserve([0xAB; 32]).unwrap();
-        w.finalize(slot, 1, true);
+        w.finalize(slot, 1, 1_700_000_001, true);
         let sealed = w.seal();
         assert_eq!(
             sealed,
             vec![WindowEntry {
                 seq: 1,
                 intent_hash: [0xAB; 32],
+                accepted_at: 1_700_000_001,
             }]
         );
     }
@@ -183,9 +196,9 @@ mod tests {
     fn rejected_entry_does_not_enter_commitment() {
         let w = EpochWindow::new(8);
         let good = w.reserve([0x01; 32]).unwrap();
-        w.finalize(good, 1, true);
+        w.finalize(good, 1, 1_700_000_001, true);
         let bad = w.reserve([0x02; 32]).unwrap();
-        w.finalize(bad, 0, false);
+        w.finalize(bad, 0, 0, false);
         let sealed = w.seal();
         assert_eq!(sealed.len(), 1);
         assert_eq!(sealed[0].seq, 1);
@@ -206,10 +219,11 @@ mod tests {
             let r = w.reserve([i as u8; 32]);
             match r {
                 Ok(slot) => {
-                    w.finalize(slot, i as u64 + 1, true);
+                    w.finalize(slot, i as u64 + 1, 1_700_000_000 + i as u64, true);
                     accepted.push(WindowEntry {
                         seq: i as u64 + 1,
                         intent_hash: [i as u8; 32],
+                        accepted_at: 1_700_000_000 + i as u64,
                     });
                 }
                 Err(AppendError::Full) => break,
@@ -234,7 +248,7 @@ mod tests {
                         let seq = (t * PER_THREAD + i) as u64 + 1;
                         let slot = w.reserve([seq as u8; 32]).unwrap();
                         // 一半接受一半拒绝，交错 finalize；seq 故意乱序给 finalize（单写者无碍）。
-                        w.finalize(slot, seq, i % 2 == 0);
+                        w.finalize(slot, seq, 1_700_000_000 + seq, i % 2 == 0);
                     }
                 })
             })
@@ -249,6 +263,7 @@ mod tests {
             .map(|seq| WindowEntry {
                 seq,
                 intent_hash: [seq as u8; 32],
+                accepted_at: 1_700_000_000 + seq,
             })
             .collect();
         assert_eq!(sealed.len(), THREADS * PER_THREAD / 2);
@@ -259,7 +274,7 @@ mod tests {
     fn seal_is_idempotent() {
         let w = EpochWindow::new(8);
         let s = w.reserve([0xAB; 32]).unwrap();
-        w.finalize(s, 1, true);
+        w.finalize(s, 1, 1_700_000_001, true);
         let a = w.seal();
         let b = w.seal();
         assert_eq!(a, b);

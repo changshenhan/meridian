@@ -12,8 +12,8 @@
 |---|---|---|
 | `BatchSettler.sol` | 持有结算资金（原生 ETH 或 USDC/ERC-20）+ 运营者债券 | **高** |
 | `IntentHelper.sol` / `Merkle.sol` | 欺诈证明的 sha256 Merkle 交叉实现 | 高（安全性依赖与 Rust 侧逐字节一致） |
-| `DSA.sol` | 委托登记 + 运营者绑定面（S-62：`dh → operator` 独立映射，owner 私钥一次性写入不可改绑；登记/绑定错误 → 支付路由错分片或闸被伪装绕过） | 中 |
-| `RevocationRegistry.sol` | 撤销锚点 | 中 |
+| `DSA.sol` | 委托登记 + 运营者绑定面（S-62：`dh → operator` 独立映射，owner 私钥一次性写入不可改绑；S-66：`boundAt` 绑定时刻锚，kind4 守卫输入；登记/绑定错误 → 支付路由错分片或闸被伪装绕过） | 中 |
+| `RevocationRegistry.sol` | 撤销锚点（S-66：`revokedAt` 撤销时刻锚，kind3 守卫输入） | 中 |
 | `OperatorRegistry.sol`（S-64，P2-4） | 金额调度 + 运营者名册（**不持有资金**、无写状态外呼）；registrar 写面决定未来部署的债券/押金起点值（在役实例判定面不可触） | 低 |
 
 链下交叉一致性（第二审计对象）：
@@ -36,6 +36,13 @@
 4. **欺诈证明 soundness**：漏单/低付两类证明无假阳性路径（`DuplicateIntent`、
    跨收款人 `BadFraudKind`、`leafIndex < acceptedCount`、siblings 深度匹配）；诚实
    运营者提交自洽 net[] **不可**被构陷（重点 fuzz）。
+10. **接受锚面（S-66，TECH_SPEC §6.23）**：kind3（已撤销消费）/ kind4（跨分片消费）
+   均单意图（计数闸）且需**双树包含**（承诺树 ∧ 接受树，缺一即 `BadInclusionProof`）；
+   时间守卫 `事件时刻 + ACCEPT_MARGIN(300) ≤ acceptedAt`（等号可罚）；kind4 三态
+   fail-open（未绑定/绑本合约 operator 不罚）；接受叶 `acceptanceLeaf(seq, acceptedAt)`
+   与 Rust `merkle::acceptance_leaf` 逐字节一致（差分第五契约）；构造期锚守卫
+   （`ZeroAnchor` / `DsaMismatch`）；零值哨兵（`revokedAt = 0` / `boundAt = 0` /
+   `acceptedAt = 0`）一律不罚（绝不因缺锚被反向定罪）。
 5. **资产模式隔离**：token 模式强制 `msg.value == 0`；ETH 模式不走 `transferFrom`；
    退款/claim 付的资产与 `asset` 一致；债券恒原生 ETH 不受 asset 影响。
 6. **重放/延展性**：`registerDelegation` 低位 s 强制；delegation_hash 碰撞面；
@@ -98,14 +105,19 @@
   （L4）缓解，本闸不防；② **存量未绑定委托 fail-open**（决策 B 有意取舍）：绑定面上线前
   已注册的委托不受摄取闸约束，事后**首绑**可收窄残余（不必重注册，预算不重置）但补绑
   前的在途消费不回溯；③ 聚合器绑定读数缓存**进程内不持久化**且不可变语义（补绑对本
-  进程不可见直至重启——链上是事实源，方向安全）；④ 跨分片双花的密码学封堵
-  （P2-3 事后欺诈 kind）未上线，绑定闸只挡「绑他方的后续意图」。
+  进程不可见直至重启——链上是事实源，方向安全）；④ 跨分片双花的密码学封堵**已上线**
+  （S-66，kind4 + 平行接受锚 acceptanceRoot，TECH_SPEC §6.23；方案老板 2026-08-31 确认）
+  ——绑他方运营者且 `boundAt + ACCEPT_MARGIN ≤ acceptedAt` 的消费可被 kind4 证明罚没。
+- **接受锚诚实边界自报（S-66）**：接受树是**运营者自证事实**（§6.20.3）——故意回填
+  接受时刻可逃逸 kind3/kind4（与绑定合谋同层，留治理/声誉面）；本砖把**过失**（撤销
+  观察滞后 / 绑定闸失灵）变为可证，不宣称防「故意」。旧格式 WAL（116B）恢复的尾部
+  `accepted_at = 0` 哨兵：kind3/4 不可出证（检出率损失非正确性损失）。
 
 ## 5. 测试与证据基线（S-58 对齐至 2026-08-31，commit 见 git log）
 
 **合约面（forge）**：
 
-- forge **109/109**（S-38 押金制负向组改 `_challengeRejected` 断言；S-50 押金参数化 2 例；
+- forge **130/130**（S-38 押金制负向组改 `_challengeRejected` 断言；S-50 押金参数化 2 例；
   S-58 覆盖缺口 6 例：claim push 失败回滚可重试 / 挑战者拒收赔付整笔回滚 / kind1 多意图
   → BadFraudKind / kind2 目标行越界 / kind2 混入伪造意图 → BadInclusionProof /
   withdrawRefund push 失败可重试；S-62 绑定面 7 例：成功 + 事件 / 未注册 / 非 owner /
@@ -113,14 +125,19 @@
   正/负向（零 registrar / 非 registrar / 两种零金额分支 / 空调度读数 / 追加历史不可变）
   + 名册正/负向（成功快照回读 / 非 operator / EOA settler / 重复 settler / 同 operator
   多实例）/ 决策 D 全链流（v1→实例1→v2→实例2 各持其部署版本）；USDC 套件含 false 返回
-  与 revert 冒泡两种 token 失败语义）。
+  与 revert 冒泡两种 token 失败语义；S-66 接受锚 20 例：commit 扩展面 + kind3/kind4
+  正负向（未绑定零地址 / 绑本合约 operator / 事件前接受不罚）/ 多意图计数闸 / margin
+  边界（事件时刻 + 300 == acceptedAt 可罚、−1 不可罚）/ 双树负向（伪造金额倒承诺面 /
+  回填 acceptedAt 倒接受面 / 接受路径深度错）/ 构造期 `ZeroAnchor` · `DsaMismatch` /
+  旧格式 WAL 哨兵不可罚）。
 - **invariant fuzz**（2026-08-31，四步路径 ②）：`test/BatchSettlerInvariant.t.sol`
   64 runs × depth 256，三条全局不变量（资金守恒 ghost 记账 / 状态机单调 / voided 后
   claim 必拒），handler 覆盖 commit/settle 三模式/窗口内双路挑战/warp 过窗 claim。
-- **跨实现差分 fuzz**（S-57，四步路径 ③）：Rust 生产实现批量产 140 golden vectors →
-  forge 镜像四契约逐条比对（intent_hash ×64 / DSA owner 切片 ×32 / Merkle 树·根·证明·
-  深度 / nettingRoot 编码**字节级** ×16），第三实现 Python 独立重算交叉确认；fixture
-  漂移闸（verify.sh 8b）。
+- **跨实现差分 fuzz**（S-57 立四契约，S-66 扩第五契约，四步路径 ③）：Rust 生产实现批量产
+  148 golden vectors → forge 镜像五契约逐条比对（intent_hash ×64 / DSA owner 切片 ×32 /
+  Merkle 树·根·证明·深度 / nettingRoot 编码**字节级** ×16 / acceptanceLeaf ×8——接受锚
+  叶规范 `"ACCV1\0" ‖ seq_le(8) ‖ acceptedAt_le(8)`，TECH_SPEC §6.20.2），第三实现
+  Python 独立重算交叉确认；fixture 漂移闸（verify.sh 8b）。
 - **分支覆盖门禁**（S-58，四步路径 ④）：`scripts/coverage_gate.sh`（verify.sh 8c +
   CI solidity job）——src 全合约行/函数 100%、分支 100%，唯一豁免 BatchSettler 1 条
   结构不可达边（押金销毁 `require(okBurn)` 失败边，代码注释 + slither 报告定性）。
@@ -133,9 +150,11 @@
 **链上面**：
 
 - anvil rust-smoke 三场景 e2e（快乐路径/撤销/欺诈挑战）+ m1_demo 10 万笔端到端
-  （verify.sh 步 10；CI 同款 alloy smoke）+ verifier_drill 三幕验证者挑战演练
-  （S-61，镜像复算检出 → challenge 全链：诚实静默 / kind1 漏单 / kind2 低付；
-  零合约改动，对账口径见 TECH_SPEC §6.18.6）。
+  （verify.sh 步 10；CI 同款 alloy smoke）+ verifier_drill 五幕验证者挑战演练
+  （S-61 立三幕，S-66 扩至五幕 + 声誉面核对两幕：诚实静默 / kind1 漏单 / kind2 低付 /
+  kind3 已撤销消费正负向 / kind4 跨分片消费正负向——错账注入点 = 聚合器撤销观察缺席 /
+  绑定闸未装配，朴素证明被链上守卫驳回（§6.20.1 抽债券向量链上死亡）+ 幕 4/7 monitor
+  声誉面解码与链上事件同实态；演练本体零合约改动，对账口径见 TECH_SPEC §6.18.6）。
 - 运营者绑定闸（S-62）：聚合器三态判定单测（绑他拒 / 未绑定与自绑放行 / 读失败
   fail-closed 不进缓存 / 不可变读缓存 / 缺省无闸口径不变）+ gateway 侧 fake JSON-RPC
   socket e2e（真实 HTTP/1.1 往返：三态 × 短返回 × RPC error × 连接不可得，selector

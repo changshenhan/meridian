@@ -15,11 +15,11 @@ use std::collections::BTreeMap;
 
 use crate::rpc::JsonRpc;
 
-/// `Commit(uint256,bytes32,bytes32,uint256)` topic0。
-/// 独立锚定：`cast keccak "Commit(uint256,bytes32,bytes32,uint256)"`（见测试）。
+/// `Commit(uint256,bytes32,bytes32,bytes32,uint64,uint256)` topic0。
+/// 独立锚定：`cast keccak "Commit(uint256,bytes32,bytes32,bytes32,uint64,uint256)"`（见测试）。
 pub const TOPIC_COMMIT: [u8; 32] = [
-    0x3b, 0xb7, 0xa5, 0x8d, 0x7b, 0xa9, 0xc3, 0xde, 0x7d, 0x74, 0xdc, 0xa6, 0xaf, 0xfc, 0xfc, 0x59,
-    0x9d, 0xba, 0x99, 0xc4, 0x53, 0x42, 0x7f, 0xd3, 0x59, 0x5a, 0x07, 0x4a, 0x7a, 0x0f, 0xca, 0x8a,
+    0xed, 0x84, 0x0f, 0xad, 0x31, 0x01, 0xe0, 0xe2, 0x4a, 0xe3, 0xa3, 0xb4, 0xac, 0x6e, 0x3e, 0x01,
+    0xcb, 0xa6, 0x15, 0x9d, 0x58, 0x23, 0x15, 0x60, 0x8e, 0xff, 0x3c, 0xe3, 0x6f, 0xff, 0xdb, 0xe0,
 ];
 /// `Settled(uint256,bytes32,uint64)` topic0。
 pub const TOPIC_SETTLED: [u8; 32] = [
@@ -82,8 +82,10 @@ impl ReputationSnapshot {
             .first()
             .ok_or_else(|| "log without topics".to_string())?;
         if *t0 == TOPIC_COMMIT {
-            // topics = [t0, epochId]；data = commitmentRoot(32) + revocationRoot(32) + bondedAmount(32)
-            if log.topics.len() != 2 || log.data.len() != 96 {
+            // topics = [t0, epochId]；data = commitmentRoot(32) + revocationRoot(32) +
+            // acceptanceRoot(32) + sealedAt(32) + bondedAmount(32)（P2-3 起五字 160B，
+            // 金额字是最后一个）。
+            if log.topics.len() != 2 || log.data.len() != 160 {
                 return Err(format!(
                     "Commit log shape: topics={} data={}B",
                     log.topics.len(),
@@ -92,7 +94,7 @@ impl ReputationSnapshot {
             }
             self.bond_committed_wei = self
                 .bond_committed_wei
-                .checked_add(word_to_u128(&log.data[64..96])?)
+                .checked_add(word_to_u128(&log.data[128..160])?)
                 .ok_or_else(|| "bond_committed_wei overflow".to_string())?;
             self.epochs_committed += 1;
         } else if *t0 == TOPIC_SETTLED {
@@ -304,7 +306,7 @@ mod tests {
     fn topic0_constants_match_cast_anchors() {
         // 独立锚定：`cast keccak "<sig>"`（foundry keccak，与 EVM 同算法）。
         assert_eq!(
-            topic0("Commit(uint256,bytes32,bytes32,uint256)"),
+            topic0("Commit(uint256,bytes32,bytes32,bytes32,uint64,uint256)"),
             TOPIC_COMMIT
         );
         assert_eq!(topic0("Settled(uint256,bytes32,uint64)"), TOPIC_SETTLED);
@@ -318,15 +320,29 @@ mod tests {
     #[test]
     fn accumulates_all_four_event_kinds() {
         let mut s = ReputationSnapshot::default();
-        // Commit ×2（债券 1 ETH + 0.5 ETH）。
+        // Commit ×2（债券 1 ETH + 0.5 ETH）。P2-3 起 data 五字：承诺根/撤销根/接受根/sealedAt/金额。
         s.apply_log(&Log {
             topics: vec![TOPIC_COMMIT, t32(0)],
-            data: [hash_word(1), hash_word(2), word(1_000_000_000_000_000_000)].concat(),
+            data: [
+                hash_word(1),
+                hash_word(2),
+                hash_word(3),
+                word(1_700_000_000),
+                word(1_000_000_000_000_000_000),
+            ]
+            .concat(),
         })
         .unwrap();
         s.apply_log(&Log {
             topics: vec![TOPIC_COMMIT, t32(1)],
-            data: [hash_word(3), hash_word(4), word(500_000_000_000_000_000)].concat(),
+            data: [
+                hash_word(4),
+                hash_word(5),
+                hash_word(6),
+                word(1_700_000_060),
+                word(500_000_000_000_000_000),
+            ]
+            .concat(),
         })
         .unwrap();
         // Settled ×1。
@@ -392,9 +408,9 @@ mod tests {
         });
         assert!(r.is_err());
         // Commit 金额超 u128 值域 → Err（截断 = 静默低估，洗白方向）。
-        //（金额是 data 第三个字 [64..96]；前 32B 是 commitmentRoot，写那里不触发。）
-        let mut data = vec![0u8; 96];
-        data[64] = 0xFF;
+        //（金额是 data 末字 [128..160]；前 32B 是 commitmentRoot，写那里不触发。）
+        let mut data = vec![0u8; 160];
+        data[128] = 0xFF;
         let r = s.apply_log(&Log {
             topics: vec![TOPIC_COMMIT, t32(0)],
             data,
@@ -523,9 +539,11 @@ mod tests {
                                 format!("0x{}", hex::encode(t32(0)))
                             ],
                             "data": format!(
-                                "0x{}{}{}",
+                                "0x{}{}{}{}{}",
                                 hex::encode(hash_word(1)),
                                 hex::encode(hash_word(2)),
+                                hex::encode(hash_word(3)),
+                                hex::encode(word(1_700_000_000)),
                                 hex::encode(word(1_000_000_000_000_000_000u128))
                             )
                         },

@@ -53,7 +53,9 @@ contract OperatorRegistry {
     mapping(address => uint256) public settlerCount;
 
     event ScheduleAppended(uint256 indexed index, uint256 bond, uint256 challengeBond);
-    event OperatorRegistered(address indexed operator, address indexed settler, uint256 challengeBond);
+    event OperatorRegistered(
+        address indexed operator, address indexed settler, uint256 challengeBond
+    );
 
     error ZeroRegistrar();
     error NotRegistrar();
@@ -75,7 +77,11 @@ contract OperatorRegistry {
     function appendSchedule(uint256 bond, uint256 challengeBond) external {
         if (msg.sender != registrar) revert NotRegistrar();
         if (bond == 0 || challengeBond == 0) revert ZeroScheduleAmount();
-        schedule.push(ScheduleEntry({bond: bond, challengeBond: challengeBond, writtenAt: uint64(block.timestamp)}));
+        schedule.push(
+            ScheduleEntry({
+                bond: bond, challengeBond: challengeBond, writtenAt: uint64(block.timestamp)
+            })
+        );
         emit ScheduleAppended(schedule.length - 1, bond, challengeBond);
     }
 

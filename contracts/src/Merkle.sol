@@ -22,6 +22,26 @@ library Merkle {
         return sha256(b);
     }
 
+    /// 接受锚叶前缀（"ACCV1\0"，P2-3 §6.20.2/§6.23——与 aggregator/src/merkle.rs
+    /// `ACCEPTANCE_LEAF_PREFIX` 同一字节序列）。
+    bytes6 constant ACCEPTANCE_LEAF_PREFIX = 0x414343563100;
+
+    /// 接受锚叶（P2-3 §6.23）= sha256("ACCV1\0" ‖ seq_le(8) ‖ acceptedAt_le(8))，22B 原像。
+    /// 平行接受树与承诺树同叶集同序（seq 升序），单独锚定「意图何时被接受」；kind3/kind4
+    /// 守卫先验 `acceptanceInclusion`（本叶 ∈ Epoch.acceptanceRoot）再验时刻下界。
+    /// S-57 差分闸第三契约扩展：与 `merkle::acceptance_leaf` 逐字节对齐（Differential.t.sol）。
+    function acceptanceLeaf(uint64 seq, uint64 acceptedAt) internal pure returns (bytes32) {
+        bytes memory b = new bytes(22);
+        for (uint256 i = 0; i < 6; i++) {
+            b[i] = ACCEPTANCE_LEAF_PREFIX[i];
+        }
+        for (uint256 i = 0; i < 8; i++) {
+            b[6 + i] = bytes1(uint8(seq >> (8 * i)));
+            b[14 + i] = bytes1(uint8(acceptedAt >> (8 * i)));
+        }
+        return sha256(b);
+    }
+
     /// next_power_of_two（空输入按 1）。
     function nextPowerOfTwo(uint256 n) internal pure returns (uint256) {
         if (n == 0) return 1;

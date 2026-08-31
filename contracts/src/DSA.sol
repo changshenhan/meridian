@@ -20,7 +20,9 @@ pragma solidity ^0.8.24;
 ///      不可改绑——改绑窗口内旧账本在途消费不可回滚 = 双花面；迁移 = 撤销 + 重注册）。
 contract DSA {
     event DelegationRegistered(bytes32 indexed delegationHash, address indexed owner);
-    event OperatorBound(bytes32 indexed delegationHash, address indexed owner, address indexed operator);
+    event OperatorBound(
+        bytes32 indexed delegationHash, address indexed owner, address indexed operator
+    );
 
     /// 已注册委托：delegation_hash -> owner。
     mapping(bytes32 => address) public owners;
@@ -28,6 +30,13 @@ contract DSA {
     /// 运营者绑定（S-62）：delegation_hash -> operator。零地址 = 未绑定（聚合器
     /// 摄取绑定闸 fail-open 的链上事实源，TECH_SPEC §6.19.2）。
     mapping(bytes32 => address) public operators;
+
+    /// 运营者绑定时刻（P2-3 §6.20.2/§6.23）：delegation_hash -> 绑定发生时的
+    /// block.timestamp。一次性写——`bindOperator` 的 `AlreadyBound` 守卫保证本映射只在
+    /// 首绑写入一次，绑定不可改 ⇒ 时刻随之不可变。kind4（跨分片消费）守卫的时间下界锚
+    /// （`boundAt(dh) + ACCEPT_MARGIN <= acceptedAt`）；零值 = 未绑定（与 operators 零地址
+    /// 同语义，§6.19.2 fail-open 三态）。
+    mapping(bytes32 => uint64) public boundAt;
 
     /// secp256k1 群阶的一半（低位 s 判据，OpenZeppelin ECDSA 同款常量）。
     uint256 private constant SECP256K1N_HALF =
@@ -95,6 +104,8 @@ contract DSA {
         if (operators[delegationHash] != address(0)) revert AlreadyBound(delegationHash);
 
         operators[delegationHash] = operator;
+        // P2-3 §6.23：绑定时刻（kind4 守卫锚）。首绑一次性写（上面 AlreadyBound 保证）。
+        boundAt[delegationHash] = uint64(block.timestamp);
         emit OperatorBound(delegationHash, owner, operator);
     }
 

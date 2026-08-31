@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use meridian_core::error::Error;
 use sha3::{Digest, Keccak256};
 
-use crate::merkle::{leaf, merkle_root};
+use crate::merkle::{acceptance_leaf, leaf, merkle_root};
 use crate::window::WindowEntry;
 
 /// 意图解析：intent_hash → (recipient, amount)。`aggregate` / `build_epoch` 用它把已密封
@@ -39,6 +39,9 @@ pub struct EpochResult {
     /// 本 epoch 承诺时的撤销根（`RevocationSet::sparse_root` 快照；单独锚定，不并入承诺树，
     /// 避免破坏承诺根的叶索引——S-11 决策）。
     pub revocation_root: [u8; 32],
+    /// 平行接受树根（P2-3 §6.23）：与承诺树同叶集同序（seq 升序），叶 =
+    /// `acceptance_leaf(seq, accepted_at)`——单独锚定「意图何时被接受」，不并入承诺叶原像。
+    pub acceptance_root: [u8; 32],
     pub net: Vec<NetLine>,
     pub netting_root: [u8; 32],
 }
@@ -50,6 +53,7 @@ pub trait ChainPublisher {
         epoch_id: u64,
         commitment_root: [u8; 32],
         revocation_root: [u8; 32],
+        acceptance_root: [u8; 32],
         sealed_at: u64,
     ) -> Result<(), Error>;
     fn settle(&self, epoch_id: u64, netting_root: [u8; 32], net_count: u64) -> Result<(), Error>;
@@ -65,6 +69,7 @@ impl ChainPublisher for NoopPublisher {
         _epoch_id: u64,
         _commitment_root: [u8; 32],
         _revocation_root: [u8; 32],
+        _acceptance_root: [u8; 32],
         _sealed_at: u64,
     ) -> Result<(), Error> {
         Ok(())
@@ -82,6 +87,17 @@ impl ChainPublisher for NoopPublisher {
 /// 步骤 B：承诺根 = sha256 merkle over L。L 由 `seal()` 保证按 seq 升序。
 pub fn commitment_root(entries: &[WindowEntry]) -> [u8; 32] {
     let leaves: Vec<[u8; 32]> = entries.iter().map(|e| leaf(e.seq, e.intent_hash)).collect();
+    merkle_root(&leaves)
+}
+
+/// 平行接受树根（P2-3 §6.23）：`merkle_root(entries.map(acceptance_leaf(seq, accepted_at)))`。
+/// 与承诺树同叶集同序（同一 `seal()` 输出）⇒ 链上两树共享 `leafIndex`/`acceptedCount`/深度，
+/// kind3/4 守卫复用同一包含证明骨架。
+pub fn acceptance_root(entries: &[WindowEntry]) -> [u8; 32] {
+    let leaves: Vec<[u8; 32]> = entries
+        .iter()
+        .map(|e| acceptance_leaf(e.seq, e.accepted_at))
+        .collect();
     merkle_root(&leaves)
 }
 
@@ -144,6 +160,7 @@ pub fn build_epoch(
     revocation_root: [u8; 32],
 ) -> Option<EpochResult> {
     let commitment_root = commitment_root(entries);
+    let acceptance_root = acceptance_root(entries);
     let ordered = reorder(entries);
     let net = aggregate(&ordered, resolve)?;
     let netting_root = netting_root(&net);
@@ -152,6 +169,7 @@ pub fn build_epoch(
         sealed_at,
         commitment_root,
         revocation_root,
+        acceptance_root,
         net,
         netting_root,
     })
@@ -166,6 +184,7 @@ mod tests {
         WindowEntry {
             seq,
             intent_hash: ih,
+            accepted_at: 1_700_000_000 + seq,
         }
     }
 
@@ -229,6 +248,38 @@ mod tests {
         // 顺序敏感：seq 序变 → 根变。
         let shuffled = vec![entries[2], entries[0], entries[1]];
         assert_ne!(r1, commitment_root(&shuffled));
+    }
+
+    /// 平行接受树根（P2-3 §6.23）：逐叶复算对账 + 字段敏感性 + 与承诺树独立（同叶集
+    /// 不同叶规范 ⇒ 两根必然不同）。
+    #[test]
+    fn acceptance_root_reproducible_and_independent_of_commitment() {
+        let entries = vec![
+            entry(1, [0x11; 32]),
+            entry(2, [0x22; 32]),
+            entry(3, [0x33; 32]),
+        ];
+        let a1 = acceptance_root(&entries);
+        let a2 = acceptance_root(&entries);
+        assert_eq!(a1, a2);
+        // 逐叶独立重算（第三实现锚：直接按 22B 原像重建再 merkle_root）。
+        let leaves: Vec<[u8; 32]> = (1..=3u64)
+            .map(|s| acceptance_leaf(s, 1_700_000_000 + s))
+            .collect();
+        assert_eq!(a1, merkle_root(&leaves));
+        // accepted_at 变 → 根变（时刻锚的字段敏感性）。
+        let shifted: Vec<WindowEntry> = entries
+            .iter()
+            .map(|e| WindowEntry {
+                accepted_at: e.accepted_at + 1,
+                ..*e
+            })
+            .collect();
+        assert_ne!(a1, acceptance_root(&shifted));
+        // 与承诺树同叶集同序但叶规范不同 ⇒ 两根独立（单独锚定不并入承诺叶原像）。
+        assert_ne!(a1, commitment_root(&entries));
+        // 空窗口 = EMPTY_LEAF（与 merkle_root(&[]) 一致）。
+        assert_eq!(acceptance_root(&[]), crate::merkle::EMPTY_LEAF);
     }
 
     /// 确定性重排：按 intent_hash 升序，同 seed 两跑一致。
@@ -305,5 +356,8 @@ mod tests {
         assert_eq!(a.revocation_root, [0xAB; 32]);
         assert_eq!(a.netting_root, b.netting_root);
         assert_eq!(a.net, b.net);
+        // 接受锚随 build_epoch 同批产出（P2-3 §6.23），确定性同口径。
+        assert_eq!(a.acceptance_root, b.acceptance_root);
+        assert_eq!(a.acceptance_root, acceptance_root(&entries));
     }
 }

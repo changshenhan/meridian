@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Elastic-2.0
 pragma solidity ^0.8.24;
 
+import {DSA} from "./DSA.sol";
 import {IntentHelper} from "./IntentHelper.sol";
 import {Merkle} from "./Merkle.sol";
+import {RevocationRegistry} from "./RevocationRegistry.sol";
 
 /// @title BatchSettler —— 乐观批量结算（TECH_SPEC §6.4-6.5, §7）
 /// @notice 结算节奏（§6.3）：运营者把 epoch 承诺根上链（commit，质押债券）→ 确定性重排后
@@ -40,6 +42,16 @@ contract BatchSettler {
     struct Epoch {
         bytes32 commitmentRoot;
         bytes32 revocationRoot;
+        /// 平行接受树根（P2-3 §6.20.2/§6.23）：与承诺树同叶集同序（seq 升序），叶 =
+        /// `Merkle.acceptanceLeaf(seq, acceptedAt)`。单独锚定「意图何时被接受」，
+        /// 与撤销根同款「不并入承诺树」（不破坏承诺叶索引，S-11 决策）。
+        bytes32 acceptanceRoot;
+        /// 运营者声明的密封时刻（§6.23.1 定夺 5）：观测面字段——与 `committedAt` 的有序窗
+        /// 核对在离线比对器做，**不进合约判定**（判定面 require 它会对自派时钟超前链钟的
+        /// 诚实运营者构成可用性陷阱，而对回填逃逸方向无约束力）。
+        uint64 sealedAt;
+        /// commit 时刻（链上写定）：观测面上界锚（sealedAt ≤ committedAt 由离线比对器核对）。
+        uint64 committedAt;
         uint256 bondedAmount;
         uint256 settlementFunded;
         uint64 settledAt;
@@ -52,7 +64,7 @@ contract BatchSettler {
         bool voided;
     }
 
-    /// 欺诈证明中的一条已提交意图（明文 + 承诺格包含位置）。
+    /// 欺诈证明中的一条已提交意图（明文 + 承诺格包含位置 + 接受锚包含位置）。
     struct IntentProof {
         bytes20 agent;
         bytes32 delegationHash;
@@ -62,16 +74,25 @@ contract BatchSettler {
         uint64 spendNonce;
         bytes memo;
         uint64 expiresAt;
+        /// 接受时刻锚（P2-3 §6.23）：聚合器自派时钟的入口快照，链上由平行接受树承诺。
+        /// kind1/kind2 不消费（向后兼容的证据形状）；kind3/kind4 的时间守卫输入。
+        uint64 acceptedAt;
         uint64 seq;
         uint256 leafIndex;
         uint256 acceptedCount;
+        /// 承诺树兄弟路径（自底层向上）。
         bytes32[] siblings;
+        /// 接受树兄弟路径（P2-3 §6.23.1 定夺 6）：两树同叶序 ⇒ 同 `leafIndex` /
+        /// `acceptedCount` / 同深度，仅叶规范与根不同。
+        bytes32[] acceptanceSiblings;
     }
 
     /// 欺诈证明：kind 1 = 漏单（一条已提交意图，其收款人不在 net[]）；kind 2 = 低付
-    /// （同一收款人的已提交意图子集，uint256 和 > net[targetNetIndex].amount）。
-    /// sound：sha256 原像绑定 + 承诺格包含性；单调子集无需完备性。两个防假阳性硬守卫：
-    /// 同笔意图重复计入（DuplicateIntent）+ 跨收款人子集（BadFraudKind）。
+    /// （同一收款人的已提交意图子集，uint256 和 > net[targetNetIndex].amount）；
+    /// kind 3 = 已撤销消费（一条已提交意图，其委托在 acceptedAt − margin 之前已撤销，
+    /// P2-3 §6.20.2）；kind 4 = 跨分片消费（委托绑在他方运营者名下且 boundAt + margin
+    /// ≤ acceptedAt 仍被本账本接受）。kind1/kind2 单调子集无需完备性；kind3/kind4 均
+    /// 单意图（BadFraudKind 计数闸，kind1 同款）。
     struct FraudProof {
         uint8 kind;
         uint256 targetNetIndex; // kind 2 用
@@ -82,6 +103,8 @@ contract BatchSettler {
         uint256 indexed epochId,
         bytes32 commitmentRoot,
         bytes32 revocationRoot,
+        bytes32 acceptanceRoot,
+        uint64 sealedAt,
         uint256 bondedAmount
     );
     event Settled(uint256 indexed epochId, bytes32 nettingRoot, uint64 netCount);
@@ -128,6 +151,12 @@ contract BatchSettler {
     // 审计加固：结算资金拉取兜底（挑战成功时退款 push 失败的留存量，仅 voided epoch 可取）。
     error EpochNotVoided(uint256 epochId);
     error NothingToRefund(uint256 epochId);
+    // P2-3 §6.23.1 定夺 7：kind3/kind4 守卫要读 DSA（boundAt/operatorOf）与
+    // RevocationRegistry（revokedAt）的事件时刻锚——缺依赖 = 守卫静默失效面伪装，构造期拒。
+    error ZeroAnchor();
+    // 部署配置错误：注册表自身也指向 DSA（RevocationRegistry.dsa），两指针失配 = 撤销
+    // 时刻锚与运营者绑定锚取自两套注册面，构造期暴露。
+    error DsaMismatch();
 
     /// 挑战窗口：settle 后 6 小时内可挑战（TECH_SPEC §6.5）。
     uint256 public constant CHALLENGE_WINDOW = 6 hours;
@@ -140,21 +169,50 @@ contract BatchSettler {
     /// 复活垃圾挑战），比金额过时严重得多。`== 0` 构造即 revert（`ZeroChallengeBond`）。
     uint256 public immutable challengeBond;
 
+    /// P2-3 §6.20.2/§6.23.1 定夺 3：接受时刻余量（秒，协议常量，无 setter，Rust/合约两侧
+    /// 同值）。覆盖运营者自身 RPC 读陈旧 / 撤销观察滞后——kind3/kind4 守卫要求「事件时刻 +
+    /// margin ≤ acceptedAt」，太小时正常传播期内的诚实接受被罚（假阳性回归），太大时过失
+    /// 免罚窗口变宽。300s ≈ 2 个数量级于本地同步传播（S-59 实测 ~0s）、~18× 于链上事件
+    /// 路径（块时 + 轮询 ~17s），同时 << CHALLENGE_WINDOW（6h）。推定缺省非实测标定，
+    /// 重定夺走重部署（immutable）。
+    uint256 public constant ACCEPT_MARGIN = 300;
+
     /// 唯一结算运营者：commit/settle 的唯一合法调用者（S-11 防 griefing）。
     address public immutable operator;
     /// S-28 结算资产：`address(0)` = 原生 ETH（v2 行为）；否则为 ERC-20（如 USDC）。
     /// 债券（commit 的 `msg.value`）恒为原生 ETH，与结算资产无关。
     address public immutable asset;
+    /// P2-3：kind4 守卫的运营者绑定锚（`DSA.boundAt` / `DSA.operatorOf`）。
+    DSA public immutable dsa;
+    /// P2-3：kind3 守卫的撤销时刻锚（`RevocationRegistry.revokedAt`）。
+    RevocationRegistry public immutable revocations;
 
-    mapping(uint256 => Epoch) public epochs;
+    /// 存储本体（S-66 读面拆分：不再 public 自动 getter——Epoch 13 字段后，自动 getter
+    /// 的 13 元组返回在 legacy codegen（forge coverage 关优化编译）恒爆栈：13 个隐式
+    /// 返回槽恒活跃，最小 13 元组函数亦不可编译，与函数体无关 → 读面拆分为
+    /// [`epochs`]（9 静态字段）+ [`epochStatus`]（4 状态位）。内部引用经 epochsById。
+    mapping(uint256 => Epoch) internal epochsById;
 
-    constructor(address operator_, address asset_, uint256 challengeBond_) {
+    constructor(
+        address operator_,
+        address asset_,
+        uint256 challengeBond_,
+        DSA dsa_,
+        RevocationRegistry revocations_
+    ) {
         if (operator_ == address(0)) revert ZeroOperator();
         operator = operator_;
         // slither-disable-next-line missing-zero-check（故意：asset=address(0) 是合法哨兵，= 原生 ETH 模式，S-28）
         asset = asset_;
         if (challengeBond_ == 0) revert ZeroChallengeBond();
         challengeBond = challengeBond_;
+        if (dsa_ == DSA(address(0)) || revocations_ == RevocationRegistry(address(0))) {
+            revert ZeroAnchor();
+        }
+        // 交叉核对：注册表自身也指向 DSA，两指针必须同一注册面（部署配置错误构造期暴露）。
+        if (revocations_.dsa() != dsa_) revert DsaMismatch();
+        dsa = dsa_;
+        revocations = revocations_;
     }
 
     modifier onlyOperator() {
@@ -162,19 +220,26 @@ contract BatchSettler {
         _;
     }
 
-    /// 运营者提交承诺根 + 撤销根并质押债券（msg.value）。同一 epoch 只允许一次。
-    function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot)
-        external
-        payable
-        onlyOperator
-    {
-        Epoch storage ep = epochs[epochId];
+    /// 运营者提交承诺根 + 撤销根 + 接受锚根并质押债券（msg.value）。同一 epoch 只允许一次。
+    /// `sealedAt` 是运营者声明的密封时刻（观测面，定夺 5——不进判定面，无 require）；
+    /// `committedAt` 由本合约以 `block.timestamp` 写定。
+    function commit(
+        uint256 epochId,
+        bytes32 commitmentRoot,
+        bytes32 revocationRoot,
+        bytes32 acceptanceRoot,
+        uint64 sealedAt
+    ) external payable onlyOperator {
+        Epoch storage ep = epochsById[epochId];
         if (ep.committed) revert EpochAlreadyCommitted(epochId);
         ep.committed = true;
         ep.commitmentRoot = commitmentRoot;
         ep.revocationRoot = revocationRoot;
+        ep.acceptanceRoot = acceptanceRoot;
+        ep.sealedAt = sealedAt;
+        ep.committedAt = uint64(block.timestamp);
         ep.bondedAmount = msg.value;
-        emit Commit(epochId, commitmentRoot, revocationRoot, msg.value);
+        emit Commit(epochId, commitmentRoot, revocationRoot, acceptanceRoot, sealedAt, msg.value);
     }
 
     /// 结算：nettingRoot 必须与 net[] 的链式 keccak 一致（S-10 对齐，逐字节）。
@@ -186,7 +251,7 @@ contract BatchSettler {
         payable
         onlyOperator
     {
-        Epoch storage ep = epochs[epochId];
+        Epoch storage ep = epochsById[epochId];
         if (!ep.committed) revert EpochUnknown(epochId);
         if (ep.settled) revert EpochAlreadySettled(epochId);
         if (nettingRoot != keccak256(abi.encode(net))) revert WrongNettingRoot();
@@ -218,7 +283,7 @@ contract BatchSettler {
 
     /// 延迟领取：窗口（挑战期）过后，收款人（或其代理人）逐条领取净额。整 epoch voided 后拒绝。
     function claim(uint256 epochId, uint256 netIndex) external {
-        Epoch storage ep = epochs[epochId];
+        Epoch storage ep = epochsById[epochId];
         if (!ep.settled) revert EpochUnknown(epochId);
         if (ep.voided) revert EpochVoided(epochId);
         if (block.timestamp <= uint256(ep.settledAt) + CHALLENGE_WINDOW) {
@@ -247,7 +312,7 @@ contract BatchSettler {
     /// voided。退款推送失败不阻断挑战（资金留合约，运营者经 withdrawRefund 拉取兜底）——
     /// 防恶意运营者以 revert 地址 / token 黑名单审查欺诈证明。
     function challenge(uint256 epochId, FraudProof calldata fp) external payable {
-        Epoch storage ep = epochs[epochId];
+        Epoch storage ep = epochsById[epochId];
         if (!ep.settled) revert EpochUnknown(epochId);
         if (ep.challenged || ep.voided) revert EpochAlreadyChallenged(epochId);
         if (block.timestamp > uint256(ep.settledAt) + CHALLENGE_WINDOW) {
@@ -308,7 +373,7 @@ contract BatchSettler {
     /// 仅 voided epoch 开放：正常 epoch 的结算资金归收款人 claim，绝不给运营者取回路径
     ///（防双花）；voided epoch 的 claim 已被拒，这笔钱不会再被任何人认领。
     function withdrawRefund(uint256 epochId) external onlyOperator {
-        Epoch storage ep = epochs[epochId];
+        Epoch storage ep = epochsById[epochId];
         if (!ep.committed || !ep.voided) revert EpochNotVoided(epochId);
         uint256 refund = ep.settlementFunded;
         if (refund == 0) revert NothingToRefund(epochId);
@@ -324,6 +389,9 @@ contract BatchSettler {
 
     /// 欺诈证明实质验证（S-38：不再 revert，失败返回原因码；None = 欺诈成立）。判定逻辑与
     /// 押金制之前逐字等价，仅把 revert 换成原因码返回。
+    /// kind 判定拆分为独立内部函数（legacy codegen 的 stack too deep 收口，先例
+    /// _epochView/_epochViewOn：coverage 模式关 optimizer/via_ir，四分支局部变量共占
+    /// 一帧爆栈）——判定语义逐字保持，仅降低单函数栈槽压力。
     function _verifyFraud(Epoch storage ep, FraudProof calldata fp)
         internal
         view
@@ -332,39 +400,147 @@ contract BatchSettler {
         if (fp.intents.length == 0 || fp.intents.length > MAX_INTENTS_PER_CHALLENGE) {
             return RejectReason.TooManyIntents;
         }
-        if (fp.kind == 1) {
-            // 漏单：一条已提交意图，其收款人不在 net[] 中。
-            if (fp.intents.length != 1) return RejectReason.BadFraudKind;
-            bytes32 ih = _intentHash(fp.intents[0]);
-            if (!_verifyInclusion(ep, fp.intents[0], ih)) return RejectReason.BadInclusionProof;
-            address recipient = address(fp.intents[0].recipient);
-            (bool found,) = _indexOfRecipient(ep, recipient);
-            if (found) return RejectReason.NotFraud;
-        } else if (fp.kind == 2) {
-            // 低付：同一收款人的已提交意图子集，uint256 和 > net[target].amount。
-            if (fp.targetNetIndex >= ep.net.length) return RejectReason.NetIndexOutOfBounds;
-            address targetRecipient = ep.net[fp.targetNetIndex].recipient;
-            // slither-disable-next-line uninitialized-local（误报：Solidity 默认 0 初始化，下方累加）
-            uint256 sum;
-            bytes32[] memory hashes = new bytes32[](fp.intents.length);
-            for (uint256 i = 0; i < fp.intents.length; i++) {
-                IntentProof calldata ip = fp.intents[i];
-                // 防假阳性 #2：跨收款人子集禁止（只与目标行比较）。
-                if (address(ip.recipient) != targetRecipient) return RejectReason.BadFraudKind;
-                bytes32 ih = _intentHash(ip);
-                // 防假阳性 #1：同笔意图重复计入禁止。
-                for (uint256 j = 0; j < i; j++) {
-                    if (ih == hashes[j]) return RejectReason.DuplicateIntent;
-                }
-                hashes[i] = ih;
-                if (!_verifyInclusion(ep, ip, ih)) return RejectReason.BadInclusionProof;
-                sum += ip.amount;
+        if (fp.kind == 1) return _verifyFraudKind1(ep, fp);
+        if (fp.kind == 2) return _verifyFraudKind2(ep, fp);
+        if (fp.kind == 3) return _verifyFraudKind3(ep, fp);
+        if (fp.kind == 4) return _verifyFraudKind4(ep, fp);
+        return RejectReason.BadFraudKind;
+    }
+
+    /// kind1 = 漏单：一条已提交意图，其收款人不在 net[] 中。
+    function _verifyFraudKind1(Epoch storage ep, FraudProof calldata fp)
+        internal
+        view
+        returns (RejectReason)
+    {
+        if (fp.intents.length != 1) return RejectReason.BadFraudKind;
+        bytes32 ih = _intentHash(fp.intents[0]);
+        if (!_verifyInclusion(ep, fp.intents[0], ih)) return RejectReason.BadInclusionProof;
+        address recipient = address(fp.intents[0].recipient);
+        (bool found,) = _indexOfRecipient(ep, recipient);
+        if (found) return RejectReason.NotFraud;
+        return RejectReason.None;
+    }
+
+    /// kind2 = 低付：同一收款人的已提交意图子集，uint256 和 > net[target].amount。
+    function _verifyFraudKind2(Epoch storage ep, FraudProof calldata fp)
+        internal
+        view
+        returns (RejectReason)
+    {
+        if (fp.targetNetIndex >= ep.net.length) return RejectReason.NetIndexOutOfBounds;
+        address targetRecipient = ep.net[fp.targetNetIndex].recipient;
+        // slither-disable-next-line uninitialized-local（误报：Solidity 默认 0 初始化，下方累加）
+        uint256 sum;
+        bytes32[] memory hashes = new bytes32[](fp.intents.length);
+        for (uint256 i = 0; i < fp.intents.length; i++) {
+            IntentProof calldata ip = fp.intents[i];
+            // 防假阳性 #2：跨收款人子集禁止（只与目标行比较）。
+            if (address(ip.recipient) != targetRecipient) return RejectReason.BadFraudKind;
+            bytes32 ih = _intentHash(ip);
+            // 防假阳性 #1：同笔意图重复计入禁止。
+            for (uint256 j = 0; j < i; j++) {
+                if (ih == hashes[j]) return RejectReason.DuplicateIntent;
             }
-            if (sum <= ep.net[fp.targetNetIndex].amount) return RejectReason.NotFraud;
-        } else {
-            return RejectReason.BadFraudKind;
+            hashes[i] = ih;
+            if (!_verifyInclusion(ep, ip, ih)) return RejectReason.BadInclusionProof;
+            sum += ip.amount;
+        }
+        if (sum <= ep.net[fp.targetNetIndex].amount) return RejectReason.NotFraud;
+        return RejectReason.None;
+    }
+
+    /// kind3 = 已撤销消费（P2-3 §6.20.2）：一条已提交意图，其委托在「接受时刻 −
+    /// margin」之前已撤销——运营者撤销观察缺席仍接受 = 可罚本体（§6.23.1 定夺 10）。
+    /// 单意图（kind1 同款计数闸）；可罚性锚在「已接受」本身，不做 net 命中检查。
+    function _verifyFraudKind3(Epoch storage ep, FraudProof calldata fp)
+        internal
+        view
+        returns (RejectReason)
+    {
+        if (fp.intents.length != 1) return RejectReason.BadFraudKind;
+        IntentProof calldata ip = fp.intents[0];
+        bytes32 ih = _intentHash(ip);
+        // 承诺树包含（意图确在本 epoch 被接受）∧ 接受树包含（接受时刻确如证明所声明）
+        // ——缺一即 BadInclusionProof（伪造 / 回填接受时刻都被承诺面挡住，§6.23.1 定夺 8）。
+        if (!_verifyInclusion(ep, ip, ih)) return RejectReason.BadInclusionProof;
+        if (!_verifyAcceptanceInclusion(ep, ip)) return RejectReason.BadInclusionProof;
+        uint64 ra = revocations.revokedAt(ip.delegationHash);
+        // 未撤销（revokedAt = 0，与 revoked 布尔同语义）→ kind 不成立（NotFraud）。
+        if (ra == 0) return RejectReason.NotFraud;
+        // margin 守卫（§6.20.3）：撤销后 ACCEPT_MARGIN 秒内的接受不罚——运营者 RPC
+        // 读陈旧 / 撤销观察滞后的余量。uint256 算术无溢出面。
+        if (uint256(ra) + ACCEPT_MARGIN > uint256(ip.acceptedAt)) {
+            return RejectReason.NotFraud;
         }
         return RejectReason.None;
+    }
+
+    /// kind4 = 跨分片消费（P2-3 §6.20.2）：委托已绑定到他方运营者（boundAt + margin
+    /// ≤ acceptedAt）仍被本账本接受——分片账本看不见的跨分片预算超支的可罚本体
+    ///（锚点是链上绑定映射 DSA.operatorOf，§6.19.1）。
+    function _verifyFraudKind4(Epoch storage ep, FraudProof calldata fp)
+        internal
+        view
+        returns (RejectReason)
+    {
+        if (fp.intents.length != 1) return RejectReason.BadFraudKind;
+        IntentProof calldata ip = fp.intents[0];
+        bytes32 ih = _intentHash(ip);
+        if (!_verifyInclusion(ep, ip, ih)) return RejectReason.BadInclusionProof;
+        if (!_verifyAcceptanceInclusion(ep, ip)) return RejectReason.BadInclusionProof;
+        address op = dsa.operatorOf(ip.delegationHash);
+        uint64 ba = dsa.boundAt(ip.delegationHash);
+        // 未绑定（boundAt = 0 ⇔ operatorOf = 零地址）→ fail-open 三态，kind 不成立
+        //（§6.19.2 决策 B 有意取舍，与聚合器摄取闸同口径）；绑到本合约 operator =
+        // 本运营者自己的委托，非跨分片，kind4 无对象。
+        if (ba == 0 || op == address(0) || op == operator) return RejectReason.NotFraud;
+        if (uint256(ba) + ACCEPT_MARGIN > uint256(ip.acceptedAt)) {
+            return RejectReason.NotFraud;
+        }
+        return RejectReason.None;
+    }
+
+    /// epoch 静态读面（S-66 读面拆分 1/2）：根锚 + 时刻 + 金额 9 字段（Epoch 声明序去
+    /// 布尔组）。显式函数替代 public 自动 getter 的原因见 epochsById 处注释。
+    function epochs(uint256 epochId)
+        external
+        view
+        returns (
+            bytes32 commitmentRoot,
+            bytes32 revocationRoot,
+            bytes32 acceptanceRoot,
+            uint64 sealedAt,
+            uint64 committedAt,
+            uint256 bondedAmount,
+            uint256 settlementFunded,
+            uint64 settledAt,
+            bytes32 nettingRoot
+        )
+    {
+        Epoch storage ep = epochsById[epochId];
+        commitmentRoot = ep.commitmentRoot;
+        revocationRoot = ep.revocationRoot;
+        acceptanceRoot = ep.acceptanceRoot;
+        sealedAt = ep.sealedAt;
+        committedAt = ep.committedAt;
+        bondedAmount = ep.bondedAmount;
+        settlementFunded = ep.settlementFunded;
+        settledAt = ep.settledAt;
+        nettingRoot = ep.nettingRoot;
+    }
+
+    /// epoch 状态位读面（S-66 读面拆分 2/2）：committed/settled/challenged/voided。
+    function epochStatus(uint256 epochId)
+        external
+        view
+        returns (bool committed, bool settled, bool challenged, bool voided)
+    {
+        Epoch storage ep = epochsById[epochId];
+        committed = ep.committed;
+        settled = ep.settled;
+        challenged = ep.challenged;
+        voided = ep.voided;
     }
 
     function _sumNet(NetInstruction[] calldata net) internal pure returns (uint256 total) {
@@ -408,5 +584,22 @@ contract BatchSettler {
         bytes32 leafHash = Merkle.leaf(ip.seq, ih);
         return Merkle.computeRoot(leafHash, ip.leafIndex, ip.acceptedCount, ip.siblings)
             == ep.commitmentRoot;
+    }
+
+    /// 接受锚包含性验证（P2-3 §6.23）：叶 = `Merkle.acceptanceLeaf(seq, acceptedAt)`，
+    /// 根 = `Epoch.acceptanceRoot`。与承诺树同叶集同序 ⇒ 复用同一 `leafIndex` /
+    /// `acceptedCount`（自校验：错值 → 根不匹配）与同深度兄弟路径。
+    /// 前置条件：调用方（_verifyFraudKind3/4）已先行通过 `_verifyInclusion`——同参数
+    /// `leafIndex >= acceptedCount` 拦截在承诺树闸完成，此处不重复（重复即一条测试
+    /// 不可达的恒假分支，S-66 coverage 门禁收口时删除）。
+    function _verifyAcceptanceInclusion(Epoch storage ep, IntentProof calldata ip)
+        internal
+        view
+        returns (bool)
+    {
+        if (ip.acceptanceSiblings.length != Merkle.treeDepth(ip.acceptedCount)) return false;
+        bytes32 leafHash = Merkle.acceptanceLeaf(ip.seq, ip.acceptedAt);
+        return Merkle.computeRoot(leafHash, ip.leafIndex, ip.acceptedCount, ip.acceptanceSiblings)
+            == ep.acceptanceRoot;
     }
 }

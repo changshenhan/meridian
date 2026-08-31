@@ -4,6 +4,8 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {OperatorRegistry} from "../src/OperatorRegistry.sol";
 import {BatchSettler} from "../src/BatchSettler.sol";
+import {DSA} from "../src/DSA.sol";
+import {RevocationRegistry} from "../src/RevocationRegistry.sol";
 
 /// S-64（TECH_SPEC §6.21）：P2-4 OperatorRegistry —— append-only 金额调度 + 运营者名册
 /// （§6.17 决策 D 实施砖）。BatchSettler 逐字节不动，只作名册绑定实证 / 快照源。
@@ -25,7 +27,11 @@ contract OperatorRegistryTest is Test {
         internal
         returns (BatchSettler)
     {
-        return new BatchSettler(operator, address(0), challengeBond);
+        // P2-3：BatchSettler 构造器增两 immutable 锚（DSA + RevocationRegistry），部署序
+        // 与 ChallengeTestHelper.deployAnchoredSettler / deploy.rs 同款（本套件未继承助手）。
+        DSA dsa = new DSA();
+        RevocationRegistry revocations = new RevocationRegistry(dsa);
+        return new BatchSettler(operator, address(0), challengeBond, dsa, revocations);
     }
 }
 
@@ -119,10 +125,7 @@ contract OperatorRegistryRosterTest is OperatorRegistryTest {
         // 非 operator 发起：链上归属读数 != 调用者 → 拒绝（名册不可伪造的根）。
         vm.expectRevert(
             abi.encodeWithSelector(
-                OperatorRegistry.NotSettlerOperator.selector,
-                address(settler),
-                other,
-                operator
+                OperatorRegistry.NotSettlerOperator.selector, address(settler), other, operator
             )
         );
         vm.prank(other);
@@ -171,8 +174,8 @@ contract OperatorRegistryRosterTest is OperatorRegistryTest {
         vm.stopPrank();
         assertEq(registry.operatorCount(), 2);
         assertEq(registry.settlerCount(operator), 2);
-        (, , , uint256 cb0,) = registry.operators(0);
-        (, , , uint256 cb1,) = registry.operators(1);
+        (,,, uint256 cb0,) = registry.operators(0);
+        (,,, uint256 cb1,) = registry.operators(1);
         assertEq(cb0, CHALLENGE_BOND);
         assertEq(cb1, 0.37 ether);
         // 调度历史不被名册动作触碰。

@@ -47,6 +47,8 @@ fn build_entries() -> Vec<WindowEntry> {
             WindowEntry {
                 seq,
                 intent_hash: ih,
+                // 确定性接受时刻（P2-3 §6.23：acceptanceRoot 纳入 B7 管线测量）。
+                accepted_at: 1_700_000_000 + seq,
             }
         })
         .collect()

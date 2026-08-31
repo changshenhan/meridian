@@ -14,11 +14,12 @@ import {BatchSettler} from "../src/BatchSettler.sol";
 /// 「Rust golden ⇄ Solidity 镜像」逐条比对——期望值不在这里产生，不在测试里重写
 /// Rust 语义（S-11a 的单 golden 是定点抽查，这里是批量差分）。
 ///
-/// 覆盖四条交叉实现契约（S-11 深度审计逐行核对过的面）：
+/// 覆盖五条交叉实现契约（S-11 深度审计逐行核对过的面）：
 ///  1. `IntentHelper.computeIntentHash` ↔ `core::dsa::intent_hash`（64 向量）
 ///  2. `DSA.sha256(delegationABI)` + owner 切片 [26:46] ↔ `delegation_hash`（32 向量）
 ///  3. `Merkle.leaf` / 补齐根 / `Merkle.computeRoot` 重推 ↔ `aggregator::merkle`（8 叶 + 10 树 + 10 证明）
 ///  4. `nettingRoot = keccak256(abi.encode(net))` ↔ `abi_encode_net`（16 向量，编码字节级比对）
+///  5. `Merkle.acceptanceLeaf` ↔ `merkle::acceptance_leaf`（8 向量，P2-3 §6.23 接受锚叶）
 contract DifferentialTest is Test {
     string internal fixture;
 
@@ -206,5 +207,24 @@ contract DifferentialTest is Test {
             assertEq(keccak256(abi.encode(net)), roots[i], "nettingRoot mismatch");
         }
         assertEq(cursor, recipients.length, "flat net columns not fully consumed");
+    }
+
+    // ---- 面 5：acceptanceLeaf（接受锚叶，P2-3 §6.23）---------------------------
+
+    function test_acceptance_leaf_differential() public {
+        uint256[] memory seqs = vm.parseJsonUintArray(fixture, ".acceptanceLeaves.seq");
+        uint256[] memory acceptedAts =
+            vm.parseJsonUintArray(fixture, ".acceptanceLeaves.acceptedAt");
+        bytes32[] memory expect = vm.parseJsonBytes32Array(fixture, ".acceptanceLeaves.leaf");
+        assertEq(seqs.length, expect.length, "fixture column count mismatch");
+        for (uint256 i; i < expect.length; i++) {
+            // kind3/kind4 守卫的叶原像（acceptanceInclusion 闸的叶面）：0/0 与
+            // MAX/MAX 边界对在 fixture 里（未锚哨兵 0 恰是要逐字节锁死的分支）。
+            assertEq(
+                Merkle.acceptanceLeaf(uint64(seqs[i]), uint64(acceptedAts[i])),
+                expect[i],
+                "acceptance leaf mismatch"
+            );
+        }
     }
 }

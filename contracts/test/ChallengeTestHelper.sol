@@ -2,8 +2,10 @@
 pragma solidity ^0.8.24;
 
 import {BatchSettler} from "../src/BatchSettler.sol";
+import {DSA} from "../src/DSA.sol";
 import {IntentHelper} from "../src/IntentHelper.sol";
 import {Merkle} from "../src/Merkle.sol";
+import {RevocationRegistry} from "../src/RevocationRegistry.sol";
 
 /// @notice S-11 测试助手：在 Solidity 内镜像 aggregator/src/merkle.rs 的 merkle_root +
 ///         inclusion-proof 生成器，供 forge 测试构造欺诈证明（等价于 Rust 证明生成器）。
@@ -105,7 +107,8 @@ contract ChallengeTestHelper {
         return (n, siblings);
     }
 
-    /// 从意图明文 + 证明位置构造 BatchSettler.IntentProof。
+    /// 从意图明文 + 证明位置构造 BatchSettler.IntentProof（kind1/kind2 证据形状：接受面
+    /// 字段零值，合约对其不校验——P2-3 §6.23 向后兼容口径）。
     function toIntentProof(IntentFields memory i, ProofBundle memory pb)
         internal
         pure
@@ -120,10 +123,51 @@ contract ChallengeTestHelper {
             spendNonce: i.spendNonce,
             memo: i.memo,
             expiresAt: i.expiresAt,
+            acceptedAt: 0,
             seq: pb.seq,
             leafIndex: pb.leafIndex,
             acceptedCount: pb.acceptedCount,
-            siblings: pb.siblings
+            siblings: pb.siblings,
+            acceptanceSiblings: new bytes32[](0)
         });
+    }
+
+    /// P2-3（§6.23）：kind3/kind4 证据形状——在 toIntentProof 之上补接受锚字段
+    /// （acceptedAt + 接受树兄弟路径；两树同叶序 ⇒ 同 leafIndex/acceptedCount）。
+    function toAnchoredIntentProof(
+        IntentFields memory i,
+        ProofBundle memory pb,
+        uint64 acceptedAt,
+        bytes32[] memory acceptanceSiblings
+    ) internal pure returns (BatchSettler.IntentProof memory) {
+        BatchSettler.IntentProof memory ip = toIntentProof(i, pb);
+        ip.acceptedAt = acceptedAt;
+        ip.acceptanceSiblings = acceptanceSiblings;
+        return ip;
+    }
+
+    /// 接受锚叶（Merkle.acceptanceLeaf 直通；测试侧与合约侧同一叶规范）。
+    function acceptanceLeafOf(uint64 seq, uint64 acceptedAt) internal pure returns (bytes32) {
+        return Merkle.acceptanceLeaf(seq, acceptedAt);
+    }
+
+    /// P2-3：BatchSettler 构造器增两 immutable 锚（DSA + RevocationRegistry，kind3/kind4
+    /// 守卫读面）。部署顺序与 deploy.rs 同款：DSA → RevocationRegistry(DSA) → BatchSettler。
+    function deployAnchoredSettler(address operator, address asset, uint256 bond)
+        internal
+        returns (BatchSettler settler, DSA dsa, RevocationRegistry revocations)
+    {
+        dsa = new DSA();
+        revocations = new RevocationRegistry(dsa);
+        settler = new BatchSettler(operator, asset, bond, dsa, revocations);
+    }
+
+    /// 单返回值便捷版（不需要触碰锚合约的用例，setUp 同款形态）。
+    function deploySettler(address operator, address asset, uint256 bond)
+        internal
+        returns (BatchSettler)
+    {
+        (BatchSettler settler,,) = deployAnchoredSettler(operator, asset, bond);
+        return settler;
     }
 }

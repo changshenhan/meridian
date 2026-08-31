@@ -106,6 +106,9 @@ async fn run_flow() -> Result<()> {
     let mut args = abi_addr(operator_addr);
     args.extend_from_slice(&abi_addr(Address::ZERO));
     args.extend_from_slice(&abi_u256(s1.challengeBond.to::<u128>()));
+    // P2-3：双锚面构造参数（§6.23.1 定夺 7）。
+    args.extend_from_slice(&abi_addr(dsa_addr));
+    args.extend_from_slice(&abi_addr(rev_addr));
     let settler1_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &args).await?;
     let settler1 = IBatchSettler::new(settler1_addr, &provider);
     assert_eq!(
@@ -146,6 +149,8 @@ async fn run_flow() -> Result<()> {
     let mut args2 = abi_addr(operator_addr);
     args2.extend_from_slice(&abi_addr(Address::ZERO));
     args2.extend_from_slice(&abi_u256(V2_CBOND));
+    args2.extend_from_slice(&abi_addr(dsa_addr));
+    args2.extend_from_slice(&abi_addr(rev_addr));
     let settler2_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &args2).await?;
     let settler2 = IBatchSettler::new(settler2_addr, &provider);
     assert_eq!(

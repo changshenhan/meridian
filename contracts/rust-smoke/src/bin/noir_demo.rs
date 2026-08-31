@@ -83,7 +83,7 @@ async fn run_noir_demo() -> Result<()> {
     wait_for_chain(&provider).await?;
 
     let dsa_addr = deploy(&provider, "DSA.sol/DSA.json", &[]).await?;
-    let _reg_addr = deploy(
+    let reg_addr = deploy(
         &provider,
         "RevocationRegistry.sol/RevocationRegistry.json",
         &abi_addr(dsa_addr),
@@ -93,6 +93,9 @@ async fn run_noir_demo() -> Result<()> {
     settler_args.extend_from_slice(&abi_addr(alloy::primitives::Address::ZERO));
     // S-50：挑战押金为部署期构造参数（本 demo 沿用参考值 0.1 ether）。
     settler_args.extend_from_slice(&abi_u256(CHALLENGE_BOND));
+    // P2-3：双锚面构造参数（§6.23.1 定夺 7）。
+    settler_args.extend_from_slice(&abi_addr(dsa_addr));
+    settler_args.extend_from_slice(&abi_addr(reg_addr));
     let settler_addr = deploy(
         &provider,
         "BatchSettler.sol/BatchSettler.json",
@@ -265,6 +268,8 @@ async fn run_noir_demo() -> Result<()> {
             U256::from(res.epoch_id),
             B256::from(res.commitment_root),
             B256::from(res.revocation_root),
+            B256::from(res.acceptance_root),
+            res.sealed_at,
         )
         .value(U256::from(BOND))
         .send()

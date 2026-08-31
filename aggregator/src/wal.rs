@@ -12,11 +12,16 @@
 //! 账本一致——未 sync 的尾巴在崩溃中丢失属标准 WAL 语义（agent 幂等重试：nonce 不在重放集
 //! → 重接受，无双重记账）。
 //!
-//! 热路径（`append_intent`）零分配：payload 固定 116B（seq8+intent_hash32+dh32+nonce8+
-//! amount8+now8+recipient20），写在栈上；缓冲**固定预置 8MB**，`append_raw` 在 extend 前检查
-//! 剩余容量，不够先 flush——缓冲永不 realloc，内存上界与 `sync_every` 无关（B8 口径，见
-//! TECH_SPEC §8.1 容量预置注记）。含 recipient：净额指令（按 recipient 聚合）崩溃后必须可从
-//! WAL 重建，intent_hash 只提交 recipient、不含明文。
+//! 热路径（`append_intent`）零分配：payload 固定 124B（seq8+intent_hash32+dh32+nonce8+
+//! amount8+now8+recipient20+accepted_at8），写在栈上；缓冲**固定预置 8MB**，`append_raw` 在
+//! extend 前检查剩余容量，不够先 flush——缓冲永不 realloc，内存上界与 `sync_every` 无关
+//! （B8 口径，见 TECH_SPEC §8.1 容量预置注记）。含 recipient：净额指令（按 recipient 聚合）
+//! 崩溃后必须可从 WAL 重建，intent_hash 只提交 recipient、不含明文。`accepted_at` =
+//! 接受时刻锚（P2-3 §6.23：平行接受树 acceptanceRoot 的叶输入，崩溃恢复后接受锚必须可重建）。
+//!
+//! **双长度重放（P2-3 §6.23.1 定夺 1）**：旧格式 Intent payload = 116B（无 accepted_at 尾
+//! 字段）→ 重放侧按长度自描述解码，`accepted_at = 0` 哨兵（事件时刻 + margin ≤ 0 恒假 ⇒
+//! kind3/4 守卫永不成立——不安全方向是「不可罚」，绝不假阳性）；`VERSION` 保持 1。
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -31,9 +36,12 @@ const MAGIC: u16 = 0x4D4D;
 const VERSION: u8 = 1;
 /// 头长度 = magic2 + version1 + kind1 + len4 + crc4。
 const HEADER_LEN: usize = 12;
-/// Intent 记录 payload 固定长度（116B）：seq8 + intent_hash32 + dh32 + nonce8 + amount8 + now8
-/// + recipient20（净额恢复所需）。
-const INTENT_PAYLOAD_LEN: usize = 116;
+/// Intent 记录 payload 固定长度（124B，P2-3 起）：seq8 + intent_hash32 + dh32 + nonce8 +
+/// amount8 + now8 + recipient20 + accepted_at8（净额恢复 + 接受锚恢复所需）。
+const INTENT_PAYLOAD_LEN: usize = 124;
+/// 旧格式 Intent payload 长度（116B，P2-3 之前）：无 accepted_at 尾字段。重放侧双长度
+/// 解码（长度自描述），旧记录 `accepted_at = 0` 哨兵。
+const INTENT_PAYLOAD_LEN_V0: usize = 116;
 /// 单记录最大长度（含头）。Register（JSON 委托）最大规模。
 const MAX_RECORD_LEN: usize = 64 * 1024;
 /// 缓冲固定预置容量（8MB）：append 前检查，不够先 flush → 永不 realloc。
@@ -85,6 +93,9 @@ pub enum DecodedRecord {
         now: u64,
         /// 收款方（净额按 recipient 聚合，崩溃后必须可恢复）。
         recipient: [u8; 20],
+        /// 接受时刻（P2-3 §6.23：acceptanceRoot 叶输入，恢复后接受锚可重建）。
+        /// 旧格式（116B）记录 = 0 哨兵（守卫永不成立的不可罚语义，不假阳性）。
+        accepted_at: u64,
     },
     /// epoch 密封（承诺根上链前的记录；重放时用于跳过已承诺 epoch）。
     EpochSeal {
@@ -191,7 +202,7 @@ impl Wal {
         Ok(wal)
     }
 
-    /// 热路径：追加一条已接受意图。payload 固定 116B、零分配。
+    /// 热路径：追加一条已接受意图。payload 固定 124B、零分配。
     #[allow(clippy::too_many_arguments)]
     pub fn append_intent(
         &self,
@@ -202,6 +213,7 @@ impl Wal {
         amount: u64,
         now: u64,
         recipient: [u8; 20],
+        accepted_at: u64,
     ) -> std::io::Result<()> {
         let mut payload = [0u8; INTENT_PAYLOAD_LEN];
         payload[0..8].copy_from_slice(&seq.to_le_bytes());
@@ -211,6 +223,7 @@ impl Wal {
         payload[80..88].copy_from_slice(&amount.to_le_bytes());
         payload[88..96].copy_from_slice(&now.to_le_bytes());
         payload[96..116].copy_from_slice(&recipient);
+        payload[116..124].copy_from_slice(&accepted_at.to_le_bytes());
         self.inner
             .lock()
             .expect("wal poisoned")
@@ -337,7 +350,9 @@ impl Wal {
                     records.push(DecodedRecord::Register(sd, agent_pub));
                 }
                 RecordKind::Intent => {
-                    if len != INTENT_PAYLOAD_LEN {
+                    // 双长度重放（§6.23.1 定夺 1）：124 = 新格式；116 = 旧格式（accepted_at
+                    // = 0 哨兵）。其它长度判撕裂。
+                    if len != INTENT_PAYLOAD_LEN && len != INTENT_PAYLOAD_LEN_V0 {
                         truncated = true;
                         break;
                     }
@@ -348,6 +363,11 @@ impl Wal {
                     let amount = u64::from_le_bytes(payload[80..88].try_into().unwrap());
                     let now = u64::from_le_bytes(payload[88..96].try_into().unwrap());
                     let recipient: [u8; 20] = payload[96..116].try_into().unwrap();
+                    let accepted_at = if len == INTENT_PAYLOAD_LEN {
+                        u64::from_le_bytes(payload[116..124].try_into().unwrap())
+                    } else {
+                        0 // 旧格式哨兵：事件时刻 + margin ≤ 0 恒假 ⇒ 守卫永不成立
+                    };
                     records.push(DecodedRecord::Intent {
                         seq,
                         intent_hash,
@@ -356,6 +376,7 @@ impl Wal {
                         amount,
                         now,
                         recipient,
+                        accepted_at,
                     });
                 }
                 RecordKind::EpochSeal => {
@@ -482,8 +503,17 @@ mod tests {
         let path = tmp_path("roundtrip");
         let w = Wal::open(&path, 1000).unwrap();
         w.append_register(&sample_sd(), &[0x11; 32]).unwrap();
-        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000, [0xEE; 20])
-            .unwrap();
+        w.append_intent(
+            1,
+            [0xAB; 32],
+            [0xCD; 32],
+            5,
+            42,
+            1_700_000_000,
+            [0xEE; 20],
+            1_700_000_000,
+        )
+        .unwrap();
         w.flush().unwrap();
         let (records, valid, truncated) = w.replay().unwrap();
         assert!(!truncated);
@@ -497,6 +527,7 @@ mod tests {
                 amount,
                 now,
                 recipient,
+                accepted_at,
                 ..
             } => {
                 assert_eq!(*seq, 1);
@@ -505,9 +536,59 @@ mod tests {
                 assert_eq!(*amount, 42);
                 assert_eq!(*now, 1_700_000_000);
                 assert_eq!(*recipient, [0xEE; 20]);
+                assert_eq!(*accepted_at, 1_700_000_000);
             }
             other => panic!("expected Intent, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P2-3 §6.23.1 定夺 1：旧格式（116B，无 accepted_at 尾字段）记录重放 =
+    /// `accepted_at = 0` 哨兵，且新旧格式可同文件共存（双长度重放）。
+    #[test]
+    fn legacy_intent_payload_replays_with_zero_sentinel() {
+        let path = tmp_path("legacy-intent");
+        let w = Wal::open(&path, 1000).unwrap();
+        // 新格式一条（走生产 append）。
+        w.append_intent(
+            1,
+            [0xAB; 32],
+            [0xCD; 32],
+            5,
+            42,
+            1_700_000_000,
+            [0xEE; 20],
+            1_700_000_005,
+        )
+        .unwrap();
+        // 手工拼一条旧格式记录（116B，头/CRC 合法）。
+        let mut legacy = [0u8; INTENT_PAYLOAD_LEN_V0];
+        legacy[0..8].copy_from_slice(&2u64.to_le_bytes());
+        legacy[8..40].copy_from_slice(&[0x11; 32]);
+        legacy[40..72].copy_from_slice(&[0xCD; 32]);
+        legacy[72..80].copy_from_slice(&6u64.to_le_bytes());
+        legacy[80..88].copy_from_slice(&43u64.to_le_bytes());
+        legacy[88..96].copy_from_slice(&1_700_000_001u64.to_le_bytes());
+        legacy[96..116].copy_from_slice(&[0xFF; 20]);
+        w.inner
+            .lock()
+            .expect("wal poisoned")
+            .append_raw(RecordKind::Intent, &legacy)
+            .unwrap();
+        w.flush().unwrap();
+        let (records, valid, truncated) = w.replay().unwrap();
+        assert!(!truncated, "新旧格式混排不得判撕裂");
+        assert_eq!(valid, w.file_len().unwrap());
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            &records[1],
+            DecodedRecord::Intent { seq, accepted_at, .. } if *seq == 2 && *accepted_at == 0
+        ));
+        // 精确字节：新 124 + 旧 116。
+        assert_eq!(
+            w.file_len().unwrap(),
+            (HEADER_LEN + INTENT_PAYLOAD_LEN + HEADER_LEN + INTENT_PAYLOAD_LEN_V0) as u64
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -516,7 +597,7 @@ mod tests {
         let path = tmp_path("buffered");
         let w = Wal::open(&path, 100_000).unwrap(); // 不自动 fsync
         for seq in 1..=100u64 {
-            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20])
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20], 0)
                 .unwrap();
         }
         // 未 flush：内存缓冲，文件未落盘。
@@ -539,7 +620,7 @@ mod tests {
         let path = tmp_path("multiflush");
         let w = Wal::open(&path, 100).unwrap(); // 每 100 条自动 fsync；末 50 条显式 flush
         for seq in 1..=250u64 {
-            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20])
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20], 0)
                 .unwrap();
         }
         w.flush().unwrap(); // 持久化缓冲中未达阈值的尾巴（200 之后的 50 条）
@@ -641,16 +722,16 @@ mod tests {
         let path = tmp_path("revinter");
         let w = Wal::open(&path, 1000).unwrap();
         w.append_register(&sample_sd(), &[0x11; 32]).unwrap(); // 0 Register
-        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000, [0xEE; 20])
+        w.append_intent(1, [0xAB; 32], [0xCD; 32], 5, 42, 1_700_000_000, [0xEE; 20], 1_700_000_000)
             .unwrap(); // 1 Intent
         w.append_revoke([0x01; 32]).unwrap(); // 2 Revoke
-        w.append_intent(2, [0xBB; 32], [0xCD; 32], 6, 43, 1_700_000_001, [0xFF; 20])
+        w.append_intent(2, [0xBB; 32], [0xCD; 32], 6, 43, 1_700_000_001, [0xFF; 20], 1_700_000_001)
             .unwrap(); // 3 Intent
         w.append_epoch_seal(0, [0x77; 32], 2, 1_700_000_002)
             .unwrap(); // 4 EpochSeal
         w.append_revoke([0x02; 32]).unwrap(); // 5 Revoke
         w.append_netting(0, [0x88; 32], 1).unwrap(); // 6 Netting
-        w.append_intent(3, [0xCC; 32], [0xDD; 32], 7, 44, 1_700_000_003, [0x12; 20])
+        w.append_intent(3, [0xCC; 32], [0xDD; 32], 7, 44, 1_700_000_003, [0x12; 20], 1_700_000_003)
             .unwrap(); // 7 Intent
         w.flush().unwrap();
         let (records, valid, truncated) = w.replay().unwrap();
@@ -683,7 +764,7 @@ mod tests {
         let path = tmp_path("torn");
         let w = Wal::open(&path, 1000).unwrap();
         for seq in 1..=10u64 {
-            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20])
+            w.append_intent(seq, [0xAB; 32], [0xCD; 32], seq, 1, 0, [0xEE; 20], 0)
                 .unwrap();
         }
         w.flush().unwrap();

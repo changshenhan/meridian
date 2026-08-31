@@ -1,7 +1,7 @@
 //! S-57 跨实现差分 fuzz（审计四步路径 ③，TECH_SPEC §8.3）：Rust 生产实现批量产
 //! golden vectors → `contracts/test/fixtures/differential.json` → forge
 //! `DifferentialTest` 逐条比对 Solidity 镜像（IntentHelper / Merkle / DSA sha256 /
-//! nettingRoot）。
+//! nettingRoot / acceptanceLeaf——P2-3 第五契约，§6.23）。
 //!
 //! 设计钉子：
 //! - **调生产实现**，不是测试替身——差分的意义就在两侧都是交付物本体。
@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 
 use meridian_aggregator::lattice::{abi_encode_net, netting_root, NetLine};
-use meridian_aggregator::merkle::{inclusion_proof, leaf as merkle_leaf, merkle_root, EMPTY_LEAF};
+use meridian_aggregator::merkle::{
+    acceptance_leaf, inclusion_proof, leaf as merkle_leaf, merkle_root, EMPTY_LEAF,
+};
 use meridian_core::dsa::{
     delegation_abi, delegation_hash, intent_hash, Delegation, RateLimit, SpendIntent,
 };
@@ -218,6 +220,32 @@ fn merkle(rng: &mut Rng) -> (Value, Value, Value, Value) {
     )
 }
 
+/// 面 5：`Merkle.acceptanceLeaf` ↔ `merkle::acceptance_leaf`（P2-3 §6.23 接受锚叶，
+/// 22B 原像 sha256("ACCV1\0" ‖ seq_le ‖ acceptedAt_le)——kind3/4 时间守卫的锚定叶面；
+/// S-57 第五契约）。8 向量：seq/acceptedAt 各含 0 与 u64::MAX 边界（0 = 未锚哨兵，
+/// 时间守卫对 0 恒不成立——恰是要逐字节锁死的分支）。
+fn acceptance_leaves(rng: &mut Rng) -> Value {
+    let mut seq = Vec::new();
+    let mut accepted_at = Vec::new();
+    let mut leaf = Vec::new();
+    for i in 0..8 {
+        let s = match i {
+            0 => 0, // 边界：seq 0
+            1 => u64::MAX,
+            _ => rng.next_u64(),
+        };
+        let a = match i {
+            0 => 0, // 边界：acceptedAt 0（未锚哨兵）
+            1 => u64::MAX,
+            _ => rng.next_u64(),
+        };
+        seq.push(s);
+        accepted_at.push(a);
+        leaf.push(hex(&acceptance_leaf(s, a)));
+    }
+    json!({ "seq": seq, "acceptedAt": accepted_at, "leaf": leaf })
+}
+
 /// 面 4：`nettingRoot = keccak256(abi.encode(net))` ↔ `abi_encode_net` /
 /// `netting_root`（16 向量，1..8 行，含零地址 / 全 ff / 零额 / u64::MAX 边界）。
 /// 同时锁**编码字节**（比根更强：根失配时能定位到编码层）。
@@ -270,7 +298,9 @@ fn main() {
 
     let mut rng = Rng(SEED);
     let (leaves, trees, proofs, depths) = merkle(&mut rng);
-    // 产出顺序固定（merkle → intents → delegations → net）= 种子到向量的确定性映射。
+    let acc_leaves = acceptance_leaves(&mut rng);
+    // 产出顺序固定（merkle → acceptance_leaves → intents → delegations → net）= 种子
+    // 到向量的确定性映射。
     let intents = intents(&mut rng, 64);
     let delegations = delegations(&mut rng, 32);
     let net = netting(&mut rng, 16);
@@ -285,6 +315,7 @@ fn main() {
         "merkleProofs": proofs,
         "merkleDepths": depths,
         "merkleEmptyRoot": hex(&EMPTY_LEAF),
+        "acceptanceLeaves": acc_leaves,
         "netCases": net,
     });
 
@@ -293,7 +324,7 @@ fn main() {
     }
     std::fs::write(&out_path, doc.to_string()).expect("写 fixture 失败");
     println!(
-        "difffuzz: 64 intents + 32 delegations + 8 leaves + 10 trees/proofs + 11 depths + 16 net vectors -> {}",
+        "difffuzz: 64 intents + 32 delegations + 8 leaves + 10 trees/proofs + 11 depths + 8 acceptance leaves + 16 net vectors -> {}",
         out_path.display()
     );
 }

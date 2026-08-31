@@ -305,7 +305,8 @@ pub fn check_budget(
 
 两种模式最终都由 `BatchSettler` 净额结算。**S-11 起用原生 ETH**（bond = `msg.value`，
 claim 付原生 ETH；`BatchSettler` v2，见 §7）。**S-28 资产参数化**（§7）：
-`BatchSettler(operator, asset, challengeBond)`——`asset = address(0)` 即 v2 原生 ETH 行为
+`BatchSettler(operator, asset, challengeBond, dsa, revocations)`（S-66 起 5 参；S-50 时点
+为前三参）——`asset = address(0)` 即 v2 原生 ETH 行为
 （逐字节保留）；`challengeBond` 为挑战押金（S-50 部署期参数化，>0 闸）；
 `asset = USDC/ERC-20` 时结算资金/claim/退款走 token，**债券仍原生 ETH**（惩罚质押与结算
 资产分离，不引入 token 质押的重入面）——`recipient + amount` 净额指令结构不变。
@@ -589,7 +590,8 @@ pub trait Ingest {
   `challenge` 变 `payable`，押金为**部署期构造参数**（S-50，原生 ETH，与 `asset` 无关、
   与运营者债券同币种）：
   - **押金金额参数化（S-50，收口 S-38 残余自报「固定常量未动态化」）**：
-    `BatchSettler(operator, asset, challengeBond)`，`uint256 public immutable challengeBond`
+    `BatchSettler(operator, asset, challengeBond, …)`（S-50 时点签名；S-66 增锚两参，§7），
+    `uint256 public immutable challengeBond`
     （`anvil` 本地参考值 `0.1 ether`）。设计决策（记录在案）：**只做部署期参数化，不做
     运行时 setter**——改运行时金额必须引入 admin/governor 信任面，而该角色天然可双向作恶：
     抬价 → 审查欺诈证明（挑战成本 → ∞，等于拆掉 §6.5 乐观安全模型）、降零 → 复活 S-38
@@ -1553,7 +1555,7 @@ P2-3 定夺**（与跨分片 kind 共享包含验证骨架，边际成本低，�
 |---|---|---|---|
 | **P2-1** | 验证者挑战演练：独立账本复算检出 commit≠settle → 欺诈证明提交工具链，本地 anvil 全链演练（人为错账 → 第三方检出 → challenge → voided + 罚没）。**已落地（S-61，2026-08-31，§6.18）** | 决策 C，**零合约改动** | 小 |
 | **P2-2** | DSA 委托→运营者绑定面（独立映射不进哈希，owner 注册期写入）+ 聚合器摄取绑定闸（Contract 模式 RPC 读）+ 存量委托 fail-open 口径。**已落地（S-62，2026-08-31，§6.19）**——写入形态定夺收窄为「owner 私钥一次性交易 `bindOperator`」（§6.19.1），存量委托由 owner 补绑收窄 fail-open 残余 | 决策 A/B | 中 |
-| **P2-3** | BatchSettler「跨分片消费」欺诈证明 kind +（P2-3 开工时定夺）「过时撤销根」kind。**开工定夺已完成（S-63，2026-08-31，§6.20）**：两个 kind 的朴素形态均不可健全实现（接受时刻墙，§6.20.1），健全形态 = 平行接受承诺树 acceptanceRoot（§6.20.2），规模重估「中」→「大」，**次序调到 P2-4 之后**（P2-4 无墙可独立落地） | P2-2 | 大 |
+| **P2-3** | BatchSettler「跨分片消费」欺诈证明 kind +（P2-3 开工时定夺）「过时撤销根」kind。**已落地（S-66，2026-08-31，§6.23；方案老板 2026-08-31 确认，§6.20）**：开工定夺（S-63，§6.20）判两个 kind 的朴素形态均不可健全实现（接受时刻墙，§6.20.1），健全形态 = 平行接受承诺树 acceptanceRoot（§6.20.2），规模重估「中」→「大」，次序调到 P2-4 之后 | P2-2 | 大 |
 | **P2-4** | OperatorRegistry（append-only 金额调度 + 运营者名册）+ 多实例部署流程与文档。**已落地（S-64，2026-08-31，§6.21）**——BatchSettler 逐字节不动，读取点定在部署流程（定夺 1），名册 = self-registration 绑定实证（定夺 4），deploy.rs 三参构造潜伏缺陷顺带修复 | 决策 D | 中 |
 | **P2-5** | 声誉派生（monitor 面只读指标）。**已落地（S-65，2026-08-31，§6.22）**——零合约改动，信源定夺为事件 + 合约余额（不走事件差，定夺 2），真 anvil 锚 = verifier_drill 幕 4 | 决策 E | 小 |
 | **P2-6/L3** | 共享账本共识（多写者同一账本） | 决策 A 在本阶段**不实施**；前置 = P2-1..5 实证 + 独立共识设计轮 | 大 / blocked |
@@ -1568,9 +1570,9 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 
 - **P2-1 已落地**（S-61，§6.18）：Rust 验证面 `fraud.rs` + anvil 三幕演练有测试锚定。
 - **P2-2 已落地**（S-62，§6.19）：链上绑定面 + 摄取绑定闸 + JSON-RPC 读装配有测试锚定；
-  P2-3 开工定夺已完成（S-63，§6.20）但**未实现**——**跨分片双花的密码学封堵（P2-3 事后
-  kind）未上线**，且其朴素形态已被定夺为不可健全实现（§6.20.1）；绑定闸只挡「绑他方的
-  后续意图」，存量未绑定委托 fail-open 如故（§6.19.5）。**P2-4 已落地**（S-64，§6.21）：
+  P2-3 开工定夺已完成（S-63，§6.20），**现已落地**（S-66，§6.23）——跨分片双花与已撤销
+  消费经平行接受锚 acceptanceRoot + kind3/kind4 上线（方案老板 2026-08-31 确认）；绑定闸
+  挡「绑他方的后续意图」，存量未绑定委托 fail-open 如故（§6.19.5）。**P2-4 已落地**（S-64，§6.21）：
   OperatorRegistry 调度/名册是**记录面不是强制面**——跳过注册表、偏离调度、registrar
   降额均不被密码学阻止，只被全史与快照公开（§6.21.4）。**P2-5 已落地**（S-65，§6.22）：
   声誉指标从 BatchSettler 事件 + 合约余额派生（monitor 面），读失败 fail-visible 不清零、
@@ -1607,10 +1609,17 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 #### 6.18.2 链上读取面（定夺记录在案）
 
 - **settle 交易 calldata 是净额的公开事实源**：Solidity 自动 getter 对 struct 内数组成员
-  整体省略（实测 `epochs()` ABI outputs 无 `net[]`——只回 root/bond/时间戳/四个 bool），
-  外部验证者经 getter 读不到 net[]。验证者读 `Settled` 事件 → 取 settle 交易 →
-  abi-decode `settle(epochId, net[], nettingRoot)` calldata 得 net[]。calldata 是链上
-  公开数据，零合约改动。
+  整体省略（实测 `epochs()` ABI outputs 无 `net[]`），外部验证者经 getter 读不到 net[]。
+  验证者读 `Settled` 事件 → 取 settle 交易 → abi-decode `settle(epochId, net[], nettingRoot)`
+  calldata 得 net[]。calldata 是链上公开数据，零合约改动。
+- **S-66 读面拆分（13 元组爆栈收口）**：P2-3 给 `Epoch` 增 3 字段后（13 读面字段），自动
+  getter 的 13 元组返回在 legacy codegen（`forge coverage` 关优化编译）恒爆栈——13 个隐式
+  返回槽恒活跃，最小 13 元组函数亦不可编译（`AsmCodeGen.cpp` "value0 is 1 slot(s) too
+  deep"，与函数体无关）。定夺：`epochs` mapping 改 internal（`epochsById`），读面拆为
+  显式 **`epochs(epochId)`（9 静态字段：3 root + 3 时刻 + 2 金额 + nettingRoot）** 与
+  **`epochStatus(epochId)`（4 状态位：committed/settled/challenged/voided）**；net[] /
+  claimed 依自动 getter 规则本就不在返回面。验证者侧（rust-smoke `common.rs`）以
+  `epoch_snapshot()` 两次读合成 13 字段快照，下游消费面零迁移。
 - 自检闭环：解码出的 net[] 重编码 `keccak256(abi.encode(net))` 必须等于链上
   `nettingRoot`（合约 settle 已强制等式，读面错误 = 解码 bug）→ 不等 fail-closed 不出证。
 
@@ -1651,9 +1660,9 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 - **纯「承诺根错账」不可挑战**：运营者 commit 了不含镜像意图的根（settle 与其自洽）——
   信号①可检出，但验证者无法构造错根的包含证明（不知错根叶集），上链挑战不可得；
   发现只能告警，罚没路径不在本砖（治理面）。
-- **撤销根比对不在本砖**：验证者可复算撤销根并比对（S-41 后口径可比），但链上无对应
-  欺诈 kind——P2-3「过时撤销根」定夺已完成（S-63，§6.20.4：做，但仅在接受锚落地之后，
-  朴素形态不可健全实现），实现仍挂账。
+- **撤销根比对不在本砖**：验证者可复算撤销根并比对（S-41 后口径可比），链上 kind3
+  （S-66 落地）锚的是 per-意图撤销时刻（`RevocationRegistry.revokedAt`）而非撤销根
+  比对——撤销根不符仍只是发现/告警面（比对的发现价值不受 kind3 影响，§6.20.4）。
 - 镜像完整性是出证可用性前提：镜像缺漏 → 该 epoch 零出证能力（检出率损失，非正确性
   损失——出证闸 fail-closed 方向安全）。
 - challengeBond 是验证者成本：驳回即没收（S-38）→ 出证闸与逐条自检是成本纪律，不是
@@ -1764,8 +1773,9 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 - **绑定合谋不在防御内**（决策 B 原文保留）：绑定由 owner 写 ⇒ owner 故意绑错分片
   （或与运营者合谋）是 §10 授权滥用面，靠 Sybil/声誉（决策 E、L4）缓解，本闸不防。
 - **存量 fail-open 是有意取舍**：未绑定委托不受闸约束（决策 B）；补绑收窄但不消灭
-  （6.19.1）。跨分片双花的密码学封堵 = P2-3 事后 kind——其朴素形态已被 §6.20.1 定夺为
-  不可健全实现（接受时刻墙），健全形态（acceptanceRoot 接受锚，§6.20.2）未实现。
+  （6.19.1）。跨分片双花的密码学封堵 = P2-3 事后 kind——朴素形态已被 §6.20.1 定夺为
+  不可健全实现（接受时刻墙），健全形态（acceptanceRoot 接受锚 + kind4）**已落地**
+  （S-66，§6.23）。
 - 闸只挡「绑他人」，不验证「绑的就是我声称的运营者」之外的事实——运营者身份与
   BatchSettler 实例的一致性是部署面职责（P2-4 OperatorRegistry 前以配置纪律承担）。
 - **`E_BIND_BACKEND` 的重试面在调用方**：SDK 业务拒绝不自动重试（仅 `E_REV_ROOT` 触发
@@ -1778,6 +1788,10 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 在定夺前 P2-3 的两个事后 kind（「跨分片消费」「过时撤销根/已撤销消费」）不写一行合约码。
 本轮产出是一份**否定性前置结论**（朴素形态不可实现）+ 一份健全化设计（接受锚），以及
 由此的砖单重排。
+
+> **方案确认（老板，2026-08-31）**：§6.20.2 接受锚健全化方案（acceptanceRoot 平行承诺
+> 树 + kind3/kind4 时间守卫，含 §6.20.1 抽债券向量的链上封堵口径）已过目拍板（"可以"），
+> P2-3 依 §6.23 实施落地。
 
 #### 6.20.1 朴素形态不可实现：接受时刻墙（设计发现，推翻决策 B 的可实现性假设）
 
@@ -1860,8 +1874,8 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 **做**（决策 F 倾向确认），但**仅在接受锚落地之后**——朴素形态（§6.20.1 kind3）不可
 健全实现，且「只承诺正确的撤销根、不承诺 per-意图接受状态」的中间形态（§6.20.1 否决
 路线 3）是 griefing 机器。§6.18.5 的「验证者可复算撤销根并比对，链上无对应 kind」挂账
-收窄为「kind 已定夺、待接受锚砖实现」；验证者侧撤销根比对的**发现/告警**价值（信号①
-同款，不上链）不受本定夺影响。
+**已收口**（S-66 接受锚砖落地，kind3/4 上线，§6.23）；验证者侧撤销根比对的**发现/告警**
+价值（信号①同款，不上链）不受本定夺影响。
 - 读面无最终性保障（6.19.3）；缓存进程内不持久化（重启冷读，可用性自伤方向安全）。
 
 ### 6.21 P2-4 OperatorRegistry：append-only 金额调度 + 运营者名册（实施，2026-08-31）
@@ -2043,13 +2057,126 @@ P2-1 演练（§6.18）三幕已产出真实链上事件（3 commit / 3 settle /
 - **监控面是事实面不是审计面**：合约判定、监控告警均不消费声誉做决策（决策 E）；
   多运营者全局视图不存在（§6.17.4）。
 
+### 6.23 P2-3 接受锚实施（账本 acceptanceRoot + kind3/kind4，2026-08-31，S-66）
+
+**定位**：§6.20.2 健全化设计的实施砖（§6.20 本节为唯一设计事实源）——给「接受时刻」补
+链上可验证的承诺面（平行接受树 acceptanceRoot），使「已撤销消费」（kind3）/「跨分片消费」
+（kind4）两个事后欺诈 kind 在不伤诚实运营者的前提下可证。本节记录实施定夺（先改后码），
+与 §6.20.2 的偏差逐条给出理由。
+
+#### 6.23.1 定夺记录（先改后码）
+
+1. **WAL Intent payload 116B → 124B（更正 §6.20.2「恢复侧零格式改动」的前提）**。
+   设计原文假设 WAL Intent 记录的 now 字段即 acceptedAt——查证为假：该字段存的是证明
+   公共输入 `pi.now`（**客户端时刻**，`check_public_inputs_consistent` 不校验它，S-10 口径），
+   且对预算重放承载语义（`try_commit` 消费它，S-10c「恢复后账本与 accepted 前缀一致」）。
+   复用它作 acceptedAt 要么 (a) 把客户端时钟引入接受锚——客户端把 `now` 填到未来即可把
+   「事件后接受」伪装成「事件前接受」，接受锚的牙被拔掉，还制造新的对诚实运营者的假阳性
+   向量（正是 §6.20.1 要消灭的那类）；要么 (b) 改语义破坏恢复精度。定夺：**payload 追加
+   8B `accepted_at` 尾字段（116 → 124），双长度重放**（len 116 = 旧格式 → `accepted_at = 0`
+   未知哨兵；len 124 = 新格式），`VERSION` 保持 1（长度自描述，无需版本位）。哨兵语义：
+   `事件时刻 + margin ≤ 0` 恒假 ⇒ 守卫永不成立——不安全方向是「不可罚」（不可出证），
+   绝不产生假阳性。诚实边界：旧格式 WAL 恢复的尾部 epoch 接受锚无牙（kind3/4 不可出证，
+   检出率损失非正确性损失）。
+2. **acceptedAt = 摄取入口的 `now_fn()` 快照（B8 口径：零新增热路径时钟读）**。
+   `submit_inner` 入口已有 `let now = (self.now_fn)();`（预算窗回滚用）——接受时刻复用同一
+   快照，不二次取钟。invariant `acceptedAt ≤ sealedAt` 由「本 epoch 最后一条接受条的
+   accepted_at == 传给 `maybe_rotate` 的 now」构造性成立（密封只能发生在最后一次接受之后）。
+   内存面 `WindowEntry` +8B；**意图索引（`IntentRef`）不增**——实施查证其无消费方（净额
+   解析用 recipient/amount、回执用 seq、恢复尾重建走 `ReplayIntent` 元组不走索引），接受锚
+   的账本事实只落在 `WindowEntry` + WAL Intent，索引加字段是驻留浪费（§6.20.2 原文
+   「意图索引各增 8B」按无增益收窄）。
+3. **`ACCEPT_MARGIN = 300`（秒，协议常量，无 setter，Rust/合约两侧同值常量）**。本仓无生产
+   遥测，按已知事实推定：S-59 撤销传播实测 = 本地同步调用 ~0s；链上事件路径 = 块时 + 轮询
+   间隔（~17s 量级）。300s ≈ 2 个数量级于本地传播、~18× 于链上路径，同时 << CHALLENGE_WINDOW
+   （6h）。太小 → RPC 陈旧期的正常接受被罚（假阳性回归，§6.20.3）；太大 → 过失免罚窗口变宽。
+   **诚实边界：这是推定缺省不是实测标定**——生产运行后按观测滞后重定夺需走部署新实例路径
+   （合约 immutable）。
+4. **廉价一致性检查收窄：`registerAt` 锚被事件下界蕴含，不单独实现**。§6.20.3 给的
+   `registerAt(dh) ≤ acceptedAt` 在两 kind 守卫下是冗余：`bindOperator` / `revoke` 均要求
+   委托已注册（DSA / RevocationRegistry 的 `NotRegistered` 守卫）⇒ 守卫成立时
+   `registerAt ≤ 事件时刻 ≤ 事件时刻 + margin ≤ acceptedAt`。下界锚已蕴含注册锚，新增
+   映射（+8B/dh）无增益——**DSA 只增 `boundAt`**。
+5. **`sealedAt` = 声明面（观测），不进判定面**。`commit` 增发 `sealedAt`（运营者声明的密封
+   时刻）+ 链上写 `committedAt = block.timestamp`。§6.20.3 的跨 epoch 有序窗
+   （epoch k 的接受 ∈ (sealAt_{k-1}, sealAt_k]）与 `sealedAt ≤ committedAt` 的核对在**观测面**
+   （验证者 / monitor 离线比对）做，不进合约判定：判定面若 require `sealedAt ≤ block.timestamp`，
+   自派时钟超前链钟 δ 的诚实运营者在密封后立即 commit 即 revert（可用性陷阱），而它对回填
+   逃逸方向无约束力（逃逸者要的是把 acceptedAt 改**小**，上界锚管不着）。判定面只消费
+   §6.20.2 的健全守卫 + 两树包含验证；声明面事实供观测核对（决策 E 同口径：声明面不进判定）。
+6. **ABI 扩展形态**：`Epoch` 增 `acceptanceRoot` / `sealedAt` / `committedAt`；`IntentProof` 增
+   `acceptedAt`(uint64) + `acceptanceSiblings`(bytes32[])（两树同叶序 ⇒ 同 `leafIndex` /
+   `acceptedCount` / 同深度）；`commit(epochId, commitmentRoot, revocationRoot, acceptanceRoot,
+   sealedAt)`；`Commit` 事件增 `acceptanceRoot` + `sealedAt`——**`monitor/src/reputation.rs`
+   的 topic0 常量与 `bondedAmount` 数据偏移同步**（签名变 keccak 变；data 内偏移
+   `[64..96] → [96..128]`，锚定测试字面量重算）。
+7. **BatchSettler 构造器增两 immutable 地址（§6.20.2 未言明，守卫读面的必然要求）**。
+   kind4 需读 `DSA.boundAt/operatorOf`、kind3 需读 `RevocationRegistry.revokedAt`——事件时刻
+   锚在别的合约里，BatchSettler 必须持地址。`constructor(operator_, asset_, challengeBond_,
+   dsa_, revocations_)`：零地址拒（`ZeroAnchor`——缺依赖 = kind3/4 守卫静默失效面伪装），
+   构造期交叉核对 `revocations.dsa() == dsa_`（`DsaMismatch`——注册表自身也指向 DSA，两指针
+   失配 = 部署配置错误，构造期暴露）。
+8. **无新 RejectReason / 错误码**：接受包含失败 → `BadInclusionProof`；时间守卫不成立 /
+   未撤销（revokedAt = 0）/ 未绑定（operatorOf = 0）/ 绑到本合约 operator → `NotFraud`；
+   意图数 ≠ 1 → `BadFraudKind`（两 kind 均单意图，kind1 同款计数闸）。§11 表与 §6.5
+   RejectReason 语义零改动。
+9. **fraud.rs 出证面**：新 trait `EventAnchors`（`revoked_at` / `bound_at` / `operator_of` /
+   `self_operator`；`None` = 事件未发生 / 未绑定，链上零地址归一同 §6.19.2 口径）——
+   fraud.rs 保持纯函数（无 alloy 依赖，链 I/O 在演练 bin，§6.18 口径）；检测信号
+   ⑥（已撤销消费）/ ⑦（跨分片消费）+ kind3/kind4 候选（单意图、每 dh 取最低 seq 的确定性、
+   `checked_add` 防时刻溢出）；kind3/4 候选的出证闸在承诺根闸之上**追加接受根闸**（镜像重算
+   `acceptanceRoot` == 链上 `acceptanceRoot`——缺镜像 = 检出率损失不是假证，同 §6.18.3）。
+   kind1/kind2 证据携带接受面字段但合约对其不校验（向后兼容的证据形状）。
+10. **演练锚（verifier_drill 幕 5/6）**：错账注入点 = **聚合器撤销观察缺席 / 绑定闸未装配**
+    （不调 `agg.revoke` / 不配 binding gate）→ 已撤销 / 已他绑仍被接受 = kind3/kind4 的可罚
+    本体（过失形态，§6.20.2 健全性论证的原样复现）。正向：出证 → challenge → 罚没；负向：
+    事件前接受 → 手工构造的朴素 kind3/kind4 证明 → `ChallengeRejected(NotFraud)` + 押金销毁
+    = **§6.20.1 抽债券向量在链上死亡的实证**。聚合器时钟与 anvil 链时对齐（margin 比较跨
+    两侧钟）。
+11. **差分叶锚（S-57 第三契约扩展）**：`Merkle.acceptanceLeaf(seq, acceptedAt)` ↔
+    `merkle::acceptance_leaf`（前缀 `"ACCV1\0"`，22B 原像）进 `difffuzz` fixture +
+    `Differential.t.sol`，与既有四契约同批差分。
+
+#### 6.23.2 诚实边界
+
+- **接受树是运营者自证事实**（§6.20.3 原文有效）：故意回填可逃逸两 kind——与绑定合谋同层，
+  本砖把**过失**（观察滞后 / 闸失灵 / 绕过）变为可证，「故意」留治理/声誉面。
+- 旧格式 WAL（116B）恢复的尾部 `accepted_at = 0`：kind3/4 不可出证（检出率损失）。
+- margin 是推定缺省不是实测标定（定夺 3）；生产重定夺走重部署。
+- 观测面核对（sealedAt 有序窗 / committedAt 上界）本砖只落数据面（链上字段），离线比对器
+  属 monitor/验证者后续面（记录不做）。
+- kind3 的可罚本体要求运营者撤销观察缺席——生产形态下 Contract 模式 `isRevoked` 快查（S-10）
+  与 ZK 模式撤销根绑定闸（S-44）把缺席收窄为配置错误；债券保的正是「观察面失灵仍接受」。
+- kind4 对**补绑前的在途消费不成立**（§6.19.1 存量 fail-open 残余的窄化口径不变）。
+
+#### 6.23.3 工件与测试
+
+- aggregator：`merkle::acceptance_leaf` / `WindowEntry.accepted_at` /
+  `lattice::acceptance_root` + `EpochResult.acceptance_root` / WAL 124B 双长重放 /
+  ingest 传递 / `fraud.rs` `EventAnchors` + 信号 ⑥⑦ + kind3/kind4 候选。
+- contracts：`Merkle.acceptanceLeaf` / `DSA.boundAt` / `RevocationRegistry.revokedAt` /
+  `BatchSettler` commit 扩展 + Epoch/IntentProof 扩展 + kind3/kind4 守卫（`_verifyFraud`
+  按 kind 拆独立内部函数，先例 `_epochView` 收栈口径，判定语义逐字保持）+ 构造期两错误
+  （`ZeroAnchor` / `DsaMismatch`）+ **S-66 读面拆分（§6.18.2）**。
+- forge 用例（S-66 收口后 **130 全绿**，`BatchSettler.t.sol` 65 例）：commit 扩展面 /
+  kind3 正负向 / kind4 正负向（含未绑定零地址、绑本合约 operator、事件后接受不罚）/
+  多意图计数闸（kind1/3/4 同款）/ margin 边界（`revokedAt + margin == acceptedAt` 成立、
+  −1 不成立；kind4 `boundAt + margin` 同款）/ 双树负向四例（承诺面伪造 kind3/kind4、
+  接受面回填 kind3/kind4、接受路径深度错）/ 构造期 `ZeroAnchor` / `DsaMismatch` /
+  旧格式哨兵不可罚。
+- `verifier_drill` 幕 5/6（正负向各一）+ `difffuzz` 接受叶向量 + `Differential.t.sol`
+  第五契约；覆盖门禁全绿（行/函数 100%，分支唯一豁免仍是既有 bond burn 不可达边——
+  新增 kind3/4 分支零豁免，`_verifyAcceptanceInclusion` 的 leafIndex 预检按不可达边
+  删除，拦截由 `_verifyInclusion` 承担）；audit-scope §1/§4/§5 与 contracts/README
+  重对齐（§6.17.3 次序约束）。
+
 ---
 
 ## 7. 链上合约接口（Solidity，S-06 最小可跑 → S-11 生产化）
 
 六个合约在 `contracts/src/`（S-11 增 `IntentHelper.sol` / `Merkle.sol` 交叉实现；S-64 增
-`OperatorRegistry.sol`；forge test **109 用例**全绿，见 `contracts/README.md`）。签名与语义
-以代码为准，此处为契约要点。
+`OperatorRegistry.sol`；S-66 增接受锚面；forge test **130 用例**全绿，见
+`contracts/README.md`）。签名与语义以代码为准，此处为契约要点。
 
 ```solidity
 // DSA.sol —— 委托注册（Contract 模式 + 撤销锚点来源）+ 运营者绑定面（S-62，§6.19）
@@ -2064,6 +2191,9 @@ contract DSA {
     function isRegistered(bytes32 delegationHash) external view returns (bool);
     /// 绑定读面：零地址 = 未绑定（聚合器摄取闸 fail-open 语义的事实源）。
     function operatorOf(bytes32 delegationHash) external view returns (address);
+    /// S-66（§6.23.1 定夺 4）：绑定时刻锚（kind4 守卫输入，0 = 未绑定）——
+    /// 注册下界锚被事件下界蕴含，不单独实现。
+    function boundAt(bytes32 delegationHash) external view returns (uint64);
     error AlreadyRegistered(); error BadOwnerSignature(); error HighS(); error MalformedABI();
     error NotRegistered(); error NotDelegationOwner(); error AlreadyBound(); error ZeroOperator();
 }
@@ -2094,23 +2224,33 @@ contract RevocationRegistry {
     event Revoked(bytes32 indexed delegationHash, address indexed by);
     function revoke(bytes32 delegationHash) external;   // 仅 owner，未注册 reverts
     function isRevoked(bytes32 delegationHash) external view returns (bool);
+    /// S-66（§6.23）：kind3 守卫的撤销时刻锚（0 = 未撤销，与 isRevoked 同语义）。
+    function revokedAt(bytes32 delegationHash) external view returns (uint64);
     error NotOwner(); error NotRegistered();
 }
 
 // BatchSettler.sol —— 乐观批量结算（S-11 v2 生产化：operator 守卫 + 延迟 claim + 完整挑战流；
-//                      S-28 资产参数化：asset = address(0) 原生 ETH / ERC-20（如 USDC））
+//                      S-28 资产参数化：asset = address(0) 原生 ETH / ERC-20（如 USDC）；
+//                      S-66 接受锚面：acceptanceRoot + kind3/kind4 + 读面拆分 §6.18.2）
 contract BatchSettler {
     struct NetInstruction { address recipient; uint256 amount; }
     struct IntentProof {
         bytes20 agent; bytes32 delegationHash; bytes20 recipient; uint64 amount;
         bytes32 category; uint64 spendNonce; bytes memo; uint64 expiresAt;
+        uint64 acceptedAt;                 // S-66：接受时刻锚（kind3/4 时间守卫输入；
+                                           //   kind1/2 随证据携带但不校验——向后兼容形状）
         uint64 seq; uint256 leafIndex; uint256 acceptedCount; bytes32[] siblings;
+        bytes32[] acceptanceSiblings;      // S-66：平行接受树路径（两树同叶序 ⇒ 同
+                                           //   leafIndex/acceptedCount/同深度，§6.23.1 定夺 6）
     }
     struct FraudProof { uint8 kind; uint256 targetNetIndex; IntentProof[] intents; }
-    // kind 1 = 漏单（收款人 ∉ net[]）；kind 2 = 低付（同收款人意图子集和 > net[target].amount）
+    // kind 1 = 漏单（收款人 ∉ net[]）；kind 2 = 低付（同收款人意图子集和 > net[target].amount）；
+    // kind 3 = 已撤销消费（单意图，revokedAt + margin ≤ acceptedAt 仍被接受，§6.20.2）；
+    // kind 4 = 跨分片消费（单意图，绑他方运营者且 boundAt + margin ≤ acceptedAt，§6.19.1）。
+    // kind1/2/3/4 均 intents.length 闸（1/≤32/1/1）。
 
     event Commit(uint256 indexed epochId, bytes32 commitmentRoot, bytes32 revocationRoot,
-                 uint256 bondedAmount);
+                 bytes32 acceptanceRoot, uint64 sealedAt, uint256 bondedAmount);  // S-66 扩展
     event Settled(uint256 indexed epochId, bytes32 nettingRoot, uint64 netCount);
     event ChallengeSucceeded(uint256 indexed epochId, address indexed challenger, uint8 kind);
     event ChallengeRejected(uint256 indexed epochId, address indexed challenger, uint8 reason);
@@ -2122,15 +2262,25 @@ contract BatchSettler {
                                                        //        否则 = ERC-20 结算资产（如 USDC）
     uint256 public immutable challengeBond;            // S-50：挑战押金（部署期参数，>0 闸）；
                                                        //        恒原生 ETH（与 asset 无关）
+    DSA public immutable dsa;                          // S-66：kind4 锚（boundAt/operatorOf）
+    RevocationRegistry public immutable revocations;   // S-66：kind3 锚（revokedAt）
     uint256 public constant CHALLENGE_WINDOW = 6 hours;
     uint256 public constant MAX_INTENTS_PER_CHALLENGE = 32;
+    uint256 public constant ACCEPT_MARGIN = 300;       // S-66：接受时刻余量（秒，协议常量，
+                                                       //   Rust/合约同值，§6.23.1 定夺 3）
 
-    constructor(address operator_, address asset_, uint256 challengeBond_);
+    constructor(address operator_, address asset_, uint256 challengeBond_,
+                DSA dsa_, RevocationRegistry revocations_);
                                                        // bond/押金恒原生 ETH（两模式相同）；
-                                                       // challengeBond_ == 0 构造即 revert
+                                                       // challengeBond_ == 0 / 锚零地址
+                                                       //（ZeroAnchor）/ revocations_.dsa() !=
+                                                       // dsa_（DsaMismatch）构造即 revert
 
-    function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot)
-        external payable onlyOperator;                // 质押债券（msg.value）+ 锚定撤销根，一次性
+    function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot,
+                    bytes32 acceptanceRoot, uint64 sealedAt)
+        external payable onlyOperator;                // 质押债券（msg.value）+ 锚定撤销根/接受根，
+                                                      // 一次性；sealedAt 是声明面（观测，定夺 5），
+                                                      // committedAt 由合约以 block.timestamp 写定
     function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot)
         external payable onlyOperator;                // keccak(net) 校验 + 存 net[] + msg.value ≥ Σnet
     function claim(uint256 epochId, uint256 netIndex) external;  // 窗口后逐条领取结算资产（ETH/token）；voided 拒
@@ -2140,6 +2290,15 @@ contract BatchSettler {
     function withdrawRefund(uint256 epochId) external onlyOperator;
                                                       // 审计加固：挑战成功时退款 push 失败的
                                                       // 留存量拉取兜底（仅 voided epoch 可取）
+
+    // S-66 读面拆分（§6.18.2）：Epoch 13 读面字段后自动 getter 的 13 元组返回在 legacy
+    // codegen（forge coverage 关优化编译）恒爆栈 → 拆两个显式读面（net[]/claimed 不在返回面）。
+    function epochs(uint256 epochId) external view
+        returns (bytes32 commitmentRoot, bytes32 revocationRoot, bytes32 acceptanceRoot,
+                 uint64 sealedAt, uint64 committedAt, uint256 bondedAmount,
+                 uint256 settlementFunded, uint64 settledAt, bytes32 nettingRoot);
+    function epochStatus(uint256 epochId) external view
+        returns (bool committed, bool settled, bool challenged, bool voided);
 
     error EpochAlreadyCommitted(uint256); error EpochAlreadySettled(uint256);
     error EpochAlreadyChallenged(uint256); error EpochUnknown(uint256); error EpochVoided(uint256);
@@ -2152,6 +2311,7 @@ contract BatchSettler {
     // TooManyIntents / DuplicateIntent / BadInclusionProof / NotFraud / BadFraudKind
     error TokenTransferFailed(); error EthValueInTokenMode();   // S-28 资产参数化
     error EpochNotVoided(uint256); error NothingToRefund(uint256);  // 审计加固：withdrawRefund 守卫
+    error ZeroAnchor(); error DsaMismatch();           // S-66：构造期锚守卫（§6.23.1 定夺 7）
 }
 ```
 
@@ -2163,8 +2323,8 @@ contract BatchSettler {
 
 - 部署底座：Base（主网 Phase 2 起）；测试：Anvil 本地链 + Base Sepolia。
 - **S-11 结算资产 = 原生 ETH**（bond = `msg.value`；claim 付原生 ETH）；**S-28 资产参数化
-  落地 ERC-20 结算**——`BatchSettler(operator, asset, challengeBond)`（S-50 押金随构造
-  参数化）：`asset = address(0)` 逐字节保留 v2
+  落地 ERC-20 结算**——`BatchSettler(operator, asset, challengeBond, dsa, revocations)`
+  （S-50 押金随构造参数化；S-66 增 kind3/4 守卫锚两参）：`asset = address(0)` 逐字节保留 v2
   行为，`asset = USDC` 时 settle `transferFrom` 拉款 / claim 付 token / void 退款退 token
   （bond 仍原生 ETH），强制 token 模式 `msg.value == 0`（`EthValueInTokenMode`）；
   `NetInstruction { recipient, amount }` 指令形状不变，资产置换不动净额结构。欺诈证明机制
@@ -2293,7 +2453,8 @@ contract BatchSettler {
   src/bin/difffuzz.rs`（splitmix64 固定种子，跨平台确定性，零新依赖）调**生产实现**
   （不是测试替身）批量产 golden vectors → `contracts/test/fixtures/differential.json`
   （并行数组，64 意图 + 32 委托 + 8 叶 + 10 棵树（n=1..16 含非 2 幂补齐）+ 16 净额
-  向量，每棵树附包含证明（index + siblings）供 `Merkle.computeRoot` 重推）→
+  向量 + 8 接受叶（S-66 第五契约，§6.23.1 定夺 11），每棵树附包含证明
+  （index + siblings）供 `Merkle.computeRoot` 重推）→
   `contracts/test/Differential.t.sol` 逐条比对 Solidity 镜像（含 `abi.encode(net)`
   编码字节级比对，不只比根）。门禁：`verify.sh` 新步 **8b**——重生成 fixture 到
   `target/` 与入库版本 `cmp` 漂移闸（改任一侧规范不回填 fixture 即红）+ forge 差分

@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 
 use meridian_aggregator::ingest::{Aggregator, IngestConfig};
 use meridian_aggregator::lattice::EpochResult;
-use meridian_aggregator::merkle::{inclusion_proof, leaf as merkle_leaf};
+use meridian_aggregator::merkle::{acceptance_leaf, inclusion_proof, leaf as merkle_leaf};
 use meridian_aggregator::proof::FormatVerifier;
 use meridian_aggregator::wal::Wal;
 use meridian_aggregator::window::WindowEntry;
@@ -72,13 +72,16 @@ async fn run_smoke() -> Result<()> {
         .await
         .context("anvil_setBalance(owner)")?;
 
-    // 2. 部署三合约（BatchSettler 构造参数 = operator + asset + challengeBond（S-50 部署期
-    //    押金参数）；S-11d 走原生 ETH = address(0)）。
+    // 2. 部署合同栈（BatchSettler 构造参数 = operator + asset + challengeBond（S-50 部署期
+    //    押金参数）+ P2-3 双锚面（DSA / RevocationRegistry，§6.23.1 定夺 7）；S-11d 走
+    //    原生 ETH = address(0)）。
     let dsa_addr = deploy(&provider, "DSA.sol/DSA.json", &[]).await?;
     let reg_addr = deploy(&provider, "RevocationRegistry.sol/RevocationRegistry.json", &abi_addr(dsa_addr)).await?;
     let mut settler_args = abi_addr(deployer_addr);
     settler_args.extend_from_slice(&abi_addr(Address::ZERO));
     settler_args.extend_from_slice(&abi_u256(CHALLENGE_BOND));
+    settler_args.extend_from_slice(&abi_addr(dsa_addr));
+    settler_args.extend_from_slice(&abi_addr(reg_addr));
     let settler_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &settler_args).await?;
     let dsa_c = IDSA::new(dsa_addr, &provider);
     let reg_c = IRevocationRegistry::new(reg_addr, &owner_provider);
@@ -140,7 +143,13 @@ async fn run_smoke() -> Result<()> {
     assert_eq!(res0.epoch_id, 0, "聚合器 epoch 编号从 0 起");
 
     settler
-        .commit(U256::from(res0.epoch_id), B256::from(res0.commitment_root), B256::from(res0.revocation_root))
+        .commit(
+            U256::from(res0.epoch_id),
+            B256::from(res0.commitment_root),
+            B256::from(res0.revocation_root),
+            B256::from(res0.acceptance_root),
+            res0.sealed_at,
+        )
         .value(U256::from(BOND))
         .send().await.context("commit send")?
         .get_receipt().await.context("commit receipt")?;
@@ -191,7 +200,13 @@ async fn run_smoke() -> Result<()> {
     assert_ne!(res1.revocation_root, res0.revocation_root, "撤销 A 后撤销根变化（1 epoch 内锚定）");
 
     settler
-        .commit(U256::from(1), B256::from(res1.commitment_root), B256::from(res1.revocation_root))
+        .commit(
+            U256::from(1),
+            B256::from(res1.commitment_root),
+            B256::from(res1.revocation_root),
+            B256::from(res1.acceptance_root),
+            res1.sealed_at,
+        )
         .value(U256::from(BOND))
         .send().await.context("commit1 send")?
         .get_receipt().await.context("commit1 receipt")?;
@@ -216,6 +231,13 @@ async fn run_smoke() -> Result<()> {
         .expect("R4 意图必须在密封 epoch entries 内");
     let leaves: Vec<[u8; 32]> = entries1.iter().map(|e| merkle_leaf(e.seq, e.intent_hash)).collect();
     let (accepted_count, siblings) = inclusion_proof(&leaves, leaf_index).expect("证明索引在界内");
+    // P2-3：kind1 证据随行接受面字段（合约对 kind1 不校验，但 IntentProof 须良构）——
+    // 平行接受树同叶集同序 ⇒ 同叶索引同深度。
+    let acc_leaves: Vec<[u8; 32]> = entries1
+        .iter()
+        .map(|e| acceptance_leaf(e.seq, e.accepted_at))
+        .collect();
+    let (_, acc_siblings) = inclusion_proof(&acc_leaves, leaf_index).expect("接受树证明索引在界内");
     let intent_proof = IBatchSettler::IntentProof {
         agent: env4.intent.agent.into(),
         delegationHash: B256::from(env4.intent.delegation_hash),
@@ -225,10 +247,12 @@ async fn run_smoke() -> Result<()> {
         spendNonce: env4.intent.spend_nonce,
         memo: Bytes::new(),
         expiresAt: env4.intent.expires_at,
+        acceptedAt: entries1[leaf_index].accepted_at,
         seq: entries1[leaf_index].seq,
         leafIndex: U256::from(leaf_index),
         acceptedCount: U256::from(accepted_count),
         siblings: siblings.into_iter().map(B256::from).collect(),
+        acceptanceSiblings: acc_siblings.into_iter().map(B256::from).collect(),
     };
     let fp = IBatchSettler::FraudProof {
         kind: 1,

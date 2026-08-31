@@ -14,9 +14,10 @@
 //!     cargo run --release --manifest-path contracts/rust-smoke/Cargo.toml --bin deploy -- --live
 //!
 //! 目标链通过 RPC 自动识别（chain_id 84532 = Base Sepolia；8453 = Base 主网；1337 = anvil）。
-//! 部署顺序（构造参数依赖，S-64）：DSA(无参) → RevocationRegistry(DSA) →
+//! 部署顺序（构造参数依赖，S-64/P2-3）：DSA(无参) → RevocationRegistry(DSA) →
 //! OperatorRegistry(registrar = 部署方) → appendSchedule(初始调度) →
-//! BatchSettler(操作者+资产+challengeBond ← 调度读数) → registerOperator(settler)。
+//! BatchSettler(操作者+资产+challengeBond ← 调度读数 + DSA/RevocationRegistry 锚面) →
+//! registerOperator(settler)。
 //!
 //! S-28 结算资产：`MERIDIAN_SETTLEMENT_ASSET`（hex 地址）= ERC-20 结算资产（如 USDC）；
 //! 未设置 = 原生 ETH（asset = address(0)，v2 行为）。Base 主网 USDC =
@@ -165,13 +166,13 @@ async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> R
     );
     deployed.push(("DSA", dsa_addr));
 
-    let (addr, receipt) =
+    let (rev_addr, receipt) =
         deploy_with_receipt(provider, artifacts[1], &abi_addr(dsa_addr), gas_limit).await?;
     println!(
-        "  ✅ RevocationRegistry → {addr}（tx {}，gas {}）",
+        "  ✅ RevocationRegistry → {rev_addr}（tx {}，gas {}）",
         receipt.transaction_hash, receipt.gas_used
     );
-    deployed.push(("RevocationRegistry", addr));
+    deployed.push(("RevocationRegistry", rev_addr));
 
     // S-64（TECH_SPEC §6.21）：OperatorRegistry（registrar = 部署方）+ 初始金额调度。
     // 决策 D（先改后码定夺 1）：「新实例读取当刻值固化」的读取点在部署流程——BatchSettler
@@ -227,11 +228,14 @@ async fn run<P: Provider>(provider: &P, live: bool, gas_limit: Option<u64>) -> R
         _ => Address::ZERO,
     };
 
-    // BatchSettler 三参构造（S-50：operator + asset + challengeBond）——challengeBond 取
-    // 当刻调度读数（决策 D 实例固化），部署后回读交叉核对（单一事实源在链上）。
+    // BatchSettler 五参构造（S-50：operator + asset + challengeBond；P2-3：DSA +
+    // RevocationRegistry 双锚面，§6.23.1 定夺 7）——challengeBond 取当刻调度读数（决策 D
+    // 实例固化），部署后回读交叉核对（单一事实源在链上）。
     let mut settler_args = abi_addr(operator_addr);
     settler_args.extend_from_slice(&abi_addr(asset));
     settler_args.extend_from_slice(&abi_u256(sched.challengeBond.to::<u128>()));
+    settler_args.extend_from_slice(&abi_addr(dsa_addr));
+    settler_args.extend_from_slice(&abi_addr(rev_addr));
     let (addr, receipt) =
         deploy_with_receipt(provider, artifacts[3], &settler_args, gas_limit).await?;
     println!(

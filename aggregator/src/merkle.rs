@@ -26,6 +26,21 @@ pub fn leaf(seq: u64, intent_hash: [u8; 32]) -> [u8; 32] {
     h(&buf)
 }
 
+/// 接受锚叶前缀（"ACCV1\0"，P2-3 §6.23）。
+pub const ACCEPTANCE_LEAF_PREFIX: [u8; 6] = *b"ACCV1\0";
+
+/// 接受锚叶（P2-3 §6.23）= sha256("ACCV1\0" ‖ seq_le(8) ‖ accepted_at_le(8)) = 22B 原像。
+/// 与 Solidity `Merkle.acceptanceLeaf` 逐字节对齐（S-57 差分闸第三契约扩展）：
+/// 平行接受树与承诺树同叶集同序（seq 升序），单独锚定接受时刻、不并入承诺叶原像
+///（§6.20.1 否决路线 1：改承诺叶原像会炸穿撤销索引/SDK/电路全部锚点）。
+pub fn acceptance_leaf(seq: u64, accepted_at: u64) -> [u8; 32] {
+    let mut buf = [0u8; 22];
+    buf[..6].copy_from_slice(&ACCEPTANCE_LEAF_PREFIX);
+    buf[6..14].copy_from_slice(&seq.to_le_bytes());
+    buf[14..].copy_from_slice(&accepted_at.to_le_bytes());
+    h(&buf)
+}
+
 /// Merkle 根：2 的幂补齐，零叶子 = EMPTY_LEAF，逐层 sha256(left‖right)。
 /// 空输入返回 sha256("")（与 EMPTY_LEAF 相同）。
 pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
@@ -140,6 +155,24 @@ mod tests {
         let b = leaf(2, [0x02; 32]);
         assert_eq!(merkle_root(&[a, b]), merkle_root(&[a, b]));
         assert_ne!(merkle_root(&[a, b]), merkle_root(&[b, a]));
+    }
+
+    /// 接受锚叶（P2-3 §6.23）：原像 22B（"ACCV1\0" ‖ seq_le(8) ‖ accepted_at_le(8)），
+    /// 独立重算原像对账 golden + 字段敏感性（seq / accepted_at 任一变化 → 叶变）。
+    #[test]
+    fn acceptance_leaf_matches_preimage_and_is_field_sensitive() {
+        let mut preimage = Vec::with_capacity(22);
+        preimage.extend_from_slice(&ACCEPTANCE_LEAF_PREFIX);
+        preimage.extend_from_slice(&7u64.to_le_bytes());
+        preimage.extend_from_slice(&1_700_000_123u64.to_le_bytes());
+        let mut s = Sha256::new();
+        s.update(&preimage);
+        let golden: [u8; 32] = s.finalize().into();
+        assert_eq!(acceptance_leaf(7, 1_700_000_123), golden);
+        assert_ne!(acceptance_leaf(8, 1_700_000_123), golden);
+        assert_ne!(acceptance_leaf(7, 1_700_000_124), golden);
+        // accepted_at = 0（旧格式哨兵，§6.23.1 定夺 1）仍是确定性 32B 叶。
+        assert_eq!(acceptance_leaf(7, 0), acceptance_leaf(7, 0));
     }
 
     /// 任意叶数任意索引：proof → verify 恒真。小树枚举全部索引；100k 容量级采样（每个 proof

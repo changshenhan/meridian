@@ -70,12 +70,15 @@ async fn run_m1() -> Result<()> {
         .context("anvil_setBalance(owner)")?;
 
     let dsa_addr = deploy(&provider, "DSA.sol/DSA.json", &[]).await?;
-    // RevocationRegistry 部署保持合同栈完整（本 demo 不触发撤销路径，S-11d 场景2 已覆盖）。
-    let _reg_addr = deploy(&provider, "RevocationRegistry.sol/RevocationRegistry.json", &abi_addr(dsa_addr)).await?;
+    // RevocationRegistry 部署保持合同栈完整（本 demo 不触发撤销路径，S-11d 场景2 已覆盖）；
+    // P2-3：两者同时是 BatchSettler 的 kind3/kind4 锚面构造参数（§6.23.1 定夺 7）。
+    let reg_addr = deploy(&provider, "RevocationRegistry.sol/RevocationRegistry.json", &abi_addr(dsa_addr)).await?;
     let mut settler_args = abi_addr(deployer_addr);
     settler_args.extend_from_slice(&abi_addr(Address::ZERO));
     // S-50：挑战押金为部署期构造参数（本 demo 沿用参考值 0.1 ether）。
     settler_args.extend_from_slice(&abi_u256(CHALLENGE_BOND));
+    settler_args.extend_from_slice(&abi_addr(dsa_addr));
+    settler_args.extend_from_slice(&abi_addr(reg_addr));
     let settler_addr = deploy(&provider, "BatchSettler.sol/BatchSettler.json", &settler_args).await?;
     let dsa_c = IDSA::new(dsa_addr, &provider);
     let settler = IBatchSettler::new(settler_addr, &provider);
@@ -184,7 +187,13 @@ async fn run_m1() -> Result<()> {
     // E. BatchSettler 净额结算（Anvil 全绿）
     // ============================================================
     settler
-        .commit(U256::from(res.epoch_id), B256::from(res.commitment_root), B256::from(res.revocation_root))
+        .commit(
+            U256::from(res.epoch_id),
+            B256::from(res.commitment_root),
+            B256::from(res.revocation_root),
+            B256::from(res.acceptance_root),
+            res.sealed_at,
+        )
         .value(U256::from(BOND))
         .send().await.context("commit send")?
         .get_receipt().await.context("commit receipt")?;

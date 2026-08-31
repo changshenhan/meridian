@@ -23,6 +23,9 @@ contract SettlerHandler is Test, ChallengeTestHelper {
     uint256 internal constant BOND = 1 ether;
     uint256 internal constant DEPOSIT = 0.1 ether;
     uint256 internal constant WINDOW = 6 hours;
+    /// P2-3：接受锚根 / sealedAt 占位（handler 只出 kind1/kind2 证明，不消费接受锚面）。
+    bytes32 internal constant ACCEPTANCE_ROOT = keccak256("acceptance-root");
+    uint64 internal constant SEALED_AT = 1_700_000_000;
 
     address[3] internal recipients = [address(0xB1), address(0xB2), address(0xB3)];
 
@@ -50,7 +53,7 @@ contract SettlerHandler is Test, ChallengeTestHelper {
     uint256 public ghostClaimedSum;
 
     constructor() {
-        bs = new BatchSettler(operator, address(0), DEPOSIT);
+        bs = deploySettler(operator, address(0), DEPOSIT);
         vm.deal(operator, 1_000 ether);
         vm.deal(challenger, 1_000 ether);
     }
@@ -84,7 +87,7 @@ contract SettlerHandler is Test, ChallengeTestHelper {
         bytes32 root = merkleRoot(leaves);
 
         vm.prank(operator);
-        bs.commit{value: BOND}(epochId, root, keccak256("revocation"));
+        bs.commit{value: BOND}(epochId, root, keccak256("revocation"), ACCEPTANCE_ROOT, SEALED_AT);
         ghostBondSum += BOND;
         epochCount++;
     }
@@ -216,7 +219,8 @@ contract SettlerHandler is Test, ChallengeTestHelper {
         bs.challenge{value: DEPOSIT}(epochId, fp);
         // 挑战成功：bonded/settlementFunded 被清零 → ghost 按调用前原额扣减（storage 已
         // 清零不可再读；押金原额退回挑战者，不进 ghost）。
-        (,, uint256 bonded, uint256 funded,,,,,, bool voided_) = bs.epochs(epochId);
+        (,,,,, uint256 bonded, uint256 funded,,) = bs.epochs(epochId);
+        (,,, bool voided_) = bs.epochStatus(epochId);
         assertTrue(voided_, "valid fraud proof must void the epoch");
         assertEq(bonded + funded, 0, "success zeroes both accounts");
         ghostBondSum -= BOND;
@@ -306,8 +310,8 @@ contract BatchSettlerInvariantTest is Test {
     /// ② 状态机单调性（全部已创建 epoch 枚举）。
     function invariant_state_machine() public view {
         for (uint256 i = 0; i < handler.epochCount(); i++) {
-            (,,,,,, bool committed_, bool settled_, bool challenged_, bool voided_) =
-                handler.bs().epochs(i);
+            (bool committed_, bool settled_, bool challenged_, bool voided_) =
+                handler.bs().epochStatus(i);
             assertTrue(!settled_ || committed_, "settled implies committed");
             assertTrue(!voided_ || challenged_, "voided implies challenged");
             assertTrue(!challenged_ || voided_, "challenged implies voided");

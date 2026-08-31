@@ -19,16 +19,26 @@ contract RevocationRegistry {
 
     mapping(bytes32 => bool) public revoked;
 
+    /// 撤销时刻（P2-3 §6.20.2/§6.23）：delegation_hash -> 首次撤销的 block.timestamp。
+    /// kind3（已撤销消费）守卫的时间下界锚（`revokedAt(dh) + ACCEPT_MARGIN <= acceptedAt`）。
+    /// 粘性语义：只在本委托第一次 revoke 时写（重复 revoke 幂等不重写）——撤销不可解除，
+    /// 「最早可观察撤销时刻」才是诚实下界（写晚 = 守卫偏松放过罚、写早 = 假阳性），锚定
+    /// 首次即两侧都不偏。零值 = 未撤销（与 `revoked` 布尔同语义）。
+    mapping(bytes32 => uint64) public revokedAt;
+
     constructor(DSA _dsa) {
         dsa = _dsa;
     }
 
-    /// 仅 owner：撤销一张已注册委托。
+    /// 仅 owner：撤销一张已注册委托。幂等（重复撤销不 revert、时刻锚不重写）。
     function revoke(bytes32 delegationHash) external {
         address owner = dsa.ownerOf(delegationHash);
         if (owner == address(0)) revert NotRegistered(delegationHash);
         if (msg.sender != owner) revert NotOwner();
         revoked[delegationHash] = true;
+        if (revokedAt[delegationHash] == 0) {
+            revokedAt[delegationHash] = uint64(block.timestamp);
+        }
         emit Revoked(delegationHash, msg.sender);
     }
 

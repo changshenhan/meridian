@@ -51,12 +51,15 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     uint256 internal constant BOND = 1 ether;
     address internal constant CHALLENGER = address(0xC0FFEE);
     bytes32 internal constant REVOCATION_ROOT = keccak256("revocation-root");
+    /// P2-3：接受锚根 / sealedAt 占位（本套件只验资产路径，不消费接受锚面）。
+    bytes32 internal constant ACCEPTANCE_ROOT = keccak256("acceptance-root");
+    uint64 internal constant SEALED_AT = 1_700_000_000;
     uint256 internal constant MINT = 1_000_000e6; // 1,000,000 USDC
 
     function setUp() public {
         usdc = new MockUSDC();
         // operator = 测试合约自身；asset = MockUSDC。
-        bs = new BatchSettler(address(this), address(usdc), CHALLENGE_BOND);
+        bs = deploySettler(address(this), address(usdc), CHALLENGE_BOND);
         usdc.mint(address(this), MINT);
         // S-38：挑战押金恒为原生 ETH，挑战者预注资。
         vm.deal(CHALLENGER, 10 ether);
@@ -126,21 +129,22 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     // ------------------------------------------------------------------ settle
 
     function test_settle_pulls_usdc_from_operator() public {
-        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
         BatchSettler.NetInstruction[] memory n = _net();
 
         uint256 opBefore = usdc.balanceOf(address(this));
         _settleUsdc(n);
         assertEq(usdc.balanceOf(address(this)), opBefore - _sum(n), "USDC pulled");
         assertEq(usdc.balanceOf(address(bs)), _sum(n), "held by settler");
-        (,, uint256 bonded, uint256 funded,,,, bool settled,,) = _epochView(EPOCH);
+        (,,,,, uint256 bonded, uint256 funded,,) = _epochView(EPOCH);
+        (, bool settled,,) = _epochStatus(EPOCH);
         assertEq(bonded, 0, "no bond yet");
         assertEq(funded, _sum(n));
         assertTrue(settled);
     }
 
     function test_settle_eth_value_reverts_in_token_mode() public {
-        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
         BatchSettler.NetInstruction[] memory n = _net();
         usdc.approve(address(bs), _sum(n));
         vm.expectRevert(BatchSettler.EthValueInTokenMode.selector);
@@ -148,7 +152,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     }
 
     function test_settle_without_allowance_reverts() public {
-        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
         BatchSettler.NetInstruction[] memory n = _net();
         // 不 approve → transferFrom 失败 → TokenTransferFailed。
         vm.expectRevert(BatchSettler.TokenTransferFailed.selector);
@@ -158,9 +162,9 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     function test_settle_insufficient_balance_reverts() public {
         // 余额不足（approve 够但 mint 余额 < net 和）→ transferFrom 失败。
         MockUSDC poor = new MockUSDC();
-        BatchSettler bsPoor = new BatchSettler(address(this), address(poor), CHALLENGE_BOND);
+        BatchSettler bsPoor = deploySettler(address(this), address(poor), CHALLENGE_BOND);
         poor.mint(address(this), 50e6);
-        bsPoor.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        bsPoor.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
         BatchSettler.NetInstruction[] memory n = _net(); // Σ = 300e6 > 50e6
         poor.approve(address(bsPoor), _sum(n));
         vm.expectRevert(BatchSettler.TokenTransferFailed.selector);
@@ -170,7 +174,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     // ------------------------------------------------------------------ claim
 
     function test_claim_after_window_pays_usdc() public {
-        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
         BatchSettler.NetInstruction[] memory n = _net();
         _settleUsdc(n);
         vm.warp(block.timestamp + bs.CHALLENGE_WINDOW() + 1);
@@ -185,7 +189,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     }
 
     function test_claim_double_reverts() public {
-        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
         _settleUsdc(_net());
         vm.warp(block.timestamp + bs.CHALLENGE_WINDOW() + 1);
         bs.claim(EPOCH, 0);
@@ -196,7 +200,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     /// 收款人被真实 USDC 黑名单冻结（transfer revert）→ claim 整笔回滚
     ///（claimed 不置位），资金留在合同；解除黑名单后重试成功。
     function test_claim_blacklisted_recipient_reverts_then_recovers() public {
-        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        bs.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
         BatchSettler.NetInstruction[] memory n = _net();
         _settleUsdc(n);
         vm.warp(block.timestamp + bs.CHALLENGE_WINDOW() + 1);
@@ -223,7 +227,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         uint64[] memory seqs = new uint64[](1);
         seqs[0] = 1;
         (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
-        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
 
         // 欺诈结算：net 只含另一收款人（漏掉 B1）。
         BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
@@ -246,7 +250,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond (ETH) to challenger");
         assertEq(usdc.balanceOf(address(this)), opUsdcBefore, "USDC refunded (net=0)");
         assertEq(address(this).balance, opEthBefore, "no ETH refund");
-        (,,,,,,, bool settled, bool challenged, bool voided) = _epochView(EPOCH);
+        (, bool settled, bool challenged, bool voided) = _epochStatus(EPOCH);
         assertTrue(settled);
         assertTrue(challenged);
         assertTrue(voided);
@@ -265,7 +269,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         uint64[] memory seqs = new uint64[](1);
         seqs[0] = 1;
         (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
-        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
 
         BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
         net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 100e6});
@@ -294,7 +298,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         uint64[] memory seqs = new uint64[](1);
         seqs[0] = 1;
         (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
-        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
 
         BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
         net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 100e6});
@@ -311,7 +315,8 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         vm.prank(CHALLENGER);
         bs.challenge{value: challengeBond}(EPOCH, fp);
 
-        (,,, uint256 funded,,,,, bool challenged, bool voided) = _epochView(EPOCH);
+        (,,,,,, uint256 funded,,) = _epochView(EPOCH);
+        (,, bool challenged, bool voided) = _epochStatus(EPOCH);
         assertTrue(challenged, "challenge must not be blocked by refund failure");
         assertTrue(voided);
         assertEq(CHALLENGER.balance, challengerBefore + BOND, "bond payout intact");
@@ -322,7 +327,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         // TokenTransferFailed 整笔回滚，记账不丢（revert 冒泡变体见下方 catch 分支测试）。
         vm.expectRevert(BatchSettler.TokenTransferFailed.selector);
         bs.withdrawRefund(EPOCH);
-        (,,, uint256 fundedStill,,,,,,) = _epochView(EPOCH);
+        (,,,,,, uint256 fundedStill,,) = _epochView(EPOCH);
         assertEq(fundedStill, 100e6, "retained accounting intact after failed pull");
 
         // 拉取兜底：解除黑名单后运营者取回留存量。
@@ -338,7 +343,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
     /// 资金留存；withdrawRefund 在运营者仍被冻结时 revert（TokenTransferFailed）可重试。
     function test_challenge_refund_reverting_token_catch_branch() public {
         RevertOnTransferToken token = new RevertOnTransferToken();
-        BatchSettler bsR = new BatchSettler(address(this), address(token), CHALLENGE_BOND);
+        BatchSettler bsR = deploySettler(address(this), address(token), CHALLENGE_BOND);
         token.mint(address(this), 1_000e6);
 
         bytes32 dh = keccak256("delegation-1");
@@ -347,7 +352,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         uint64[] memory seqs = new uint64[](1);
         seqs[0] = 1;
         (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
-        bsR.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT);
+        bsR.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
 
         BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
         net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 100e6});
@@ -362,7 +367,8 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         vm.prank(CHALLENGER);
         bsR.challenge{value: challengeBond}(EPOCH, fp); // transfer revert → catch 吸收
 
-        (,,, uint256 funded,,,,, bool challenged, bool voided) = bsR.epochs(EPOCH);
+        (,,,,,, uint256 funded,,) = bsR.epochs(EPOCH);
+        (,, bool challenged, bool voided) = bsR.epochStatus(EPOCH);
         assertTrue(challenged);
         assertTrue(voided);
         assertEq(funded, 100e6, "retained via catch branch");
@@ -372,7 +378,7 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         // 与 claim 的失败路径一致），settlementFunded 记账不丢，解除后可重试。
         vm.expectRevert("frozen");
         bsR.withdrawRefund(EPOCH);
-        (,,, uint256 fundedAfter,,,,,,) = bsR.epochs(EPOCH);
+        (,,,,,, uint256 fundedAfter,,) = bsR.epochs(EPOCH);
         assertEq(fundedAfter, 100e6, "retained accounting intact");
     }
 
@@ -380,8 +386,8 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
 
     /// asset=address(0) 走原生 ETH —— v2 行为的部署形态（完整回归在 BatchSettler.t.sol）。
     function test_eth_mode_deploy_still_settles_native() public {
-        BatchSettler bsEth = new BatchSettler(address(this), address(0), CHALLENGE_BOND);
-        bsEth.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT);
+        BatchSettler bsEth = deploySettler(address(this), address(0), CHALLENGE_BOND);
+        bsEth.commit(EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
         BatchSettler.NetInstruction[] memory n = new BatchSettler.NetInstruction[](1);
         n[0] = BatchSettler.NetInstruction({recipient: address(0xA1), amount: 1 ether});
         bsEth.settle{value: 1 ether}(EPOCH, n, keccak256(abi.encode(n)));
@@ -400,17 +406,25 @@ contract BatchSettlerUsdcTest is Test, ChallengeTestHelper {
         returns (
             bytes32 commitmentRoot,
             bytes32 revocationRoot,
+            bytes32 acceptanceRoot,
+            uint64 sealedAt,
+            uint64 committedAt,
             uint256 bondedAmount,
             uint256 settlementFunded,
             uint64 settledAt,
-            bytes32 nettingRoot,
-            bool committed,
-            bool settled,
-            bool challenged,
-            bool voided
+            bytes32 nettingRoot
         )
     {
-        // 同 BatchSettler.t.sol：直接回传 10 元组，避开 coverage 编译（无优化器）栈太深。
+        // 同 BatchSettler.t.sol：直接回传 9 元组，避开 coverage 编译（无优化器）栈太深
+        //（S-66 读面拆分：13 元组单读恒爆栈，状态位走 _epochStatus）。
         return bs.epochs(epochId);
+    }
+
+    function _epochStatus(uint256 epochId)
+        internal
+        view
+        returns (bool committed, bool settled, bool challenged, bool voided)
+    {
+        return bs.epochStatus(epochId);
     }
 }
