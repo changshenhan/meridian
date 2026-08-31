@@ -8,7 +8,7 @@
 //! - `epoch_backlog`：pending_sealed 是否超过阈值。结算滞后是运营风险（长时间不
 //!   process_pending，风险集中在 BatchSettler 消费端），不是数据损坏——阈值可放宽。
 
-use meridian_aggregator::health::HealthSnapshot;
+use mist_aggregator::health::HealthSnapshot;
 use serde::Serialize;
 
 /// 结算滞后告警边界：允许 pending_sealed 最多落后这么多 epoch。
@@ -96,7 +96,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_aggregator::hist::LatencySnapshot;
+    use mist_aggregator::hist::LatencySnapshot;
 
     fn snap() -> HealthSnapshot {
         HealthSnapshot {

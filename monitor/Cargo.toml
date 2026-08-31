@@ -1,21 +1,21 @@
 [package]
-name = "meridian-monitor"
+name = "mist-monitor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Meridian 聚合器可观测性脚手架：Prometheus 文本导出 + /healthz 健康检查端点（S-15，std-only 零依赖）"
+description = "Mist 聚合器可观测性脚手架：Prometheus 文本导出 + /healthz 健康检查端点（S-15，std-only 零依赖）"
 
 [dependencies]
-meridian-aggregator = { workspace = true }
-meridian-core = { workspace = true }
+mist-aggregator = { workspace = true }
+mist-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # S-65 声誉面（TECH_SPEC §6.22）：链上事件 hex 编解码。
 hex = { workspace = true }
 
 [[bin]]
-name = "meridian-monitor"
+name = "mist-monitor"
 path = "src/bin/main.rs"
 
 [dev-dependencies]

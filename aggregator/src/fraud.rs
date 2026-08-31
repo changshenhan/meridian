@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use meridian_core::dsa::{self, SpendIntent};
+use mist_core::dsa::{self, SpendIntent};
 
 use crate::lattice::{self, NetLine};
 use crate::merkle::{self, leaf as merkle_leaf};

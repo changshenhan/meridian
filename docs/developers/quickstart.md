@@ -4,7 +4,7 @@
 Linux 或 WSL 均可用；Windows 用同款可执行文件）、可选 **nargo/bb**（ZK 门禁，仅 Linux）。
 
 ```sh
-git clone <meridian-repo> && cd meridian
+git clone <mist-repo> && cd mist
 cargo build --workspace            # 首次编译较久；或直接跑下面的命令（自动编译）
 ```
 
@@ -41,7 +41,7 @@ OK: M1 端到端 demo 全部通过
 ## 3. 框架闭环（3 家 demo 同一条链路）
 
 ```sh
-cargo build -p meridian-mcp --release   # MCP 服务器（内嵌真实聚合器，stdio）
+cargo build -p mist-mcp --release   # MCP 服务器（内嵌真实聚合器，stdio）
 cd demos
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe langchain_demo.py
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe autogen_demo.py
@@ -62,7 +62,7 @@ Ed25519 签 intent，付 vendor）→ `balance`（额度滚动）→ `verify_rec
 以"替 owner 花钱"为例（Rust，`sdk/`）：
 
 ```rust
-use meridian_sdk::{SdkClient, PayParams};
+use mist_sdk::{SdkClient, PayParams};
 
 // 1) 注册委托：owner 私钥签发 DSA 授权给 agent，限制单笔/窗口/总额
 let mut client = SdkClient::in_process(owner_key, agent_key, limits)?;

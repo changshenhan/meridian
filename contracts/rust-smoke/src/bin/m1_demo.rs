@@ -28,13 +28,13 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::lattice;
-use meridian_aggregator::merkle::{leaf as merkle_leaf, merkle_root};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::dsa::{self, AgentSigningKey, Delegation, RateLimit};
-use meridian_core::error::Error;
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::lattice;
+use mist_aggregator::merkle::{leaf as merkle_leaf, merkle_root};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::dsa::{self, AgentSigningKey, Delegation, RateLimit};
+use mist_core::error::Error;
 
 use contract_smoke::common::*;
 
@@ -112,12 +112,12 @@ async fn run_m1() -> Result<()> {
         .send().await?
         .get_receipt().await?;
     let registered: bool = dsa_c.isRegistered(B256::from(dh)).call().await?;
-    assert!(registered, "on-chain sha256(delegationABI) 必须等于 meridian-core delegation_hash");
+    assert!(registered, "on-chain sha256(delegationABI) 必须等于 mist-core delegation_hash");
     println!("OK M1: DSA 链上登记（sha256(delegationABI) == delegation_hash）");
 
     // ---- 聚合器：可控时钟 + WAL，单 epoch 容量 10 万 ----
     let clock = Arc::new(AtomicU64::new(1_700_000_000));
-    let wal_path = std::env::temp_dir().join(format!("meridian-m1-{}.wal", std::process::id()));
+    let wal_path = std::env::temp_dir().join(format!("mist-m1-{}.wal", std::process::id()));
     let agent_key = AgentSigningKey::from_bytes(&AGENT_KEY_BYTES);
     let agg = aggregator(clock.clone(), &wal_path);
     agg.register(sd, agent_key.verifying_key());

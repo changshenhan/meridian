@@ -1,4 +1,4 @@
-# Meridian 审计范围书（v1 · 2026-08-29，S-58 与实态对齐 · 2026-08-31）
+# Mist 审计范围书（v1 · 2026-08-29，S-58 与实态对齐 · 2026-08-31）
 
 > 用途：委托第三方安全审计时随附的范围与不变量定义。审计前如代码变更，以 tag
 > `audit-v1` 为准重验。当前状态：**范围书就绪且已与实态对齐（S-58，含 §6 冻结清单），
@@ -18,7 +18,7 @@
 
 链下交叉一致性（第二审计对象）：
 
-- `meridian-core::dsa::delegation_hash`（Rust sha2）↔ Solidity `sha256` 预编译：
+- `mist-core::dsa::delegation_hash`（Rust sha2）↔ Solidity `sha256` 预编译：
   字节级一致（`"DSAv1\0"` 前缀 + agent + owner canonical 编码，ABI 区间 `[26:46]`）。
 - 聚合器 `RevocationSet::sparse_root`（Pedersen sparse merkle，S-41 起与电路同哈希同叶规范，
   Rust 复现见 `aggregator/src/noir_pedersen.rs`）↔ 链上 `commit` 锚定根 ↔ 电路
@@ -68,7 +68,7 @@
   路径**缺省**用 `FormatVerifier`（TEMPORARY 占位），**未**依赖电路正确性——审计报告
   须注明此临时态。S-40（2026-08-30）已交付真验证后端 `BbVerifier`（bb CLI wrapper，
   TECH_SPEC §6.13）；**prove 侧 S-43（2026-08-30）已实装**（`NoirProver`，TECH_SPEC
-  §6.14）。`MERIDIAN_VERIFY_BACKEND=bb` 显式开启后摄取路径**依赖电路正确性**
+  §6.14）。`MIST_VERIFY_BACKEND=bb` 显式开启后摄取路径**依赖电路正确性**
   （电路进审计范围）；该模式同时要求真电路 prover 产物（`PlaceholderProver` 产物会被
   fail-closed 全拒）。全链真 ZK 装配的可运行示例见 §6.15（`noir_demo`）。
 - 聚合器内核 Rust 侧（WAL/lattice）：不持链上资产，故障模式 = 停机非盗币；作为

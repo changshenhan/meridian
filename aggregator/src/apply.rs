@@ -25,8 +25,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
 
-use meridian_core::dsa::{delegation_hash, AgentPubKey, SignedDelegation};
-use meridian_core::error::Error;
+use mist_core::dsa::{delegation_hash, AgentPubKey, SignedDelegation};
+use mist_core::error::Error;
 use sha2::{Digest, Sha256};
 
 use crate::ingest::{
@@ -361,7 +361,7 @@ struct IntentRecord {
 /// ——它们不是账本状态，恢复后从 0 起，§6.2 既有口径）。
 pub(crate) fn state_digest(parts: &LedgerParts<'_>) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"MERIDIAN-APPLY-DIGEST-V1");
+    h.update(b"MIST-APPLY-DIGEST-V1");
     // 每域先写域标签 + 条目数（digest_into 自带计数）再写内容——定长记录流 + 计数前缀
     // 使拼接无歧义。
     h.update(b"REG");
@@ -427,7 +427,7 @@ pub(crate) fn state_digest(parts: &LedgerParts<'_>) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_core::dsa::{
+    use mist_core::dsa::{
         intent_hash, owner_signing_key_from_bytes, sign_delegation, AgentSigningKey, Delegation,
         RateLimit, SpendIntent,
     };
@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(report.last_epoch_id, 3);
         assert_eq!(
             hex::encode(rep.digest()),
-            "405d625c3c307b7857e7249cb49bdbedea0df2a66343923791b8291aa906ebde",
+            "0c6c5849518e384504b76b98718451c255aa3bf9f0a83e9f4c727b27f9aebb7d",
             "digest 口径漂移：状态域增删 / 域序 / 序列化调整需同步所有副本消费者（§6.26.1 定夺 6）"
         );
     }

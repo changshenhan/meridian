@@ -16,7 +16,7 @@ use crate::hist::LatencySnapshot;
 /// 单次抓取的健康快照（无锁视图）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthSnapshot {
-    /// 实例标识（`meridian-<pid>`；S-15 多实例时每实例一 endpoint）。
+    /// 实例标识（`mist-<pid>`；S-15 多实例时每实例一 endpoint）。
     pub instance_id: String,
     /// 本实例启动时刻（unix 秒，聚合器构造时取）。
     pub started_at_unix: u64,

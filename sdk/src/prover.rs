@@ -24,12 +24,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
-use meridian_aggregator::bb::{serialize_public_inputs, VERIFIER_TARGET};
-use meridian_aggregator::noir_pedersen::{pedersen_hash2, Fe};
-use meridian_core::attestation::{agent_commit, AttestationPubKey};
-use meridian_core::dsa::zk_intent_hash;
-use meridian_core::error::Error;
-use meridian_core::zk::{
+use mist_aggregator::bb::{serialize_public_inputs, VERIFIER_TARGET};
+use mist_aggregator::noir_pedersen::{pedersen_hash2, Fe};
+use mist_core::attestation::{agent_commit, AttestationPubKey};
+use mist_core::dsa::zk_intent_hash;
+use mist_core::error::Error;
+use mist_core::zk::{
     RevocationWitness, SpendProof, SpendProofRequest, SpendProver, SpendPublicInputs,
 };
 use sha2::{Digest, Sha256};
@@ -65,8 +65,8 @@ enum Shell {
 impl Shell {
     /// 环境解析。皆不可得返回 None（构造期报 `E_PROVER`，不落运行时半可用态）。
     fn detect() -> Option<Shell> {
-        let nargo_env = std::env::var("MERIDIAN_NARGO_BIN").ok();
-        let bb_env = std::env::var("MERIDIAN_BB_BIN").ok();
+        let nargo_env = std::env::var("MIST_NARGO_BIN").ok();
+        let bb_env = std::env::var("MIST_BB_BIN").ok();
         let nargo_native = |n: &str| !n.is_empty() && probe(n, "--version");
         let bb_native = |b: &str| !b.is_empty() && probe(b, "--version");
         if let (Some(n), Some(b)) = (&nargo_env, &bb_env) {
@@ -83,8 +83,7 @@ impl Shell {
                 bb: "bb".into(),
             });
         }
-        let distro =
-            std::env::var("MERIDIAN_WSL_DISTRO").unwrap_or_else(|_| "MeridianUbuntu".into());
+        let distro = std::env::var("MIST_WSL_DISTRO").unwrap_or_else(|_| "MeridianUbuntu".into());
         if wsl_probe(&distro) {
             return Some(Shell::Wsl { distro });
         }
@@ -238,7 +237,7 @@ impl NoirProver {
             None => {
                 eprintln!(
                     "[noir-prover] nargo/bb 工具链不可得（原生与 WSL 兜底皆无；\
-                     MERIDIAN_NARGO_BIN / MERIDIAN_BB_BIN / MERIDIAN_WSL_DISTRO 可覆盖）"
+                     MIST_NARGO_BIN / MIST_BB_BIN / MIST_WSL_DISTRO 可覆盖）"
                 );
                 Err(Error::EProver)
             }
@@ -668,8 +667,8 @@ fn sig_s(req: &SpendProofRequest, o: &OracleOut) -> Result<[u8; 32], Error> {
 }
 
 /// 委托哈希重算（`delegation_hash` 的薄封装，避免在热签名对象上引入歧义）。
-fn delegation_hash_of(sd: &meridian_core::dsa::SignedDelegation) -> [u8; 32] {
-    meridian_core::dsa::delegation_hash(&sd.delegation)
+fn delegation_hash_of(sd: &mist_core::dsa::SignedDelegation) -> [u8; 32] {
+    mist_core::dsa::delegation_hash(&sd.delegation)
 }
 
 /// gen-witness `ProverSDK.toml` 的 `[return]` 节解析（nargo `--overwrite-return` 序列化
@@ -793,7 +792,7 @@ mod tests {
     #[test]
     fn revocation_witness_self_consistent_for_empty_set() {
         // 空集 witness（path 全层 = empty_roots[d]）重算 == 聚合器 sparse_root。
-        let set = meridian_aggregator::revocation::RevocationSet::new();
+        let set = mist_aggregator::revocation::RevocationSet::new();
         let dh = [0x21u8; 32];
         let w: RevocationWitness = set.non_membership_witness(&dh).expect("未撤销").into();
         verify_revocation_witness(&dh, &w).expect("空集 witness 自洽");
@@ -804,7 +803,7 @@ mod tests {
     #[test]
     fn revocation_witness_self_consistent_with_real_revocation() {
         // 非空撤销集：路径重算 == 聚合器根（S-42 产出 → S-43 消费的同树锚）。
-        let set = meridian_aggregator::revocation::RevocationSet::new();
+        let set = mist_aggregator::revocation::RevocationSet::new();
         let mut revoked = [0u8; 32];
         revoked[0] = 0x01;
         set.insert(revoked);
@@ -819,7 +818,7 @@ mod tests {
     #[test]
     fn revocation_witness_tampered_sibling_rejected() {
         // 负向：任一层兄弟被篡改 → 重算根 != root → E_PROVER。
-        let set = meridian_aggregator::revocation::RevocationSet::new();
+        let set = mist_aggregator::revocation::RevocationSet::new();
         let mut revoked = [0u8; 32];
         revoked[5] = 0x7F;
         set.insert(revoked);

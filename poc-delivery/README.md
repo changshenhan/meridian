@@ -1,4 +1,4 @@
-# Meridian PoC ③ — 交付证明（TLSNotary）
+# Mist PoC ③ — 交付证明（TLSNotary）
 
 > S-08b / Phase 0 合闸 PoC ③。蓝图交付物："交付证明（TLSNotary 最小原型）"。
 > 独立 workspace，不挂主仓库（tlsn 拉 mpz 大框架，编译重，不进 CI 常规 workspace）。

@@ -10,9 +10,9 @@
 //! `check_public_inputs_consistent`：管线在 `verify` 之后把 `SpendPublicInputs` 与信封内
 //! intent 逐字段比对——"登记以验证器返回值为准"（§9），但返回的公共输入不能与信封自相矛盾。
 
-use meridian_core::dsa::SpendIntent;
-use meridian_core::error::Error;
-use meridian_core::zk::{SpendProof, SpendPublicInputs, SpendVerifier};
+use mist_core::dsa::SpendIntent;
+use mist_core::error::Error;
+use mist_core::zk::{SpendProof, SpendPublicInputs, SpendVerifier};
 
 /// 格式校验后端（TEMPORARY）：proof 非空即过，原样返回公共输入。无密码学验证。
 #[derive(Debug, Clone, Copy, Default)]
@@ -58,7 +58,7 @@ pub fn check_public_inputs_consistent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_core::zk::SpendProof;
+    use mist_core::zk::SpendProof;
 
     fn pi() -> SpendPublicInputs {
         SpendPublicInputs {

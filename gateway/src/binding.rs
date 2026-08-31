@@ -6,8 +6,8 @@
 //! aggregator 保持零依赖不受影响）。**读失败一律 Err 上抛** → 闸 fail-closed
 //! `E_BIND_BACKEND`（§6.19.2），本层绝不把读失败翻译成「未绑定」。
 //!
-//! 装配口径（bin fail-fast）：`MERIDIAN_RPC_URL` + `MERIDIAN_DSA_ADDRESS` +
-//! `MERIDIAN_SELF_OPERATOR` 三者同给同不给——只给其一 = 半装配 = 闸语义不明，
+//! 装配口径（bin fail-fast）：`MIST_RPC_URL` + `MIST_DSA_ADDRESS` +
+//! `MIST_SELF_OPERATOR` 三者同给同不给——只给其一 = 半装配 = 闸语义不明，
 //! 启动即退（§6.19.3）。url 只收 `http://host:port`（std-only 无 TLS，§6.7 口径）。
 
 use std::io::{Read, Write};
@@ -15,7 +15,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_aggregator::binding::{OperatorAddress, OperatorBinding};
+use mist_aggregator::binding::{OperatorAddress, OperatorBinding};
 
 /// 读超时（毫秒）。绑定冷读是每委托一次的成本，超时收紧到网关常规请求同级。
 const DEFAULT_TIMEOUT_MS: u64 = 2000;
@@ -186,12 +186,10 @@ pub fn parse_binding_env(
             let binding = JsonRpcBinding::new(&url, contract)?;
             Ok(Some((Arc::new(binding), self_op)))
         }
-        _ => Err(
-            "运营者绑定闸半装配：MERIDIAN_RPC_URL / MERIDIAN_DSA_ADDRESS / \
-             MERIDIAN_SELF_OPERATOR 必须同给同不给（TECH_SPEC §6.19.3）——只给其一 \
+        _ => Err("运营者绑定闸半装配：MIST_RPC_URL / MIST_DSA_ADDRESS / \
+             MIST_SELF_OPERATOR 必须同给同不给（TECH_SPEC §6.19.3）——只给其一 \
              = 闸语义不明，启动即退。"
-                .into(),
-        ),
+            .into()),
     }
 }
 

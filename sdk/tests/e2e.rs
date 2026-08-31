@@ -7,13 +7,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::attestation::{agent_commit, verify_binding, AttestationPubKey};
-use meridian_core::dsa::owner_signing_key_from_bytes;
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::attestation::{agent_commit, verify_binding, AttestationPubKey};
+use mist_core::dsa::owner_signing_key_from_bytes;
 
-use meridian_sdk::{
+use mist_sdk::{
     AgentWallet, DelegationLimits, InProcessAggregator, PayParams, ResponseLossTransport,
     RetryPolicy, SdkClient, SdkError,
 };
@@ -28,7 +28,7 @@ static WAL_SEQ: AtomicU32 = AtomicU32::new(0);
 fn wal_path(tag: &str) -> PathBuf {
     let seq = WAL_SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "meridian-sdk-e2e-{}-{tag}-{seq}.wal",
+        "mist-sdk-e2e-{}-{tag}-{seq}.wal",
         std::process::id()
     ))
 }
@@ -180,7 +180,7 @@ fn response_loss_retry_on_budget_rejection_reports_error() {
 
     // 透传原错误码；断线重发不把拒绝变成成功。
     assert_eq!(err.code(), "E_BUDGET_PER_SPEND");
-    assert!(matches!(err, SdkError::Meridian(_)));
+    assert!(matches!(err, SdkError::Mist(_)));
 
     // 聚合器从未接受任何意图（spent 停留在注册时的 0）；nonce 已被拒绝记录消耗
     // （防同 nonce 换意图重放）。
@@ -200,7 +200,7 @@ fn response_loss_retry_on_budget_rejection_reports_error() {
 fn drop_first_never_delivered_retries() {
     let (path, agg) = aggregator("drop-first");
     let inner = InProcessAggregator::from_inner(Arc::clone(&agg));
-    let transport = meridian_sdk::DropFirstTransport::new(inner, 1);
+    let transport = mist_sdk::DropFirstTransport::new(inner, 1);
     let (wallet, owner) = wallet_and_owner();
     let mut client = SdkClient::new(wallet, Box::new(transport));
     fast_retry(&mut client, 2);
@@ -289,7 +289,7 @@ fn authorize_error_code_passthrough() {
     l.rate_max_per_window = 500;
     let err = client.authorize(&owner, [1u8; 20], &l).unwrap_err();
     assert_eq!(err.code(), "E_BUDGET_PER_SPEND");
-    assert!(matches!(err, SdkError::Meridian(_)));
+    assert!(matches!(err, SdkError::Mist(_)));
 
     // 未被本地记录（构造失败的委托不进 authorized）。
     assert_eq!(client.authorized_count(), 0);

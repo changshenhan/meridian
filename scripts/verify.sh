@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# meridian 本地验证流水线（S-10d 门禁）。
+# mist 本地验证流水线（S-10d 门禁）。
 #
 # 背景：GitHub Actions 曾于 2026-08-17 起被账户计费阻断（账户 included 额度被私有
-# repo 用尽 + 无 spending limit → 全账户私有 CI 硬停），meridian 的验证门禁因此改为
+# repo 用尽 + 无 spending limit → 全账户私有 CI 硬停），mist 的验证门禁因此改为
 # 本地执行——跑在记录 baseline.json 的同一台参考机上，比共享 runner（±10% 噪声）
 # 更稳，且零 GitHub 计费分钟。2026-08-30 起 Actions 恢复可用，ci/noir/solidity 三
 # job 作为 push 后第二道网继续盯绿（本地门禁仍是主门禁）。
@@ -66,25 +66,25 @@ fi
 
 if want bench; then
     step "4/10 bench 编译检查 (--no-run)"
-    run "bench compile" cargo bench -p meridian-bench --no-run
+    run "bench compile" cargo bench -p mist-bench --no-run
 else
     skip "bench"
 fi
 
-# S-15 生产化：meridian-monitor 二进制构建 + `--once` 健康烟测（空 WAL → ok → exit 0）。
+# S-15 生产化：mist-monitor 二进制构建 + `--once` 健康烟测（空 WAL → ok → exit 0）。
 # Rust 主门禁的一部分（不跳过）：监控是部署面第一道可观测探针，编译坏了等于运维盲区。
 # WAL 用 mktemp 唯一名（不删旧重建同一路径）。注意：ROOT 是普通 shell 变量，**不 export**，
 # 不能在嵌套 `bash -c '...'` 里引用（为空 → WAL 路径解析到 Windows 根 → os error 3）。
 # 因此在外部 shell 算好 WAL 路径再直接传参，无需嵌套 bash。
 if want monitor; then
-    step "5/10 meridian-monitor 构建 + --once 健康烟测 (S-15b)"
-    run "monitor build" cargo build -p meridian-monitor --bin meridian-monitor
+    step "5/10 mist-monitor 构建 + --once 健康烟测 (S-15b)"
+    run "monitor build" cargo build -p mist-monitor --bin mist-monitor
     W="$(mktemp -u "$ROOT/target/monitor-smoke-XXXXXX.wal")"
-    run "monitor --once" cargo run -q -p meridian-monitor --bin meridian-monitor -- --wal "$W" --once
+    run "monitor --once" cargo run -q -p mist-monitor --bin mist-monitor -- --wal "$W" --once
     # S-39 多副本集群烟测：两个空 WAL 副本 → 集群收敛 ok → exit 0（覆盖集群 CLI/渲染路径）。
     W1="$(mktemp -u "$ROOT/target/monitor-smoke-XXXXXX.wal")"
     W2="$(mktemp -u "$ROOT/target/monitor-smoke-XXXXXX.wal")"
-    run "monitor cluster --once" cargo run -q -p meridian-monitor --bin meridian-monitor -- --wal "$W1" --wal "$W2" --once
+    run "monitor cluster --once" cargo run -q -p mist-monitor --bin mist-monitor -- --wal "$W1" --wal "$W2" --once
 else
     skip "monitor"
 fi
@@ -95,7 +95,7 @@ if want perf; then
     # Windows 11 调度到 E-core（EcoQoS）——整数型指标假回归 -60~70%（SHA-NI 硬件加速类
     # 不受影响，易误判成"代码回归"）。clocks/亲和性/内存均正常，唯有钉 P-core 线程
     # （0-15）后回到基线 ±10%。规避：从前台交互 shell 跑，或把进程树亲和性钉 0-15。
-    run "perf gate" cargo run --release -p meridian-bench --bin gate -- --fail-over 15
+    run "perf gate" cargo run --release -p mist-bench --bin gate -- --fail-over 15
 else
     skip "perf"
 fi
@@ -103,12 +103,12 @@ fi
 if want alloc || want det; then
     step "7/10 agg_sim 回归 (B8 热路径零分配 + B11 确定性)"
     if want alloc; then
-        run "agg_sim B8 zero-alloc" cargo run --release -p meridian-bench --bin agg_sim -- --check-alloc
+        run "agg_sim B8 zero-alloc" cargo run --release -p mist-bench --bin agg_sim -- --check-alloc
     else
         skip "agg_sim B8 zero-alloc"
     fi
     if want det; then
-        run "agg_sim B11 determinism" cargo run --release -p meridian-bench --bin agg_sim -- --check-determinism
+        run "agg_sim B11 determinism" cargo run --release -p mist-bench --bin agg_sim -- --check-determinism
     else
         skip "agg_sim B11 determinism"
     fi
@@ -145,7 +145,7 @@ fi
 
 # S-37：第 9 步 ZK 门禁三层探测。① Windows 原生 nargo/bb（历史路径，实际不可得——
 # nargo 1.0.0-beta.26 无法在 Windows 构建）；② WSL2 兜底（默认发行版 MeridianUbuntu、
-# root 用户，工具在 /root/.nargo/bin 与 /root/.bb，MERIDIAN_WSL_DISTRO 可覆盖）；
+# root 用户，工具在 /root/.nargo/bin 与 /root/.bb，MIST_WSL_DISTRO 可覆盖）；
 # ③ 皆无才 SKIP。ZK 门禁由此真正进入本地 pre-push（电路回归不再只靠 CI 兜底）。
 # 配套：跑前把 gen-witness/Prover.toml 备份到 target/，跑后还原——nargo
 # `--overwrite-return` 会追加/改写 return 键（不进版本库），pre-push 不再污染工作树，
@@ -168,7 +168,7 @@ if { command -v nargo >/dev/null 2>&1 || [ -x "$HOME/.nargo/bin/nargo" ]; } \
     run "zk smoke" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/smoke_zk.sh'
     run "zk formal" bash -c 'export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"; bash scripts/formal_zk.sh'
 else
-    WSL_DISTRO="${MERIDIAN_WSL_DISTRO:-MeridianUbuntu}"
+    WSL_DISTRO="${MIST_WSL_DISTRO:-MeridianUbuntu}"
     if zk_wsl_ready "$WSL_DISTRO"; then
         step "9/10 ZK (smoke_zk + formal_zk, WSL2 兜底 S-37: $WSL_DISTRO)"
         WSL_ROOT="/mnt/$(printf '%s' "${ROOT:0:1}" | tr 'A-Z' 'a-z')${ROOT:2}"
@@ -177,7 +177,7 @@ else
         run "zk formal" wsl.exe -d "$WSL_DISTRO" -u root -e bash -lc \
             "export PATH=\"\$HOME/.nargo/bin:\$HOME/.bb:\$PATH\"; cd '$WSL_ROOT' && bash scripts/formal_zk.sh"
     else
-        skip "nargo/bb 未找到（Windows 与 WSL 发行版 $WSL_DISTRO 皆无）→ ZK 门禁跳过（MERIDIAN_WSL_DISTRO 可覆盖发行版）"
+        skip "nargo/bb 未找到（Windows 与 WSL 发行版 $WSL_DISTRO 皆无）→ ZK 门禁跳过（MIST_WSL_DISTRO 可覆盖发行版）"
     fi
 fi
 
@@ -186,7 +186,7 @@ fi
 # proof/vk（新鲜且与 VK 配对）；工件缺失（第 9 步被跳过）则同口径跳过。
 if [ -f "$ROOT/circuits/target/proof" ] && [ -f "$ROOT/circuits/target/vk" ]; then
     step "9b/10 bb-verify e2e (S-40, 真证明正/负向)"
-    run "bb-verify e2e" env MERIDIAN_BB_E2E=1 cargo test -p meridian-aggregator --test bb_verify_e2e
+    run "bb-verify e2e" env MIST_BB_E2E=1 cargo test -p mist-aggregator --test bb_verify_e2e
 else
     step "9b/10 bb-verify e2e (S-40)"
     skip "circuits/target/{proof,vk} 不存在（第 9 步 ZK 被跳过）→ bb-verify e2e 跳过"
@@ -195,10 +195,10 @@ fi
 # S-43：真 prover e2e（TECH_SPEC §6.14，prove 侧 TEMPORARY 缝收口）。SDK 委托/意图 +
 # 聚合器撤销集非成员 witness（S-42）→ NoirProver 真电路证明 → BbVerifier 密码学接受。
 # 依赖第 9 步刚产出的 circuits/target/{spend_authorization.json,vk}（bb 字节码 + VK）；
-# 缺失（第 9 步被跳过）则同口径跳过。MERIDIAN_ZK_PROVER_E2E 门控测试本体。
+# 缺失（第 9 步被跳过）则同口径跳过。MIST_ZK_PROVER_E2E 门控测试本体。
 if [ -f "$ROOT/circuits/target/spend_authorization.json" ] && [ -f "$ROOT/circuits/target/vk" ]; then
     step "9c/10 noir-prover e2e (S-43, 真证明全链正/负向)"
-    run "noir-prover e2e" env MERIDIAN_ZK_PROVER_E2E=1 cargo test -p meridian-sdk --test noir_prover_e2e
+    run "noir-prover e2e" env MIST_ZK_PROVER_E2E=1 cargo test -p mist-sdk --test noir_prover_e2e
 else
     step "9c/10 noir-prover e2e (S-43)"
     skip "circuits/target/{spend_authorization.json,vk} 不存在（第 9 步 ZK 被跳过）→ noir-prover e2e 跳过"
@@ -206,11 +206,11 @@ fi
 
 # S-47：桥接真 prover e2e（TECH_SPEC §6.10 第 4 步 / §6.14 CLI 消费）。facilitator
 # EIP-3009 桥经 BridgeConfig.noir（SdkClient::with_noir）在真 BbVerifier 网关上摄取；
-# 占位桥对照组 402（bb 全拒占位证明）。工件依赖 9c 同款；MERIDIAN_ZK_PROVER_E2E 门控
+# 占位桥对照组 402（bb 全拒占位证明）。工件依赖 9c 同款；MIST_ZK_PROVER_E2E 门控
 # 测试本体（同门同工件，过滤器只选 noir 桥用例，不重跑全量 facilitator e2e）。
 if [ -f "$ROOT/circuits/target/spend_authorization.json" ] && [ -f "$ROOT/circuits/target/vk" ]; then
     step "9d/10 bridge noir-prover e2e (S-47, with_noir CLI 消费)"
-    run "bridge noir-prover e2e" env MERIDIAN_ZK_PROVER_E2E=1 cargo test -p meridian-facilitator --test facilitator e2e_bridge_with_noir_prover
+    run "bridge noir-prover e2e" env MIST_ZK_PROVER_E2E=1 cargo test -p mist-facilitator --test facilitator e2e_bridge_with_noir_prover
 else
     step "9d/10 bridge noir-prover e2e (S-47)"
     skip "circuits/target/{spend_authorization.json,vk} 不存在（第 9 步 ZK 被跳过）→ bridge noir-prover e2e 跳过"
@@ -224,7 +224,7 @@ fi
 if [ -f "$ROOT/circuits/target/spend_authorization.json" ] && [ -f "$ROOT/circuits/target/vk" ] \
    && { command -v anvil >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/anvil" ]; }; then
     step "9e/10 demo 层真 ZK 装配示例 (S-51, with_noir × BbVerifier × BatchSettler)"
-    run "noir demo e2e" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && MERIDIAN_NOIR_DEMO=1 cargo run --quiet --bin noir_demo'
+    run "noir demo e2e" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && MIST_NOIR_DEMO=1 cargo run --quiet --bin noir_demo'
 else
     step "9e/10 demo 层真 ZK 装配示例 (S-51)"
     skip "circuits 工件 / anvil 不可得 → demo 层真 ZK 示例跳过"
@@ -258,10 +258,10 @@ fi
 printf '\n'
 # S-52：mcp-server 真 ZK e2e（TECH_SPEC §6.16，MCP 面证明直通）。客户端侧 NoirProver
 # 真电路证明 → MCP pay 工具 → BbVerifier + 撤销根绑定闸聚合器密码学接受；对照组占位
-# pay 必拒 E_PROOF。工件依赖 9c 同款；MERIDIAN_MCP_NOIR_E2E 门控测试本体。
+# pay 必拒 E_PROOF。工件依赖 9c 同款；MIST_MCP_NOIR_E2E 门控测试本体。
 if [ -f "$ROOT/circuits/target/spend_authorization.json" ] && [ -f "$ROOT/circuits/target/vk" ]; then
     step "9f/10 mcp-server noir-prover e2e (S-52, MCP 面证明直通)"
-    run "mcp noir-prover e2e" env MERIDIAN_MCP_NOIR_E2E=1 cargo test -p meridian-mcp --test mcp_noir_e2e
+    run "mcp noir-prover e2e" env MIST_MCP_NOIR_E2E=1 cargo test -p mist-mcp --test mcp_noir_e2e
 else
     step "9f/10 mcp-server noir-prover e2e (S-52)"
     skip "circuits/target/{spend_authorization.json,vk} 不存在（第 9 步 ZK 被跳过）→ mcp noir-prover e2e 跳过"

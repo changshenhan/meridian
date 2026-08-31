@@ -1,4 +1,4 @@
-# MERIDIAN
+# Mist
 ## Machine-Commerce Settlement Infrastructure
 
 > **Status**: Phase 0 complete (2026-08-16). All three proofs of concept green.
@@ -28,7 +28,7 @@ Four gaps:
 
 ## 2. The stance: no new chain
 
-Meridian is **not** a chain. It is a settlement and trust layer that sits **on top of**
+Mist is **not** a chain. It is a settlement and trust layer that sits **on top of**
 existing L2s (Base first), in the same way Nethermind-style infrastructure sits on Ethereum:
 
 - No new consensus. No new token. No validator set. No license or regulatory surface.
@@ -190,7 +190,7 @@ the received side shows `200 OK` + ack, and the server identity matches the deli
 |---|---|---|
 | Phase 0 — standards | **Done** (2026-08-16) | Three PoCs green; spec v1.0 frozen; repo ready for open-source (launch deferred, per S-08e) |
 | S-09 (ZK circuit) | **Done** (2026-08-16) | Full `spend_authorization`: intent_hash field binding + sparse-Merkle revocation non-membership; owner ECDSA verified off-circuit (on-chain + S-02); EVM verifier (`UltraVerifier.sol`, keccak-flavor) generated |
-| S-10 (aggregator kernel) | **Done** (2026-08-16) | Production kernel in `meridian-aggregator`: ingest fast-path (verify → SpendVerifier → budget → window → WAL), commitment lattice, crash recovery; B5 576,406/s @64t (≥100k PASS), B6 p99 0.03ms, B7 46.5ms/33MiB, B8 0-alloc, B10/B11 PASS |
+| S-10 (aggregator kernel) | **Done** (2026-08-16) | Production kernel in `mist-aggregator`: ingest fast-path (verify → SpendVerifier → budget → window → WAL), commitment lattice, crash recovery; B5 576,406/s @64t (≥100k PASS), B6 p99 0.03ms, B7 46.5ms/33MiB, B8 0-alloc, B10/B11 PASS |
 | Phase 1 — reference impl | Next | In-process proving/verification wrapper (true B4), milestone M1 end-to-end |
 | Phase 2 — operator | Later | Multi-operator, bond economy, Base mainnet, recursive aggregation |
 
@@ -206,4 +206,4 @@ S-09 → S-27; order is non-negotiable).
 
 ---
 
-*Meridian · Machine-commerce settlement infrastructure · 2026-08-16*
+*Mist · Machine-commerce settlement infrastructure · 2026-08-16*

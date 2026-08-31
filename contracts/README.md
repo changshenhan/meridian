@@ -21,10 +21,10 @@ src/
                        net[]+结算资金 / 延迟 claim / challenge 完整验证 + 罚没；
                        S-28 asset 参数化：原生 ETH / ERC-20；S-66 接受锚面：
                        acceptanceRoot 平行接受树 + kind3/kind4 + 读面拆分 epochs/epochStatus）
-  IntentHelper.sol     intent_hash 规范编码镜像（与 meridian-core dsa.rs 逐字节一致）
+  IntentHelper.sol     intent_hash 规范编码镜像（与 mist-core dsa.rs 逐字节一致）
   Merkle.sol           sha256 包含验证器（EMPTY_LEAF + next_power_of_two 树深）
 test/
-  DelegationHelper.sol   与 meridian-core 逐字节一致的 canonical 编码（测试库）
+  DelegationHelper.sol   与 mist-core 逐字节一致的 canonical 编码（测试库）
   InternalHarnesses.sol  外部包装合约，让 vm.expectRevert 能捕获内部库 revert
   DSA.t.sol              14 个用例（注册 7 + S-62 运营者绑定 7：owner 私钥一次性写入/
                          不可改绑/零地址禁/未绑定读数零地址）
@@ -52,7 +52,7 @@ foundry.lock           forge-std v1.9.6（rev 3b20d60）
 
 `DSA.sol::registerDelegation(bytes delegationABI, bytes ownerSig)` 在链上重算
 `delegation_hash = sha256(delegationABI)`，owner 从 ABI 的字节区间 `[26:46]`
-（`"DSAv1\0"` 6 字节前缀 + agent 20 + owner 20）解析。**链下 meridian-core 的
+（`"DSAv1\0"` 6 字节前缀 + agent 20 + owner 20）解析。**链下 mist-core 的
 `delegation_hash` 必须与链上一致** —— Rust `sha2` ↔ Solidity `sha256` 预编译
 双向验收（forge 测试 + rust-smoke 都断言了这一点）。
 

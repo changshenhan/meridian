@@ -1,8 +1,8 @@
 //! 账本基准（TECH_SPEC §8.2 B9）：预算检查 ops/s。
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use meridian_core::dsa::{delegation_hash, Delegation, RateLimit};
-use meridian_core::ledger::{check_budget, BudgetState};
+use mist_core::dsa::{delegation_hash, Delegation, RateLimit};
+use mist_core::ledger::{check_budget, BudgetState};
 
 fn sample_delegation() -> Delegation {
     Delegation {

@@ -28,7 +28,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use meridian_core::dsa::SignedDelegation;
+use mist_core::dsa::SignedDelegation;
 
 /// 记录魔法数（"MM"）。
 const MAGIC: u16 = 0x4D4D;
@@ -467,13 +467,11 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use meridian_core::dsa::{
-        owner_signing_key_from_bytes, sign_delegation, Delegation, RateLimit,
-    };
+    use mist_core::dsa::{owner_signing_key_from_bytes, sign_delegation, Delegation, RateLimit};
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("meridian-wal-test-{}-{}", name, std::process::id()));
+        p.push(format!("mist-wal-test-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }

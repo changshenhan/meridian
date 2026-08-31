@@ -1,9 +1,9 @@
 //! B8 —— 热路径零分配门禁（TECH_SPEC §8.2）。
 //! check_budget 是聚合器单笔处理热路径，必须零堆分配。
 
-use meridian_bench::{section_allocs, NoAllocGuard};
-use meridian_core::dsa::{delegation_hash, Delegation, RateLimit};
-use meridian_core::ledger::{check_budget, BudgetState};
+use mist_bench::{section_allocs, NoAllocGuard};
+use mist_core::dsa::{delegation_hash, Delegation, RateLimit};
+use mist_core::ledger::{check_budget, BudgetState};
 
 fn sample_delegation() -> Delegation {
     Delegation {

@@ -19,9 +19,9 @@ use std::sync::Mutex;
 use ed25519_dalek::{
     Signature as AgentSignature, SigningKey as AgentSigningKey, VerifyingKey as AgentPubKey,
 };
-use meridian_core::dsa::{verify_intent, Delegation, SpendIntent};
-use meridian_core::error::Error;
-use meridian_core::ledger::ShardedLedger;
+use mist_core::dsa::{verify_intent, Delegation, SpendIntent};
+use mist_core::error::Error;
+use mist_core::ledger::ShardedLedger;
 
 /// nonce 防重放分片数。128 代理 × 2000 意图 → 不同代理的 dh 均匀落片。
 pub const NONCE_SHARDS: usize = 64;
@@ -120,7 +120,7 @@ fn fixture_delegation(agent_idx: usize) -> Delegation {
         owner: [2u8; 20],
         nonce: agent_idx as u64,
         max_per_spend: 1,
-        rate: meridian_core::dsa::RateLimit {
+        rate: mist_core::dsa::RateLimit {
             window_secs: u64::MAX,
             max_per_window: u64::MAX,
         },
@@ -128,7 +128,7 @@ fn fixture_delegation(agent_idx: usize) -> Delegation {
         categories: vec![],
         not_before: 0,
         expires_at: u64::MAX,
-        version: meridian_core::dsa::PROTOCOL_VERSION,
+        version: mist_core::dsa::PROTOCOL_VERSION,
     }
 }
 
@@ -142,7 +142,7 @@ impl Batch {
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let agent_key = AgentSigningKey::from_bytes(&seed);
             let delegation = fixture_delegation(i);
-            let dh = meridian_core::dsa::delegation_hash(&delegation);
+            let dh = mist_core::dsa::delegation_hash(&delegation);
             // 先签名（借 agent_key），再把 agent_key 移入 fixture。
             for n in 1..=p.per_agent {
                 let intent = SpendIntent {
@@ -155,7 +155,7 @@ impl Batch {
                     memo: None,
                     expires_at: u64::MAX,
                 };
-                let sig = meridian_core::dsa::sign_intent(&intent, &agent_key);
+                let sig = mist_core::dsa::sign_intent(&intent, &agent_key);
                 items.push((i, intent, sig));
             }
             agents.push(AgentFixture {

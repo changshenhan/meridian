@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::error::Error;
 
 /// 域分离前缀：杜绝绑定签名与其它 Ed25519 上下文串用（§11 E-03 反串用）。
-const BINDING_PREFIX: &[u8] = b"MERIDIAN-BINDING-v1\0";
+const BINDING_PREFIX: &[u8] = b"MIST-BINDING-v1\0";
 
 /// BabyJubJub attestation 公钥，坐标取 32 字节小端（与 Noir `to_le_bytes` 一致）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

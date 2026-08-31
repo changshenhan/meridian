@@ -2,7 +2,7 @@
 name = "spend_authorization"
 version = "0.1.0"
 type = "bin"
-authors = ["Meridian Labs"]
+authors = ["Mist Labs"]
 
 # 依赖版本锁定（S-05 决策记录，2026-08-16 修订）：
 #   Noir 1.0 移出 stdlib 的库按 git 锁定。eddsa 的最新 tag v0.1.3 仍是 Noir 0.x

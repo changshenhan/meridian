@@ -1,11 +1,11 @@
 [package]
-name = "meridian-poc-delivery"
+name = "mist-poc-delivery"
 version = "0.1.0"
 edition = "2021"
-description = "Meridian S-08b PoC ③ 交付证明：TLSNotary 2-party MPC-TLS 最小原型"
+description = "Mist S-08b PoC ③ 交付证明：TLSNotary 2-party MPC-TLS 最小原型"
 license = "Elastic-2.0"
 
-# 独立 workspace：poc-delivery 嵌套在 meridian 仓库内但不挂主 workspace
+# 独立 workspace：poc-delivery 嵌套在 mist 仓库内但不挂主 workspace
 # （tlsn 拉 mpz 大框架，编译重，不进 CI 常规 workspace）。自带 Cargo.lock。
 [workspace]
 

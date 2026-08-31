@@ -1,7 +1,7 @@
 {
-  "uid": "meridian-agg",
-  "title": "Meridian Aggregator",
-  "tags": ["meridian", "aggregator"],
+  "uid": "mist-agg",
+  "title": "Mist Aggregator",
+  "tags": ["mist", "aggregator"],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
@@ -23,7 +23,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(meridian_accepted_total[1m])",
+          "expr": "rate(mist_accepted_total[1m])",
           "legendFormat": "{{instance}}"
         }
       ]
@@ -35,8 +35,8 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "fieldConfig": { "defaults": { "unit": "short" } },
       "targets": [
-        { "refId": "A", "expr": "meridian_accepted_total", "legendFormat": "accepted {{instance}}" },
-        { "refId": "B", "expr": "meridian_rejected_total", "legendFormat": "rejected {{instance}}" }
+        { "refId": "A", "expr": "mist_accepted_total", "legendFormat": "accepted {{instance}}" },
+        { "refId": "B", "expr": "mist_rejected_total", "legendFormat": "rejected {{instance}}" }
       ]
     },
     {
@@ -57,7 +57,7 @@
           }
         }
       },
-      "targets": [{ "refId": "A", "expr": "meridian_pending_sealed" }]
+      "targets": [{ "refId": "A", "expr": "mist_pending_sealed" }]
     },
     {
       "id": 4,
@@ -65,7 +65,7 @@
       "title": "WAL 字节数",
       "gridPos": { "h": 6, "w": 6, "x": 6, "y": 8 },
       "fieldConfig": { "defaults": { "unit": "bytes" } },
-      "targets": [{ "refId": "A", "expr": "meridian_wal_bytes" }]
+      "targets": [{ "refId": "A", "expr": "mist_wal_bytes" }]
     },
     {
       "id": 5,
@@ -73,7 +73,7 @@
       "title": "Uptime",
       "gridPos": { "h": 6, "w": 6, "x": 12, "y": 8 },
       "fieldConfig": { "defaults": { "unit": "s" } },
-      "targets": [{ "refId": "A", "expr": "meridian_uptime_seconds" }]
+      "targets": [{ "refId": "A", "expr": "mist_uptime_seconds" }]
     },
     {
       "id": 6,
@@ -81,7 +81,7 @@
       "title": "已撤销委托",
       "gridPos": { "h": 6, "w": 6, "x": 18, "y": 8 },
       "fieldConfig": { "defaults": { "unit": "short" } },
-      "targets": [{ "refId": "A", "expr": "meridian_revoked_total" }]
+      "targets": [{ "refId": "A", "expr": "mist_revoked_total" }]
     }
   ],
   "templating": {
@@ -90,7 +90,7 @@
         "name": "instance",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "query": "label_values(meridian_instance_info, instance)",
+        "query": "label_values(mist_instance_info, instance)",
         "multi": true,
         "includeAll": true
       }

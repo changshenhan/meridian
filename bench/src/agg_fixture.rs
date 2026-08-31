@@ -9,12 +9,12 @@
 //! `--gen-fixture` 重新快照（TECH_SPEC §8.1 "固定 seed、固定输入集、结果可复现"）。
 
 use ed25519_dalek::{SigningKey as AgentSigningKey, VerifyingKey as AgentPubKey};
-use meridian_aggregator::receipt::IntentEnvelope;
-use meridian_core::dsa::{
+use mist_aggregator::receipt::IntentEnvelope;
+use mist_core::dsa::{
     delegation_hash, owner_signing_key_from_bytes, sign_delegation, sign_intent, Delegation,
     RateLimit, SignedDelegation, SpendIntent, PROTOCOL_VERSION,
 };
-use meridian_core::zk::{SpendProof, SpendPublicInputs};
+use mist_core::zk::{SpendProof, SpendPublicInputs};
 use sha2::{Digest, Sha256};
 
 /// S-10 fixture 主 seed：所有 agent 密钥由 `seed ^ agent_idx` 确定性派生（agg_sim / gate 共用）。
@@ -151,7 +151,7 @@ impl KernelBatch {
             let agent_idx = i / self.per_agent;
             let mut buf = Vec::with_capacity(278);
             buf.extend_from_slice(&(agent_idx as u16).to_le_bytes());
-            buf.extend_from_slice(&meridian_core::dsa::intent_hash(&env.intent));
+            buf.extend_from_slice(&mist_core::dsa::intent_hash(&env.intent));
             buf.extend_from_slice(&env.intent.delegation_hash);
             buf.extend_from_slice(&env.intent.recipient);
             buf.extend_from_slice(&env.intent.amount.to_le_bytes());
@@ -237,9 +237,9 @@ fn hex_of(h: &[u8; 32]) -> String {
 /// 每次调用全新 `Aggregator`（nonce/账本不跨次污染），结果确定；容量预置 + 可控时钟
 /// 与 agg_sim 的 `new_agg` 同构，保证同一测量口径。
 pub fn measure_kernel_single_threaded(batch: &KernelBatch) -> f64 {
-    use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-    use meridian_aggregator::proof::FormatVerifier;
-    use meridian_aggregator::wal::Wal;
+    use mist_aggregator::ingest::{Aggregator, IngestConfig};
+    use mist_aggregator::proof::FormatVerifier;
+    use mist_aggregator::wal::Wal;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -252,7 +252,7 @@ pub fn measure_kernel_single_threaded(batch: &KernelBatch) -> f64 {
         enforce_revocation_root: false,
     };
     let mut wal_path = std::env::temp_dir();
-    wal_path.push(format!("meridian-gate-kernel-{}.wal", std::process::id()));
+    wal_path.push(format!("mist-gate-kernel-{}.wal", std::process::id()));
     let _ = std::fs::remove_file(&wal_path);
     let wal = Wal::open(&wal_path, cfg.wal_sync_every).expect("gate kernel wal open");
     let clock = Arc::new(AtomicU64::new(batch.now));
@@ -288,9 +288,9 @@ pub fn measure_kernel_single_threaded(batch: &KernelBatch) -> f64 {
 /// 5 次取峰值（工作集不瞬时回落，峰值抗瞬时抖动）。返回 MiB，供 gate 指标
 /// `agg_kernel_rss_mib` 使用（METRIC_THRESHOLDS 3%，回归 >3% 红）。
 pub fn measure_kernel_rss_mib() -> f64 {
-    use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-    use meridian_aggregator::proof::FormatVerifier;
-    use meridian_aggregator::wal::Wal;
+    use mist_aggregator::ingest::{Aggregator, IngestConfig};
+    use mist_aggregator::proof::FormatVerifier;
+    use mist_aggregator::wal::Wal;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -309,7 +309,7 @@ pub fn measure_kernel_rss_mib() -> f64 {
         enforce_revocation_root: false,
     };
     let mut wal_path = std::env::temp_dir();
-    wal_path.push(format!("meridian-gate-rss-{}.wal", std::process::id()));
+    wal_path.push(format!("mist-gate-rss-{}.wal", std::process::id()));
     let _ = std::fs::remove_file(&wal_path);
     let wal = Wal::open(&wal_path, cfg.wal_sync_every).expect("gate rss wal open");
     let clock = Arc::new(AtomicU64::new(batch.now));

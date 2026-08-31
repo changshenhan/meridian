@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Meridian v0.1 release 工装（S-14c）。
+# Mist v0.1 release 工装（S-14c）。
 #
 # 目标：让 v0.1 发布是"一条命令"的机械动作，且完全可复现。
 # 边界：仓库**暂不公开**（S-08e 续，任务 #24，用户已拍板）——本脚本默认只做**本地可复现
@@ -13,7 +13,7 @@
 #
 # 退出码：0 = 产物就绪；1 = 门禁失败或构建失败（拒绝装配）；2 = 用法错误。
 #
-# 产物：target/release-dist/meridian-v0.1.0/<组件> + SHA256SUMS + VERSION + manifest.json
+# 产物：target/release-dist/mist-v0.1.0/<组件> + SHA256SUMS + VERSION + manifest.json
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -49,11 +49,11 @@ pass "verify.sh 全绿"
 
 step "2/4 release 构建（workspace + mcp + M1 demo）"
 cargo build --workspace --release
-cargo build -p meridian-mcp --release
+cargo build -p mist-mcp --release
 cargo build --release --manifest-path contracts/rust-smoke/Cargo.toml --bin m1_demo
 pass "release 构建完成"
 
-DIST="target/release-dist/meridian-v${VERSION}"
+DIST="target/release-dist/mist-v${VERSION}"
 rm -rf "$DIST"; mkdir -p "$DIST"
 
 step "3/4 装配 dist 产物 + SHA256SUMS"
@@ -61,7 +61,7 @@ step "3/4 装配 dist 产物 + SHA256SUMS"
 # 哈希在装配时计算 → 每次构建的 SHA256SUMS 不同（正常：二进制含构建路径/时间戳；
 # 源码签名的可复现性由 git tag + verify.sh 全门禁保证）。
 BINS=(
-    "target/release/meridian-mcp.exe::meridian-mcp.exe"
+    "target/release/mist-mcp.exe::mist-mcp.exe"
     "contracts/rust-smoke/target/release/m1_demo.exe::m1_demo.exe"
     "contracts/rust-smoke/target/release/contract-smoke.exe::contract-smoke.exe"
 )
@@ -72,7 +72,7 @@ for entry in "${BINS[@]}"; do
 done
 # 文档 + 演示脚本 + 集成 README
 cp -r docs "$DIST/docs"
-cp demos/langchain_demo.py demos/autogen_demo.py demos/meridian_demo_common.py "$DIST/" 2>/dev/null || true
+cp demos/langchain_demo.py demos/autogen_demo.py demos/mist_demo_common.py "$DIST/" 2>/dev/null || true
 cp mcp-server/README.md sdk/README.md "$DIST/" 2>/dev/null || true
 echo "$VERSION" > "$DIST/VERSION"
 git rev-parse HEAD > "$DIST/COMMIT"
@@ -82,7 +82,7 @@ pass "装配完成（$COPIED 个二进制 + 文档 + 演示）"
 step "4/4 版本与发布检查清单"
 git describe --tags --always 2>/dev/null || echo "（无 tag）"
 if [ "$TAG" -eq 1 ]; then
-    git tag -a "v${VERSION}" -m "Meridian v${VERSION}（本地，待公开后推送）"
+    git tag -a "v${VERSION}" -m "Mist v${VERSION}（本地，待公开后推送）"
     pass "本地 tag v${VERSION}"
 fi
 
@@ -94,8 +94,8 @@ cat <<EOF
   1. 安全复核：scripts/secret_scan（若存在）+ 全仓 secrets grep
   2. 代码签名：发布二进制签名（Windows Authenticode / macOS notarize）
   3. 公开 tag：git push origin v${VERSION}
-  4. GitHub Release：上传 target/release-dist/meridian-v${VERSION}/ 全部产物
-  5. crates.io（如发布）：cargo publish -p meridian-core / -p meridian-sdk（先 dry-run）
+  4. GitHub Release：上传 target/release-dist/mist-v${VERSION}/ 全部产物
+  5. crates.io（如发布）：cargo publish -p mist-core / -p mist-sdk（先 dry-run）
   6. 文档站部署：docs/developers/ 对外发布
   7. 立场复核：WHITEPAPER 引用 PoC 实测数字与最终仓库一致
 ══════════════════════════════════════════════════════════════

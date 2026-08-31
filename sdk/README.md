@@ -1,6 +1,6 @@
-# meridian-sdk — Agent 集成层（S-12）
+# mist-sdk — Agent 集成层（S-12）
 
-独立 agent 进程接入 Meridian 聚合器的 Rust crate。封装 core 密码学原语 + 聚合器摄取
+独立 agent 进程接入 Mist 聚合器的 Rust crate。封装 core 密码学原语 + 聚合器摄取
 管线，暴露三个高层操作：
 
 | 操作 | 作用 |
@@ -18,7 +18,7 @@
    只有聚合器返回**定局**（accepted 或永久拒绝）后，下一笔才拿新 nonce（`NonceManager`，
    每委托单调）。
 2. **只重试传输错误**：`SdkError::Transport` 触发重试；聚合器业务拒绝
-   （`SdkError::Meridian`，错误码经 `Error::as_code` 透传）**永不重试**。
+   （`SdkError::Mist`，错误码经 `Error::as_code` 透传）**永不重试**。
 3. **聚合器侧幂等**（S-12 配合改动）：同一 `(spend_nonce, intent_hash)` 的重发返回先前
    结果——accepted → 原 `seq`（不重复分配、不重复记账），rejected → 原原因（不透传成
    成功）。此闸口在过期检查之前 → 已过期但曾被接受的意图重发仍 re-ack，SDK 绝不会因
@@ -55,13 +55,13 @@ pub trait Transport: Send + Sync {
 
 S-12 提供 `InProcessAggregator`（进程内聚合器，测试与单进程嵌入用）。**S-29 兑现网络
 传输**：`HttpTransport`（`transport_http.rs`，std-only TcpStream 手写 HTTP/1.1，不引
-tokio）对接 `meridian-gateway`——`pay()` 重试与幂等逻辑不变。
+tokio）对接 `mist-gateway`——`pay()` 重试与幂等逻辑不变。
 
 ### HttpTransport 错误映射（TECH_SPEC §6.7 状态表）
 
 | 网关响应 | SdkError | 重试 |
 |---|---|---|
-| 200 + Receipt（含 `E_*` 业务拒绝） | 定局（拒绝经 `SdkError::Meridian` 透传） | 拒绝不重试 |
+| 200 + Receipt（含 `E_*` 业务拒绝） | 定局（拒绝经 `SdkError::Mist` 透传） | 拒绝不重试 |
 | 400 / 401 / 413 | `Local`（配置/协议错误） | 否 |
 | 429（租户限流，未进内核） | `Transport(Other)` | 是（退避） |
 | 5xx | `Transport(Other)` | 是 |
@@ -89,7 +89,7 @@ let mut client = SdkClient::new(wallet, Box::new(transport));
 ## 测试
 
 ```sh
-cargo test -p meridian-sdk          # 单元 + e2e（真实聚合器，需临时目录写 WAL）
+cargo test -p mist-sdk          # 单元 + e2e（真实聚合器，需临时目录写 WAL）
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

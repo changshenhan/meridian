@@ -3,8 +3,8 @@
 //! 每条 metric：`# HELP` + `# TYPE` + 样本行 `name{label="v"} value`。全部用 gauge
 //! （计数语义由刮取器按增量处理，见 crate 文档——诚实：不加 counter 语义误导）。
 
-use meridian_aggregator::health::HealthSnapshot;
-use meridian_aggregator::hist::LatencySnapshot;
+use mist_aggregator::health::HealthSnapshot;
+use mist_aggregator::hist::LatencySnapshot;
 
 /// 单条样本（渲染前构造，便于测试断言）。
 #[derive(Debug, Clone, PartialEq)]
@@ -55,7 +55,7 @@ pub fn render_prometheus(s: &HealthSnapshot, ingest_rate: f64) -> String {
 }
 
 /// 多副本模式（S-39）入口：实例标签由调用方给（WAL 文件名 stem）——快照里的
-/// `instance_id` 是 monitor 进程自身 pid（`meridian-<pid>`），同一进程恢复 N 个副本
+/// `instance_id` 是 monitor 进程自身 pid（`mist-<pid>`），同一进程恢复 N 个副本
 /// 会同值撞序列，无法区分。单副本模式走 `render_prometheus`（行为不变）。
 pub fn render_prometheus_labeled(s: &HealthSnapshot, ingest_rate: f64, instance: String) -> String {
     let info_label = instance.clone();
@@ -71,61 +71,61 @@ pub fn render_prometheus_labeled(s: &HealthSnapshot, ingest_rate: f64, instance:
 pub fn samples(s: &HealthSnapshot, ingest_rate: f64, instance: String) -> Vec<PromSample> {
     vec![
         PromSample {
-            name: "meridian_accepted_total",
+            name: "mist_accepted_total",
             help: "累计接受意图数（== 下一个待分配 seq）。",
             labels: vec![("instance", instance.clone())],
             value: s.accepted_count as f64,
         },
         PromSample {
-            name: "meridian_rejected_total",
+            name: "mist_rejected_total",
             help: "本次会话拒绝数（不持久化；崩溃恢复后从 0 起）。",
             labels: vec![("instance", instance.clone())],
             value: s.rejected_count as f64,
         },
         PromSample {
-            name: "meridian_pending_sealed",
+            name: "mist_pending_sealed",
             help: "已密封未消费 epoch 数（结算滞后信号，见告警阈值）。",
             labels: vec![("instance", instance.clone())],
             value: s.pending_sealed as f64,
         },
         PromSample {
-            name: "meridian_revoked_total",
+            name: "mist_revoked_total",
             help: "已撤销委托数。",
             labels: vec![("instance", instance.clone())],
             value: s.revoked_len as f64,
         },
         PromSample {
-            name: "meridian_wal_bytes",
+            name: "mist_wal_bytes",
             help: "WAL 文件字节数（崩溃恢复边界可见性）。",
             labels: vec![("instance", instance.clone())],
             value: s.wal_len as f64,
         },
         PromSample {
-            name: "meridian_uptime_seconds",
+            name: "mist_uptime_seconds",
             help: "本实例运行时长（秒）。",
             labels: vec![("instance", instance.clone())],
             value: s.uptime_secs() as f64,
         },
         PromSample {
-            name: "meridian_ingest_rate_last_window",
+            name: "mist_ingest_rate_last_window",
             help: "最近一次刮取间隔的平均接受速率（笔/s；刮取窗口内增量/时长）。",
             labels: vec![("instance", instance.clone())],
             value: ingest_rate,
         },
         PromSample {
-            name: "meridian_epoch_capacity",
+            name: "mist_epoch_capacity",
             help: "epoch 容量（配置）。",
             labels: vec![("instance", instance.clone())],
             value: s.epoch_capacity as f64,
         },
         PromSample {
-            name: "meridian_ledger_shards",
+            name: "mist_ledger_shards",
             help: "账本分片数（配置）。",
             labels: vec![("instance", instance.clone())],
             value: s.ledger_shards as f64,
         },
         PromSample {
-            name: "meridian_instance_info",
+            name: "mist_instance_info",
             help: "实例标识（值恒 1，取 label instance）。",
             labels: vec![("instance", instance)],
             value: 1.0,
@@ -146,7 +146,7 @@ fn le_label(i: usize) -> String {
 /// `histogram_quantile`。会话计数不持久化——实例重启后 `_count` 从 0 重爬
 /// （`rate()` 在重启点会失真，用 `histogram_quantile` 的绝对快照口径）。
 pub fn render_submit_duration(l: &LatencySnapshot, instance: &str) -> String {
-    const BASE: &str = "meridian_submit_duration_seconds";
+    const BASE: &str = "mist_submit_duration_seconds";
     let mut out = String::new();
     out.push_str(&format!(
         "# HELP {BASE} submit 全路径 API 延迟（接受/拒绝/re-ack 一律计时；log2 μs 桶 ×32，TECH_SPEC §6.11）。\n"
@@ -177,7 +177,7 @@ pub fn render_submit_duration(l: &LatencySnapshot, instance: &str) -> String {
         l.count
     ));
     // 预计算 p99（Grafana 直用；μs → 秒）。
-    let p99_name = "meridian_submit_duration_p99_seconds";
+    let p99_name = "mist_submit_duration_p99_seconds";
     out.push_str(&format!(
         "# HELP {p99_name} submit 延迟 p99（log2 桶上界近似；精确分位数用 _bucket 跑 histogram_quantile）。\n"
     ));
@@ -193,11 +193,11 @@ pub fn render_submit_duration(l: &LatencySnapshot, instance: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_aggregator::hist::BUCKETS;
+    use mist_aggregator::hist::BUCKETS;
 
     fn snap() -> HealthSnapshot {
         HealthSnapshot {
-            instance_id: "meridian-123".into(),
+            instance_id: "mist-123".into(),
             started_at_unix: 1_700_000_000,
             now: 1_700_000_100,
             accepted_count: 42,
@@ -216,9 +216,9 @@ mod tests {
     #[test]
     fn renders_valid_prometheus_text() {
         let text = render_prometheus(&snap(), 0.5);
-        assert!(text.contains("# TYPE meridian_accepted_total gauge"));
-        assert!(text.contains("meridian_accepted_total{instance=\"meridian-123\"} 42"));
-        assert!(text.contains("meridian_uptime_seconds{instance=\"meridian-123\"} 100"));
+        assert!(text.contains("# TYPE mist_accepted_total gauge"));
+        assert!(text.contains("mist_accepted_total{instance=\"mist-123\"} 42"));
+        assert!(text.contains("mist_uptime_seconds{instance=\"mist-123\"} 100"));
         // 每个样本都有 HELP + TYPE + 值行。
         assert_eq!(
             text.matches("# TYPE").count(),
@@ -258,28 +258,26 @@ mod tests {
         l.buckets[6] = 1; // [64, 128) μs
         l.count = 3;
         l.sum_us = 100;
-        let text = render_submit_duration(&l, "meridian-123");
+        let text = render_submit_duration(&l, "mist-123");
 
         // 家族头：一个 HELP + 一个 TYPE（histogram），不是逐样本 gauge。
         assert_eq!(
-            text.matches("# HELP meridian_submit_duration_seconds ")
-                .count(),
+            text.matches("# HELP mist_submit_duration_seconds ").count(),
             1
         );
-        assert!(text.contains("# TYPE meridian_submit_duration_seconds histogram"));
+        assert!(text.contains("# TYPE mist_submit_duration_seconds histogram"));
         // le 升序 + 累计：桶 0 → 2，桶 6 累计 → 3。
         assert!(text.contains(
-            "meridian_submit_duration_seconds_bucket{instance=\"meridian-123\",le=\"0.000002\"} 2"
+            "mist_submit_duration_seconds_bucket{instance=\"mist-123\",le=\"0.000002\"} 2"
         ));
         assert!(text.contains(
-            "meridian_submit_duration_seconds_bucket{instance=\"meridian-123\",le=\"0.000064\"} 2"
+            "mist_submit_duration_seconds_bucket{instance=\"mist-123\",le=\"0.000064\"} 2"
         ));
         assert!(text.contains(
-            "meridian_submit_duration_seconds_bucket{instance=\"meridian-123\",le=\"0.000128\"} 3"
+            "mist_submit_duration_seconds_bucket{instance=\"mist-123\",le=\"0.000128\"} 3"
         ));
-        assert!(text.contains(
-            "meridian_submit_duration_seconds_bucket{instance=\"meridian-123\",le=\"+Inf\"} 3"
-        ));
+        assert!(text
+            .contains("mist_submit_duration_seconds_bucket{instance=\"mist-123\",le=\"+Inf\"} 3"));
         // 有限 le 桶数 == BUCKETS，累计值单调不减。
         let cum: Vec<u64> = text
             .lines()
@@ -288,29 +286,24 @@ mod tests {
             .collect();
         assert_eq!(cum.len(), BUCKETS);
         assert!(cum.windows(2).all(|w| w[0] <= w[1]), "le 累计必须单调不减");
-        assert!(
-            text.contains("meridian_submit_duration_seconds_sum{instance=\"meridian-123\"} 0.0001")
-        );
-        assert!(
-            text.contains("meridian_submit_duration_seconds_count{instance=\"meridian-123\"} 3")
-        );
+        assert!(text.contains("mist_submit_duration_seconds_sum{instance=\"mist-123\"} 0.0001"));
+        assert!(text.contains("mist_submit_duration_seconds_count{instance=\"mist-123\"} 3"));
         // p99：累计 2/3 < 99% → 落桶 6 → 上界 128 μs = 0.000128 s。
-        assert!(text
-            .contains("meridian_submit_duration_p99_seconds{instance=\"meridian-123\"} 0.000128"));
+        assert!(text.contains("mist_submit_duration_p99_seconds{instance=\"mist-123\"} 0.000128"));
     }
 
     /// S-35：空直方图渲染不 NaN、p99 = 0；总渲染流含直方图家族。
     #[test]
     fn empty_histogram_renders_zero_p99() {
         let text = render_submit_duration(&LatencySnapshot::default(), "t");
-        assert!(text.contains("meridian_submit_duration_seconds_count{instance=\"t\"} 0"));
-        assert!(text.contains("meridian_submit_duration_p99_seconds{instance=\"t\"} 0"));
+        assert!(text.contains("mist_submit_duration_seconds_count{instance=\"t\"} 0"));
+        assert!(text.contains("mist_submit_duration_p99_seconds{instance=\"t\"} 0"));
         assert!(!text.contains("NaN"), "空直方图不得产生 NaN");
         // render_prometheus 集成：gauge 家族 + histogram 家族同流。
         let full = render_prometheus(&snap(), 0.5);
-        assert!(full.contains("# TYPE meridian_submit_duration_seconds histogram"));
+        assert!(full.contains("# TYPE mist_submit_duration_seconds histogram"));
         assert_eq!(
-            full.matches("# TYPE meridian_submit_duration_seconds histogram")
+            full.matches("# TYPE mist_submit_duration_seconds histogram")
                 .count(),
             1,
             "histogram 家族只导出一次"

@@ -8,16 +8,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ed25519_dalek::SigningKey as AgentSigningKey;
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::dsa::{
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::dsa::{
     delegation_hash, owner_signing_key_from_bytes, sign_delegation, sign_intent, Amount,
     Delegation, OwnerSigningKey, RateLimit, SpendIntent, PROTOCOL_VERSION,
 };
-use meridian_core::zk::{SpendProof, SpendPublicInputs};
-use meridian_monitor::count_wal_intents;
-use meridian_monitor::health::evaluate;
+use mist_core::zk::{SpendProof, SpendPublicInputs};
+use mist_monitor::count_wal_intents;
+use mist_monitor::health::evaluate;
 
 const AGENT_DID: [u8; 20] = [1u8; 20];
 const OWNER_DID: [u8; 20] = [2u8; 20];
@@ -29,7 +29,7 @@ fn wal_path(tag: &str) -> PathBuf {
     let seq = WAL_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "meridian-monitor-e2e-{}-{tag}-{seq}.wal",
+        "mist-monitor-e2e-{}-{tag}-{seq}.wal",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&p); // Windows 残留文件挡住重建
@@ -87,7 +87,7 @@ fn populated_wal(tag: &str, n: u64) -> PathBuf {
     for i in 0..n {
         let it = intent(dh, 1 + i, i);
         let sig = sign_intent(&it, &agent_key);
-        let env = meridian_aggregator::receipt::IntentEnvelope {
+        let env = mist_aggregator::receipt::IntentEnvelope {
             intent: it,
             agent_sig: sig,
             proof: SpendProof {

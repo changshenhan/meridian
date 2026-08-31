@@ -1,4 +1,4 @@
-//! Meridian L3 结算聚合器内核（MASTER_PLAN S-10）。
+//! Mist L3 结算聚合器内核（MASTER_PLAN S-10）。
 //!
 //! 生产形态的 PoC ②：把原型（bench `ingest.rs`，验签→nonce→预算的吞吐管线）升级为
 //! `Ingest`（验签快路径 → 验证明 → 预算检查 → 记账 → 入窗口）+ commitment lattice

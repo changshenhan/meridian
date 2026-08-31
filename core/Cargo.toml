@@ -1,5 +1,5 @@
 [package]
-name = "meridian-core"
+name = "mist-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,4 +1,4 @@
-# Meridian 运营手册（S-15 生产化）
+# Mist 运营手册（S-15 生产化）
 
 面向部署/运维角色的生产拓扑、健康判定、指标口径与告警阈值。
 代码契约以 `docs/TECH_SPEC.md` 为唯一事实源；本手册只讲**怎么跑、怎么看、怎么判**。
@@ -8,14 +8,14 @@
 ```text
 agent 进程 / 框架         聚合器实例（多实例，热备）          可观测性
 ┌──────────────┐     ┌───────────────────────────┐    ┌─────────────────────┐
-│  meridian-sdk│─┐   │  meridian-mcp (stdio)      │    │  meridian-monitor   │
-│  或 MCP 框架 │ └─► │   内嵌 meridian-aggregator │◄─┐ │   restore WAL 副本  │
+│  mist-sdk│─┐   │  mist-mcp (stdio)      │    │  mist-monitor   │
+│  或 MCP 框架 │ └─► │   内嵌 mist-aggregator │◄─┐ │   restore WAL 副本  │
 └──────────────┘     │   (生产配置, WAL 落盘)      │  │ │   /metrics  /healthz│
                      └───────────┬───────────────┘  │ └──────────┬──────────┘
                                  │ WAL 副本/多实例     │           │ scrape (Prometheus 语义)
                      ┌───────────▼───────────────┐  │ ┌──────────▼──────────┐
                      │ BatchSettler (链上净额结算) │  │ │  Prometheus → Grafana│
-                     │ DSA / RevocationRegistry  │  │ │  meridian-dashboard  │
+                     │ DSA / RevocationRegistry  │  │ │  mist-dashboard  │
                      └───────────────────────────┘  └─┴─────────────────────┘
                          Base Sepolia → Base 主网
 ```
@@ -25,10 +25,10 @@ agent 进程 / 框架         聚合器实例（多实例，热备）          �
 - **monitor**：`restore_from_wal` **只读副本**，**不接热路径**（B8 信条：快照零分配、不碰分片锁）。
   它读到的是 WAL 最后一个持久点，不是实时内存——这是诚实的口径，不是缺陷。
 - **链上**：`DSA` / `RevocationRegistry` / `BatchSettler` 由 `contracts/rust-smoke` 的
-  `deploy` 二进制部署（dry-run 兜底 → `--live` 需 `MERIDIAN_OPERATOR_KEY`）。
+  `deploy` 二进制部署（dry-run 兜底 → `--live` 需 `MIST_OPERATOR_KEY`）。
 - **运营者绑定闸（S-62，TECH_SPEC §6.19）**：网关 bin 三个环境变量**同给同不给**（半装配
-  启动即退）：`MERIDIAN_RPC_URL`（`http://host:port`，std-only 不收 https）+
-  `MERIDIAN_DSA_ADDRESS`（DSA 合约 `0x` + 40 hex）+ `MERIDIAN_SELF_OPERATOR`（本账本
+  启动即退）：`MIST_RPC_URL`（`http://host:port`，std-only 不收 https）+
+  `MIST_DSA_ADDRESS`（DSA 合约 `0x` + 40 hex）+ `MIST_SELF_OPERATOR`（本账本
   运营者地址，须与 BatchSettler 实例的 operator 一致——部署面职责）。绑定写面 =
   owner 对 `DSA.bindOperator(dh, operator)` 发一次性交易（不可改绑；存量委托由 owner
   补绑收窄 fail-open 残余，见 §6.19.5）。绑定读数每委托一次冷 RPC 后进程内缓存
@@ -37,23 +37,23 @@ agent 进程 / 框架         聚合器实例（多实例，热备）          �
   重试属调用方/SDK 装配侧职责（SDK 业务拒绝不自动重试，仅 `E_REV_ROOT` 触发刷新重出）；
   RPC 端点要进部署可用性清单。
 
-## 2. meridian-monitor 用法
+## 2. mist-monitor 用法
 
 ```bash
 # 独立 WAL 检查（脚本探活 / 部署前体检），exit 0 = 全绿
-meridian-monitor --wal /data/meridian.wal --once
+mist-monitor --wal /data/mist.wal --once
 
 # HTTP 服务（默认端口 9100，仅回环绑定）
-meridian-monitor --wal /data/meridian.wal --port 9100
+mist-monitor --wal /data/mist.wal --port 9100
 curl http://127.0.0.1:9100/healthz   # JSON，200=ok / 503=degraded
 curl http://127.0.0.1:9100/metrics   # Prometheus 文本（v0.0.4 exposition format）
 
 # 多副本热备组（S-39）：--wal 可重复传，一个端点聚合整组（TECH_SPEC §6.12）
-meridian-monitor --wal /data/replicas/primary.wal --wal /data/replicas/standby.wal --port 9100
+mist-monitor --wal /data/replicas/primary.wal --wal /data/replicas/standby.wal --port 9100
 
 # 声誉面（S-65）：追加 BatchSettler 事件派生的只读运营者指标（--settler/--rpc 同给同不给，
 # 缺省两参不给 = 声誉序列完全不出现，TECH_SPEC §6.22）
-meridian-monitor --wal /data/meridian.wal --settler 0x<40hex> --rpc http://127.0.0.1:8545 --port 9100
+mist-monitor --wal /data/mist.wal --settler 0x<40hex> --rpc http://127.0.0.1:8545 --port 9100
 ```
 
 WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪造健康）。
@@ -74,41 +74,41 @@ WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪�
 
 | 指标 | 类型 | 口径 |
 |---|---|---|
-| `meridian_accepted_total` | gauge | 累计接受意图数（== 下一个待分配 seq） |
-| `meridian_rejected_total` | gauge | **会话**计数（崩溃恢复后从 0 起；幂等 re-ack 不计） |
-| `meridian_pending_sealed` | gauge | 已密封未消费 epoch 数 |
-| `meridian_revoked_total` | gauge | 已撤销委托数 |
-| `meridian_wal_bytes` | gauge | WAL 文件字节数 |
-| `meridian_uptime_seconds` | gauge | 实例运行时长 |
-| `meridian_ingest_rate_last_window` | gauge | 最近一次刮取窗口平均速率（增量/时长） |
-| `meridian_submit_duration_seconds` | histogram | `submit` 全路径 API 延迟（接受/拒绝/re-ack 一律计时；log2 μs 桶 ×32，`le` 累计 + `_sum`/`_count`，TECH_SPEC §6.11） |
-| `meridian_submit_duration_p99_seconds` | gauge | 预计算 p99（log2 桶**上界**近似；精确分位数用 `_bucket` 跑 `histogram_quantile`） |
-| `meridian_epoch_capacity` / `meridian_ledger_shards` | gauge | 生产拓扑参数 |
-| `meridian_instance_info` | gauge | 实例标识（label `instance`） |
-| `meridian_cluster_instances` | gauge | 被监控副本数（`--wal` 个数，S-39 多副本模式） |
-| `meridian_cluster_accepted_total` | gauge | 副本间 accepted_count **max**（热备副本组同一逻辑账本，最新推进副本；**求和会双计备份副本**） |
-| `meridian_cluster_replica_lag` | gauge | 副本间 accepted_count max−min（备份滞后笔数，0 = 收敛） |
-| `meridian_cluster_pending_sealed` | gauge | 副本间最差结算滞后（max，取最差副本） |
-| `meridian_operator_*`（S-65 声誉面，TECH_SPEC §6.22） | gauge | 仅 `--settler`+`--rpc` 装配时出现：epochs_committed/settled、slash_total、slash_kind_total{kind}、bond_committed/claimed_wei、contract_balance_wei——全部从 BatchSettler 事件 + 余额派生，**不进任何判定面**（决策 E） |
-| `meridian_operator_chain_read_ok` | gauge | 1 = 本轮链上抓取成功 / 0 = 失败（失败保留上次快照继续渲染，绝不清零——清零会被误读为「罚没归零」） |
+| `mist_accepted_total` | gauge | 累计接受意图数（== 下一个待分配 seq） |
+| `mist_rejected_total` | gauge | **会话**计数（崩溃恢复后从 0 起；幂等 re-ack 不计） |
+| `mist_pending_sealed` | gauge | 已密封未消费 epoch 数 |
+| `mist_revoked_total` | gauge | 已撤销委托数 |
+| `mist_wal_bytes` | gauge | WAL 文件字节数 |
+| `mist_uptime_seconds` | gauge | 实例运行时长 |
+| `mist_ingest_rate_last_window` | gauge | 最近一次刮取窗口平均速率（增量/时长） |
+| `mist_submit_duration_seconds` | histogram | `submit` 全路径 API 延迟（接受/拒绝/re-ack 一律计时；log2 μs 桶 ×32，`le` 累计 + `_sum`/`_count`，TECH_SPEC §6.11） |
+| `mist_submit_duration_p99_seconds` | gauge | 预计算 p99（log2 桶**上界**近似；精确分位数用 `_bucket` 跑 `histogram_quantile`） |
+| `mist_epoch_capacity` / `mist_ledger_shards` | gauge | 生产拓扑参数 |
+| `mist_instance_info` | gauge | 实例标识（label `instance`） |
+| `mist_cluster_instances` | gauge | 被监控副本数（`--wal` 个数，S-39 多副本模式） |
+| `mist_cluster_accepted_total` | gauge | 副本间 accepted_count **max**（热备副本组同一逻辑账本，最新推进副本；**求和会双计备份副本**） |
+| `mist_cluster_replica_lag` | gauge | 副本间 accepted_count max−min（备份滞后笔数，0 = 收敛） |
+| `mist_cluster_pending_sealed` | gauge | 副本间最差结算滞后（max，取最差副本） |
+| `mist_operator_*`（S-65 声誉面，TECH_SPEC §6.22） | gauge | 仅 `--settler`+`--rpc` 装配时出现：epochs_committed/settled、slash_total、slash_kind_total{kind}、bond_committed/claimed_wei、contract_balance_wei——全部从 BatchSettler 事件 + 余额派生，**不进任何判定面**（决策 E） |
+| `mist_operator_chain_read_ok` | gauge | 1 = 本轮链上抓取成功 / 0 = 失败（失败保留上次快照继续渲染，绝不清零——清零会被误读为「罚没归零」） |
 
 **诚实边界**：吞吐是刮取窗口均值，不是 p99；p99 由 S-35 热路径直方图提供（桶上界近似，
 会话计数不持久化——崩溃恢复后从 0 起）。直方图埋点为固定桶原子增量 + 两次 `Instant::now()`，
-热路径仍零分配（B8 复测口径见 TECH_SPEC §8.2）。Grafana 面板 `monitor/grafana/meridian-dashboard.json`
-用 `rate(meridian_accepted_total[1m])` 看吞吐——因为计数语义在刮取器侧做增量，不误导为 counter。
+热路径仍零分配（B8 复测口径见 TECH_SPEC §8.2）。Grafana 面板 `monitor/grafana/mist-dashboard.json`
+用 `rate(mist_accepted_total[1m])` 看吞吐——因为计数语义在刮取器侧做增量，不误导为 counter。
 
 ## 5. 告警阈值建议
 
 | 信号 | 建议阈值 | 处置 |
 |---|---|---|
-| `meridian_uptime_seconds` 下降/重置 | 与上次比对 | 进程重启/崩溃，查 WAL 完整性 |
+| `mist_uptime_seconds` 下降/重置 | 与上次比对 | 进程重启/崩溃，查 WAL 完整性 |
 | `/healthz` 503 | 任一检查降级 | `ledger_consistent` 优先——接管 WAL 核对账本 |
-| `meridian_pending_sealed` | > 3 | 结算消费端阻塞，尽快 process_pending |
-| `meridian_rejected_total` 激增 | 环比 | 客户端配置漂移或重放攻击，查错误码分布 |
-| `meridian_submit_duration_p99_seconds` | > 0.05（B6 目标 50 ms） | 热路径退化（分片争用 / WAL 慢盘 / 验证变贵），对照 `_bucket` 定位量级 |
-| `meridian_cluster_replica_lag` | > 0（多副本） | 备份副本复制断档/滞后——failover 会丢账本尾部，查副本复制链路 |
-| `meridian_operator_slash_total` 增长 | 环比 | 运营者被成功欺诈挑战罚没（epoch voided）——最高优先安全事件，对照 `slash_kind_total{kind}` 与链上 `ChallengeSucceeded` 事件核查欺诈证明 |
-| `meridian_operator_chain_read_ok` | 持续 = 0 | 链上读面失败（RPC 不可得/事件解码失败）——声誉快照停留在旧值；**不拉低 /healthz**（账本健康面与链上读面告警分离，TECH_SPEC §6.22.1 定夺 5），查 monitor `--rpc` 连通性与节点状态 |
+| `mist_pending_sealed` | > 3 | 结算消费端阻塞，尽快 process_pending |
+| `mist_rejected_total` 激增 | 环比 | 客户端配置漂移或重放攻击，查错误码分布 |
+| `mist_submit_duration_p99_seconds` | > 0.05（B6 目标 50 ms） | 热路径退化（分片争用 / WAL 慢盘 / 验证变贵），对照 `_bucket` 定位量级 |
+| `mist_cluster_replica_lag` | > 0（多副本） | 备份副本复制断档/滞后——failover 会丢账本尾部，查副本复制链路 |
+| `mist_operator_slash_total` 增长 | 环比 | 运营者被成功欺诈挑战罚没（epoch voided）——最高优先安全事件，对照 `slash_kind_total{kind}` 与链上 `ChallengeSucceeded` 事件核查欺诈证明 |
+| `mist_operator_chain_read_ok` | 持续 = 0 | 链上读面失败（RPC 不可得/事件解码失败）——声誉快照停留在旧值；**不拉低 /healthz**（账本健康面与链上读面告警分离，TECH_SPEC §6.22.1 定夺 5），查 monitor `--rpc` 连通性与节点状态 |
 
 ## 6. 与 S-15 后续的接缝
 
@@ -123,8 +123,8 @@ WAL 缺失/不可读 → 进程以非零码退出（monitor 不猜测，不伪�
 网关**恒明文 HTTP**（std-only，无 TLS 栈），生产必须由反代终结 TLS。拓扑：
 
 ```text
-公网 :443 (TLS) ──► 反代（终结 TLS）──► 127.0.0.1:9400 meridian-gateway（明文）
-                                      └► 127.0.0.1:9100 meridian-monitor（不进公共反代）
+公网 :443 (TLS) ──► 反代（终结 TLS）──► 127.0.0.1:9400 mist-gateway（明文）
+                                      └► 127.0.0.1:9100 mist-monitor（不进公共反代）
 ```
 
 - 网关 `listen` 只绑回环；`0.0.0.0` 直暴露 = 无 TLS、无反代超时缓冲，属部署事故。
@@ -221,7 +221,7 @@ server {
 
 ```bash
 curl -X POST https://gw.example.com/v1/admin/revocations \
-  -H "Authorization: Bearer $MERIDIAN_ADMIN_KEY" \
+  -H "Authorization: Bearer $MIST_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{"delegation_hash":"<64hex>"}'
 # 200 {"newly_revoked":true,"revocation_root":"<64hex>","revoked_len":1}
@@ -326,11 +326,11 @@ Phase 2 决策 A（分片模型）：每张委托在授权期绑定唯一运营�
 
 ```bash
 cd contracts && forge build
-MERIDIAN_RPC_URL=<rpc> MERIDIAN_OPERATOR_KEY=0x... MERIDIAN_BOND=<wei> MERIDIAN_CHALLENGE_BOND=<wei>   cargo run --release --manifest-path contracts/rust-smoke/Cargo.toml --bin deploy -- --live
+MIST_RPC_URL=<rpc> MIST_OPERATOR_KEY=0x... MIST_BOND=<wei> MIST_CHALLENGE_BOND=<wei>   cargo run --release --manifest-path contracts/rust-smoke/Cargo.toml --bin deploy -- --live
 ```
 
 部署顺序（脚本自动完成）：DSA(无参) → RevocationRegistry(DSA) → OperatorRegistry
-(registrar = 部署方) → `appendSchedule`（初值取 `MERIDIAN_BOND` / `MERIDIAN_CHALLENGE_BOND`，
+(registrar = 部署方) → `appendSchedule`（初值取 `MIST_BOND` / `MIST_CHALLENGE_BOND`，
 缺省 1 ETH / 0.1 ETH）→ BatchSettler(operator, asset, **challengeBond ← currentSchedule()
 读数**) → `registerOperator(settler)`。脚本自带两道核对：调度读数与写入值一致 +
 部署后 `challengeBond()` 回读与调度读数一致（单一事实源在链上）。

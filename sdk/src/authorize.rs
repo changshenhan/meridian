@@ -11,7 +11,7 @@ use std::sync::RwLock;
 
 use k256::ecdsa::SigningKey as OwnerSigningKey;
 
-use meridian_core::dsa::{delegation_hash, Did, SignedDelegation};
+use mist_core::dsa::{delegation_hash, Did, SignedDelegation};
 
 use crate::error::SdkError;
 use crate::identity::{create_delegation, AgentWallet, DelegationLimits};
@@ -39,8 +39,8 @@ pub(crate) fn authorize(
     authorized: &RwLock<HashMap<[u8; 32], (Did, SignedDelegation)>>,
 ) -> Result<AuthorizeReceipt, SdkError> {
     // 1. 构造 + 本地校验（限额自洽 → 规格错误码透传）。
-    let sd = create_delegation(owner_key, agent, delegation_nonce, limits)
-        .map_err(SdkError::Meridian)?;
+    let sd =
+        create_delegation(owner_key, agent, delegation_nonce, limits).map_err(SdkError::Mist)?;
     let dh = delegation_hash(&sd.delegation);
     let owner = sd.delegation.owner;
 

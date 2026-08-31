@@ -47,14 +47,14 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolCall, SolValue};
 use anyhow::{Context, Result};
 
-use meridian_aggregator::fraud::{
+use mist_aggregator::fraud::{
     self, ChainEpoch, EventAnchors, FraudCandidate, IntentEvidence, MirrorIntent,
 };
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::lattice::{EpochResult, NetLine};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::dsa::{self, AgentSigningKey, Delegation, OwnerSigningKey, RateLimit};
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::lattice::{EpochResult, NetLine};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::dsa::{self, AgentSigningKey, Delegation, OwnerSigningKey, RateLimit};
 
 use contract_smoke::common::*;
 
@@ -344,9 +344,9 @@ async fn run_drill() -> Result<()> {
     // 真实链上事件（3 commit / 3 settle / kind1+kind2 两次罚没）。事件解码路径的
     // 链上真实性由幕 2/3 的真实罚没交易保证。
     // ============================================================
-    let rpc = meridian_monitor::rpc::JsonRpc::new(RPC_URL).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rpc = mist_monitor::rpc::JsonRpc::new(RPC_URL).map_err(|e| anyhow::anyhow!("{e}"))?;
     let settler_hex = format!("0x{}", hex::encode(settler_addr));
-    let rep = meridian_monitor::reputation::fetch_reputation(&rpc, &settler_hex)
+    let rep = mist_monitor::reputation::fetch_reputation(&rpc, &settler_hex)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     assert_eq!(rep.epochs_committed, 3, "幕 1-3 各 commit 一次");
     assert_eq!(rep.epochs_settled, 3, "幕 1-3 各 settle 一次（含被 voided 的）");
@@ -363,10 +363,10 @@ async fn run_drill() -> Result<()> {
     // 合同余额 ≤ 3×BOND：构成含未领取结算资金/退款留存（§6.22.5），不等于净债券；
     // 本演练实态 = 幕 1 未罚没的 1×BOND（幕 2/3 债券已罚没给验证者出金、结算资金已退）。
     assert!(rep.contract_balance_wei <= 3 * BOND);
-    let metrics = meridian_monitor::reputation::render_reputation(&rep, &settler_hex)
-        + &meridian_monitor::reputation::render_read_ok(&settler_hex, true);
-    assert!(metrics.contains("meridian_operator_slash_total{settler="));
-    assert!(metrics.contains("meridian_operator_chain_read_ok{settler="));
+    let metrics = mist_monitor::reputation::render_reputation(&rep, &settler_hex)
+        + &mist_monitor::reputation::render_read_ok(&settler_hex, true);
+    assert!(metrics.contains("mist_operator_slash_total{settler="));
+    assert!(metrics.contains("mist_operator_chain_read_ok{settler="));
     println!(
         "OK 幕 4 声誉面核对：monitor 派生（commit=3 settle=3 slash=2 kind={{1:1,2:1}} \
          bond_committed={} wei）与本会话链上事件一致",
@@ -619,7 +619,7 @@ async fn run_drill() -> Result<()> {
     // 未建模事件静默，恰是「损失检出率，不产假计数」的同款边界。
     // ============================================================
     let settler2_hex = format!("0x{}", hex::encode(settler2_addr));
-    let rep2 = meridian_monitor::reputation::fetch_reputation(&rpc, &settler2_hex)
+    let rep2 = mist_monitor::reputation::fetch_reputation(&rpc, &settler2_hex)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     assert_eq!(rep2.epochs_committed, 4, "幕 5/5b/6/6b 各 commit 一次");
     assert_eq!(rep2.epochs_settled, 4);
@@ -673,7 +673,7 @@ async fn ingest_act(
 
     let clock = Arc::new(AtomicU64::new(1_700_000_000 + act * 1_000));
     let wal_path = std::env::temp_dir().join(format!(
-        "meridian-verifier-drill-{}-act{act}.wal",
+        "mist-verifier-drill-{}-act{act}.wal",
         std::process::id()
     ));
     let c = Arc::clone(&clock);
@@ -1034,7 +1034,7 @@ fn ingest_anchored_act(
 ) -> (EpochResult, Vec<MirrorIntent>) {
     let clock = Arc::new(AtomicU64::new(clock_base));
     let wal_path = std::env::temp_dir().join(format!(
-        "meridian-verifier-drill-{}-anchored-{clock_base}.wal",
+        "mist-verifier-drill-{}-anchored-{clock_base}.wal",
         std::process::id()
     ));
     let c = Arc::clone(&clock);

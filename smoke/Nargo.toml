@@ -2,7 +2,7 @@
 name = "smoke"
 version = "0.1.0"
 type = "bin"
-authors = ["Meridian Labs"]
+authors = ["Mist Labs"]
 
 # 为什么在仓库根，不在 circuits/ 下：nargo 1.0 把「从当前目录向上找最近的顶层
 # Nargo.toml」当作 workspace 根。若 smoke 位于 circuits/ 内，nargo 会把

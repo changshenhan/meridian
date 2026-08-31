@@ -13,7 +13,7 @@ ack 全部可见，**交付令牌对 verifier 隐藏**（`\0` 占位）。"对�
 
 ## 场景
 
-Agent A 把订单 `ORD-001` 交付给 Agent B 的 TLS 端点 `https://delivery.meridian.test/deliver`。
+Agent A 把订单 `ORD-001` 交付给 Agent B 的 TLS 端点 `https://delivery.mist.test/deliver`。
 A 手里有交付令牌（secret）。仲裁方 C 想要证据——既证明交付真实发生，又不让 A 泄露令牌。
 
 ## 见证结果（实测）
@@ -21,8 +21,8 @@ A 手里有交付令牌（secret）。仲裁方 C 想要证据——既证明交
 ### 发送侧 transcript（verifier 可见，令牌已隐藏）
 
 ```
-POST https://delivery.meridian.test:53598/deliver HTTP/1.1
-host: delivery.meridian.test
+POST https://delivery.mist.test:53598/deliver HTTP/1.1
+host: delivery.mist.test
 connection: close
 x-order-id: ORD-001
 x-recipient: did:agent:b
@@ -53,7 +53,7 @@ content-length: 298
 | 1 | 发送侧含 `POST` + `/deliver` + 订单号 `ORD-001`（东西真发出去了） | **PASS** |
 | 2 | 交付令牌对 verifier 隐藏（不在披露字节中） | **PASS** |
 | 3 | 接收侧含 `200 OK` + 服务器 `delivery_ack`（服务器真回了） | **PASS** |
-| 4 | 服务器身份 = `delivery.meridian.test`（证书链由 prover 信任根核验） | **PASS** |
+| 4 | 服务器身份 = `delivery.mist.test`（证书链由 prover 信任根核验） | **PASS** |
 
 ## 技术要点
 
@@ -62,7 +62,7 @@ content-length: 298
   `v0.1.0-alpha.15`（git 锁 tag，未上 crates.io）。
 - **选择性披露**：`ProveConfig` 声明披露范围——除令牌位置外全部 `reveal_sent` +
   全部 `reveal_recv`；`PartialTranscript::sent_unsafe()` 把未披露位置置 `\0`。
-- **本地证书**：rcgen 现场生成 CA + 叶证书（`delivery.meridian.test`），CA 作
+- **本地证书**：rcgen 现场生成 CA + 叶证书（`delivery.mist.test`），CA 作
   prover/verifier 的 RootCertStore 信任根；交付端点由 tokio-rustls 承载。
 - **身份核验**：verifier 断言服务器名 = 交付域名（`server_identity()` 披露 + 断言）。
 

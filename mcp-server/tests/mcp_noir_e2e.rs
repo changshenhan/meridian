@@ -4,10 +4,10 @@
 //! 正向的接受不是占位漏网——S-47 桥 e2e 同口径）。
 //!
 //! keyless 保形（D3/§6.16）：`attestation_secret` 只在测试的"客户端侧"出现，服务器
-//! （MeridianServer/AppState）全程只验证——真证明经 `revocation_witness` 工具取服务器
+//! （MistServer/AppState）全程只验证——真证明经 `revocation_witness` 工具取服务器
 //! 侧撤销事实后由客户端产出，作为 `pay` 入参的数据回来。
 //!
-//! 门控：`MERIDIAN_MCP_NOIR_E2E=1` 才跑（verify.sh 步 9f，CI noir job 同款）。工件依赖
+//! 门控：`MIST_MCP_NOIR_E2E=1` 才跑（verify.sh 步 9f，CI noir job 同款）。工件依赖
 //! formal_zk 产出的 `circuits/target/spend_authorization.json` + `circuits/target/vk`；
 //! 缺失则显式打印跳过原因（不静默成功）。
 
@@ -15,15 +15,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey as AgentSigningKey;
-use meridian_aggregator::bb::{BbBackend, BbVerifier};
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::dsa::{delegation_hash, intent_hash, Delegation};
-use meridian_core::zk::{RevocationWitness, SpendProver};
-use meridian_mcp::MeridianServer;
-use meridian_sdk::identity::{create_delegation, AgentWallet, DelegationLimits};
-use meridian_sdk::prover::NoirProver;
+use mist_aggregator::bb::{BbBackend, BbVerifier};
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::dsa::{delegation_hash, intent_hash, Delegation};
+use mist_core::zk::{RevocationWitness, SpendProver};
+use mist_mcp::MistServer;
+use mist_sdk::identity::{create_delegation, AgentWallet, DelegationLimits};
+use mist_sdk::prover::NoirProver;
 use rmcp::model::{CallToolRequestParams, ClientInfo, JsonObject};
 use rmcp::{ClientHandler, ServiceExt};
 use serde_json::{json, Value};
@@ -98,8 +98,8 @@ fn error_code(result: &rmcp::model::CallToolResult) -> String {
 
 #[test]
 fn mcp_noir_prover_full_path_via_pay_tool() {
-    if std::env::var("MERIDIAN_MCP_NOIR_E2E").as_deref() != Ok("1") {
-        println!("SKIP: MERIDIAN_MCP_NOIR_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
+    if std::env::var("MIST_MCP_NOIR_E2E").as_deref() != Ok("1") {
+        println!("SKIP: MIST_MCP_NOIR_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
         return;
     }
     let _prove_serial = prove_guard();
@@ -126,7 +126,7 @@ fn mcp_noir_prover_full_path_via_pay_tool() {
 
     // ——— 服务器侧：真 BbVerifier 聚合器 + 撤销根绑定闸（S-48 配对闸生效）———
     let wal_path = std::env::temp_dir().join(format!(
-        "meridian-mcp-noir-{}-{}.wal",
+        "mist-mcp-noir-{}-{}.wal",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -156,7 +156,7 @@ fn mcp_noir_prover_full_path_via_pay_tool() {
         let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
         let server_agg = Arc::clone(&agg);
         let server_handle = tokio::spawn(async move {
-            MeridianServer::new(server_agg)
+            MistServer::new(server_agg)
                 .serve(server_transport)
                 .await?
                 .waiting()
@@ -167,7 +167,7 @@ fn mcp_noir_prover_full_path_via_pay_tool() {
 
         // ---- 1. 客户端侧授权上下文（真实密钥，非手搓 fixture）----
         let wallet = AgentWallet::from_seed([0xA7u8; 32]);
-        let owner_key = meridian_core::dsa::owner_signing_key_from_bytes([0x11u8; 32]);
+        let owner_key = mist_core::dsa::owner_signing_key_from_bytes([0x11u8; 32]);
         let agent_key: AgentSigningKey = wallet.agent_key.clone();
         let limits = DelegationLimits {
             max_per_spend: 5_000,
@@ -259,7 +259,7 @@ fn mcp_noir_prover_full_path_via_pay_tool() {
         secret[3] = 0xDE;
         let prover = NoirProver::from_repo_root(&root).expect("noir 工具链可得");
         let proof = prover
-            .prove(&meridian_core::zk::SpendProofRequest {
+            .prove(&mist_core::zk::SpendProofRequest {
                 sd: &sd,
                 intent: &intent,
                 agent_key: &wallet.agent_key,
@@ -275,7 +275,7 @@ fn mcp_noir_prover_full_path_via_pay_tool() {
         );
 
         // ---- 5. MCP pay 直通：真证明 → BbVerifier 密码学接受 ----
-        let agent_sig = meridian_core::dsa::sign_intent(&intent, &agent_key);
+        let agent_sig = mist_core::dsa::sign_intent(&intent, &agent_key);
         let pay = call_tool(
             &client,
             "pay",
@@ -321,7 +321,7 @@ fn mcp_noir_prover_full_path_via_pay_tool() {
             None,
             d.expires_at,
         );
-        let sig2 = meridian_core::dsa::sign_intent(&intent2, &agent_key);
+        let sig2 = mist_core::dsa::sign_intent(&intent2, &agent_key);
         let placeholder = call_tool(
             &client,
             "pay",
@@ -354,7 +354,7 @@ fn mcp_noir_prover_full_path_via_pay_tool() {
 #[tokio::test]
 async fn placeholder_pay_still_accepted_under_default_format_backend() {
     let wal_path = std::env::temp_dir().join(format!(
-        "meridian-mcp-noir-default-{}-{}.wal",
+        "mist-mcp-noir-default-{}-{}.wal",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -371,7 +371,7 @@ async fn placeholder_pay_still_accepted_under_default_format_backend() {
     let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
     let server_agg = Arc::clone(&agg);
     let server_handle = tokio::spawn(async move {
-        MeridianServer::new(server_agg)
+        MistServer::new(server_agg)
             .serve(server_transport)
             .await?
             .waiting()
@@ -380,14 +380,14 @@ async fn placeholder_pay_still_accepted_under_default_format_backend() {
     });
     let client = ProbeClient.serve(client_transport).await.unwrap();
 
-    let owner_key = meridian_core::dsa::owner_signing_key_from_bytes([0x12u8; 32]);
+    let owner_key = mist_core::dsa::owner_signing_key_from_bytes([0x12u8; 32]);
     let agent_key = AgentSigningKey::from_bytes(&[0x13u8; 32]);
     let d = Delegation {
         agent: [0x0Bu8; 20],
         owner: [0x0Au8; 20],
         nonce: 1,
         max_per_spend: 1_000,
-        rate: meridian_core::dsa::RateLimit {
+        rate: mist_core::dsa::RateLimit {
             window_secs: 3_600,
             max_per_window: 10_000,
         },
@@ -395,9 +395,9 @@ async fn placeholder_pay_still_accepted_under_default_format_backend() {
         categories: vec![],
         not_before: 0,
         expires_at: u64::MAX,
-        version: meridian_core::dsa::PROTOCOL_VERSION,
+        version: mist_core::dsa::PROTOCOL_VERSION,
     };
-    let sd = meridian_core::dsa::sign_delegation(&d, &owner_key);
+    let sd = mist_core::dsa::sign_delegation(&d, &owner_key);
     let dh = delegation_hash(&d);
     let auth = call_tool(
         &client,
@@ -425,7 +425,7 @@ async fn placeholder_pay_still_accepted_under_default_format_backend() {
     .await;
     assert!(!auth.is_error.unwrap_or(false), "authorize 应成功");
 
-    let intent = meridian_core::dsa::SpendIntent {
+    let intent = mist_core::dsa::SpendIntent {
         agent: d.agent,
         delegation_hash: dh,
         recipient: [0x9Cu8; 20],
@@ -435,7 +435,7 @@ async fn placeholder_pay_still_accepted_under_default_format_backend() {
         memo: None,
         expires_at: u64::MAX,
     };
-    let sig = meridian_core::dsa::sign_intent(&intent, &agent_key);
+    let sig = mist_core::dsa::sign_intent(&intent, &agent_key);
     let pay = call_tool(
         &client,
         "pay",

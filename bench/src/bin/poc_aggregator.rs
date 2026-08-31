@@ -2,9 +2,9 @@
 //!
 //! 用法：
 //! ```text
-//! cargo run --release -p meridian-bench --bin poc_aggregator                       # 缩放曲线报告
-//! cargo run --release -p meridian-bench --bin poc_aggregator -- --check 100000     # 验收模式（≥ 10万/秒）
-//! cargo run --release -p meridian-bench --bin poc_aggregator -- --json             # JSON 报告（供文档回填）
+//! cargo run --release -p mist-bench --bin poc_aggregator                       # 缩放曲线报告
+//! cargo run --release -p mist-bench --bin poc_aggregator -- --check 100000     # 验收模式（≥ 10万/秒）
+//! cargo run --release -p mist-bench --bin poc_aggregator -- --json             # JSON 报告（供文档回填）
 //! ```
 //!
 //! 口径：固定输入（`DEFAULT_AGENTS` 代理 × `DEFAULT_PER_AGENT` 意图/代理，密钥由
@@ -14,9 +14,7 @@
 
 use std::thread;
 
-use meridian_bench::ingest::{
-    measure_multi_threaded, measure_single_threaded, Batch, FixtureParams,
-};
+use mist_bench::ingest::{measure_multi_threaded, measure_single_threaded, Batch, FixtureParams};
 
 const DEFAULT_AGENTS: usize = 128;
 const DEFAULT_PER_AGENT: usize = 2_000;

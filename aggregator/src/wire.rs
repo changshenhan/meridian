@@ -10,8 +10,8 @@
 //!   `agent_sig` = 64B hex、`agent_pub` = 32B hex。
 //! - 错误：内核 `Error` 无 serde → `as_code()` 字符串（§11 错误码表）。
 
-use meridian_core::dsa::{AgentPubKey, AgentSignature, SignedDelegation};
-use meridian_core::error::Error;
+use mist_core::dsa::{AgentPubKey, AgentSignature, SignedDelegation};
+use mist_core::error::Error;
 
 use crate::receipt::{IntentEnvelope, Receipt};
 
@@ -62,10 +62,10 @@ impl AuthorizeRequest {
 /// `POST /v1/intents` 请求体（§6.1 意图信封 wire 形态）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IntentEnvelopeDto {
-    pub intent: meridian_core::dsa::SpendIntent,
+    pub intent: mist_core::dsa::SpendIntent,
     /// agent 的 Ed25519 传输签名（64B hex，签名对象 = `intent_hash`）。
     pub agent_sig: String,
-    pub proof: meridian_core::zk::SpendProof,
+    pub proof: mist_core::zk::SpendProof,
 }
 
 /// `POST /v1/intents` 响应体（§6.2 回执 wire 形态）。
@@ -173,9 +173,9 @@ impl RevocationWitnessResponse {
         }
     }
 
-    /// wire → 电路 witness 口径（`meridian_core::zk::RevocationWitness`，path 按 32B
+    /// wire → 电路 witness 口径（`mist_core::zk::RevocationWitness`，path 按 32B
     /// 分块还原）。长度 / hex 不合法即 `Err`（fail-closed，不静默截断）。
-    pub fn into_witness(self) -> Result<meridian_core::zk::RevocationWitness, String> {
+    pub fn into_witness(self) -> Result<mist_core::zk::RevocationWitness, String> {
         let raw = hex::decode(&self.path).map_err(|e| format!("bad path hex: {e}"))?;
         if raw.len() != crate::revocation::SPARSE_DEPTH * 32 {
             return Err(format!(
@@ -188,7 +188,7 @@ impl RevocationWitnessResponse {
         let (chunks, rest) = raw.as_chunks::<32>();
         debug_assert!(rest.is_empty()); // 上面的长度闸保证无余数
         let path = chunks.to_vec();
-        Ok(meridian_core::zk::RevocationWitness {
+        Ok(mist_core::zk::RevocationWitness {
             root: hex_to_bytes32(&self.root)?,
             path,
         })
@@ -221,7 +221,7 @@ impl GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_core::error::Error;
+    use mist_core::error::Error;
 
     #[test]
     fn from_code_mirrors_as_code_exactly() {

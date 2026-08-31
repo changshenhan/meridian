@@ -1,13 +1,13 @@
 //! x402 适配层 · 客户端（S-30b，TECH_SPEC §6.8，docs/x402-adapter.md §2.1）。
 //!
-//! 站位：Meridian 是 **x402 的结算后端**（卖水），不是再造付费协议。本模块 = agent 侧
-//! fetch 拦截：资源服务器回 `402` + `paymentRequirements`（scheme `meridian-v1`）→
+//! 站位：Mist 是 **x402 的结算后端**（卖水），不是再造付费协议。本模块 = agent 侧
+//! fetch 拦截：资源服务器回 `402` + `paymentRequirements`（scheme `mist-v1`）→
 //! 映射成 [`PayParams`] 走 [`SdkClient::pay`]（幂等重试契约 §6.6 不变）→ 构造
 //! `X-PAYMENT`（base64url JSON）重放请求。
 //!
 //! # 线格式（x402 v1 惯例：camelCase、金额恒字符串、base64url 无 padding）
 //!
-//! - 402 体消费 `accepts[]` 中 `scheme == "meridian-v1"` 的条目（无则 [`SdkError::Local`]）。
+//! - 402 体消费 `accepts[]` 中 `scheme == "mist-v1"` 的条目（无则 [`SdkError::Local`]）。
 //! - `X-PAYMENT` payload：`{"intentHash", "seq", "spendNonce"}`——merchant 验证 =
 //!   网关 `GET /v1/receipts/{intentHash}`（S-30a），信封不内嵌（离线验签是 S-30c 缝）。
 //!
@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use meridian_core::dsa::Did;
+use mist_core::dsa::Did;
 
 use crate::error::SdkError;
 use crate::pay::PayParams;
@@ -32,8 +32,8 @@ use crate::SdkClient;
 
 /// x402 协议版本（v1）。
 pub const X402_VERSION: u32 = 1;
-/// Meridian 的自定义 scheme（docs/x402-adapter.md §3；上游注册路径未定前使用）。
-pub const SCHEME: &str = "meridian-v1";
+/// Mist 的自定义 scheme（docs/x402-adapter.md §3；上游注册路径未定前使用）。
+pub const SCHEME: &str = "mist-v1";
 /// `X-PAYMENT` 头名（x402 HTTP transport 惯例）。
 pub const PAYMENT_HEADER: &str = "X-PAYMENT";
 
@@ -73,7 +73,7 @@ pub struct PaymentRequirements {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset: Option<String>,
     /// `exact` scheme 专属：EIP-3009 域参数（S-32，TECH_SPEC §6.10）。
-    /// `meridian-v1` 条目不产出该字段（skip），Deserialize 缺省 None——旧 wire 兼容。
+    /// `mist-v1` 条目不产出该字段（skip），Deserialize 缺省 None——旧 wire 兼容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<Eip3009Extra>,
 }
@@ -112,7 +112,7 @@ impl PaymentRequirements {
 /// merchant 验证载荷：网关 `GET /v1/receipts/{intentHash}`（S-30a）所需的最小集合。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MeridianPayload {
+pub struct MistPayload {
     /// 0x 32B hex——merchant 凭它查网关回执。
     pub intent_hash: String,
     pub seq: u64,
@@ -129,7 +129,7 @@ pub struct PaymentPayload {
     pub scheme: String,
     pub network: String,
     pub resource: String,
-    pub payload: MeridianPayload,
+    pub payload: MistPayload,
 }
 
 impl PaymentPayload {
@@ -340,7 +340,7 @@ impl<'a> X402Client<'a> {
             return Ok(X402Outcome::Free(first));
         }
 
-        // 402 → 解析 paymentRequirements（scheme meridian-v1，多条取首条）。
+        // 402 → 解析 paymentRequirements（scheme mist-v1，多条取首条）。
         let required: PaymentRequired = serde_json::from_slice(&first.body)
             .map_err(|e| SdkError::Local(format!("bad 402 body: {e}")))?;
         let entry = required
@@ -376,7 +376,7 @@ impl<'a> X402Client<'a> {
             scheme: SCHEME.to_string(),
             network: entry.network.clone(),
             resource: entry.resource.clone(),
-            payload: MeridianPayload {
+            payload: MistPayload {
                 intent_hash: format!("0x{}", hex::encode(receipt.intent_hash)),
                 seq: receipt.seq,
                 spend_nonce: receipt.spend_nonce,
@@ -600,7 +600,7 @@ mod tests {
                 "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
                 "maxTimeoutSeconds": 60
             }, {
-                "scheme": "meridian-v1",
+                "scheme": "mist-v1",
                 "network": "base",
                 "maxAmountRequired": "10000",
                 "resource": "https://api.example.com/data",
@@ -610,10 +610,10 @@ mod tests {
         let pr: PaymentRequired = serde_json::from_str(body).expect("parse 402 body");
         assert_eq!(pr.x402_version, 1);
         assert_eq!(pr.accepts.len(), 2);
-        assert_eq!(pr.accepts[1].scheme, "meridian-v1");
+        assert_eq!(pr.accepts[1].scheme, "mist-v1");
         assert_eq!(pr.accepts[1].amount().unwrap(), 10_000);
         assert_eq!(pr.accepts[1].max_timeout_seconds, None);
-        // exact 条目可携带 EIP-3009 域参数（S-32）；meridian-v1 条目缺省 None（旧 wire 兼容）。
+        // exact 条目可携带 EIP-3009 域参数（S-32）；mist-v1 条目缺省 None（旧 wire 兼容）。
         assert_eq!(pr.accepts[0].extra, None);
     }
 
@@ -638,7 +638,7 @@ mod tests {
                 version: "2".into()
             })
         );
-        // 产出侧 skip_serializing_if：meridian-v1 条目不出现 extra 键。
+        // 产出侧 skip_serializing_if：mist-v1 条目不出现 extra 键。
         let plain = serde_json::to_string(&PaymentRequired {
             x402_version: X402_VERSION,
             error: None,
@@ -665,7 +665,7 @@ mod tests {
             scheme: SCHEME.into(),
             network: "base".into(),
             resource: "https://api.example.com/data".into(),
-            payload: MeridianPayload {
+            payload: MistPayload {
                 intent_hash: format!("0x{}", hex::encode([0xAB; 32])),
                 seq: 7,
                 spend_nonce: 3,
@@ -678,7 +678,7 @@ mod tests {
         let json = String::from_utf8(base64url_decode(&header).expect("self-consistent decode"))
             .expect("utf8");
         assert!(json.contains("\"x402Version\":1"));
-        assert!(json.contains("\"scheme\":\"meridian-v1\""));
+        assert!(json.contains("\"scheme\":\"mist-v1\""));
         assert!(json.contains("\"intentHash\":\"0x"));
         assert!(json.contains("\"seq\":7"));
         assert!(json.contains("\"spendNonce\":3"));

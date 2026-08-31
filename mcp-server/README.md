@@ -1,4 +1,4 @@
-# meridian-mcp — S-13 MCP 正式版
+# mist-mcp — S-13 MCP 正式版
 
 **MCP stdio 服务器**：内嵌**真实聚合器内核**（WAL + 幂等 re-ack + seq + 预算强制），
 向主流 agent 框架暴露 6 个工具——`authorize` / `pay` / `balance` / `attest` /
@@ -9,14 +9,14 @@ agent Ed25519 签名都在框架侧完成，服务器只验签 + 执行；S-52 �
 ## 运行
 
 ```bash
-cargo build -p meridian-mcp --release
+cargo build -p mist-mcp --release
 
-# WAL 目录优先级：env MERIDIAN_WAL_DIR（目录下 meridian.wal）> CLI 首参（文件路径）>
-# ./meridian.wal。父目录不存在时自动创建。
-MERIDIAN_WAL_DIR=demos/.wal target/release/meridian-mcp
+# WAL 目录优先级：env MIST_WAL_DIR（目录下 mist.wal）> CLI 首参（文件路径）>
+# ./mist.wal。父目录不存在时自动创建。
+MIST_WAL_DIR=demos/.wal target/release/mist-mcp
 ```
 
-任何支持 stdio MCP 的 agent 框架都能把它挂成工具。服务器自述名 `meridian`，
+任何支持 stdio MCP 的 agent 框架都能把它挂成工具。服务器自述名 `mist`，
 版本 `0.2.0`，能力 `tools`。
 
 ## 工具
@@ -31,7 +31,7 @@ MERIDIAN_WAL_DIR=demos/.wal target/release/meridian-mcp
 | `revocation_witness` | `delegation_hash` | `WitnessReceipt {delegation_hash, root, path}`（S-52，path = 256×32B 扁平 hex） | 只读；目标已撤销 → `E_REVOKED`（非成员接口不给成员陈述） |
 
 错误统一回 `{"ok":false,"error":"E_..."}` 形式的工具错误（`is_error=true`）。错误码
-见 `meridian_core::error::Error::as_code()`：
+见 `mist_core::error::Error::as_code()`：
 
 | 码 | 含义 |
 |---|---|
@@ -66,10 +66,10 @@ coincurve/ed25519 与 Node @noble 跨语言镜像 `core/src/dsa.rs` 规范布局
 诚实边界（S-53）：脚本演示的是 witness **事实面**——`pay` 的 optional `proof`
 直通不在脚本演示范围（真电路证明需要 nargo/bb 工具链，Python/JS 侧不可得，硬造即
 假演示），该路径由 `mcp-server/tests/mcp_noir_e2e.rs` 门控 e2e 实证
-（`MERIDIAN_MCP_NOIR_E2E=1`，TECH_SPEC §6.16）。
+（`MIST_MCP_NOIR_E2E=1`，TECH_SPEC §6.16）。
 
 ```bash
-cargo build -p meridian-mcp --release
+cargo build -p mist-mcp --release
 cd demos
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe langchain_demo.py
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe autogen_demo.py
@@ -79,7 +79,7 @@ cd eliza && node eliza_client.mjs
 **框架适配坑（已踩平，代码注释同步）**：
 - **langchain-mcp-adapters 0.1.0**：`get_tools()` 的每个工具**每次调用都新建一个 MCP
   会话**（→ 新子进程 → 新聚合器，authorize 与 pay 落到不同内核，`E_DELEG_UNKNOWN`）。
-  必须 `client.session("meridian")` + `load_mcp_tools(session)` 共享**单一**会话。
+  必须 `client.session("mist")` + `load_mcp_tools(session)` 共享**单一**会话。
 - **autogen-ext 0.7.5**：`mcp_server_tools` 不显式传 `session` 同样每调用新建会话；
   须 `stdio_client` + `ClientSession` 建共享会话传入 factory。另需两个兼容层：
   (1) `FORMAT_MAPPING` 补 `uint8/16/32/64 → int`（rmcp/schemars 的 `format:"uint64"`
@@ -95,7 +95,7 @@ cd eliza && node eliza_client.mjs
 1. **证明来源分派（S-52 收口）**：`pay` 的 `proof` 入参缺席 = 服务器占位证明
    （缺省口径，`FormatVerifier` 只查 proof 非空 + public_inputs↔intent 一致性，逐字节
    不变）；携带 = **客户端直通**（框架侧 `NoirProver` 产真电路证明，服务器只验证，
-   D6）。真验证语义经 `MERIDIAN_VERIFY_BACKEND=bb`（`BbVerifier` + 撤销根绑定闸，
+   D6）。真验证语义经 `MIST_VERIFY_BACKEND=bb`（`BbVerifier` + 撤销根绑定闸，
    网关 bin 同款）开启——bb 装配下占位 pay / 篡改任一公共输入 = 密码学拒 `E_PROOF`。
    **format 缺省后端下 `agent_commit` / `revocation_root` / `now` 三个自由量无密码学
    约束**（与网关格式口径一致）。
@@ -136,7 +136,7 @@ owner 与 agent 私钥都在框架侧，签名外部完成；服务器只验签 
 ### D4. 身份模型：注册时绑定 agent 传输身份公钥
 `authorize` 把 delegation_hash 绑定到调用方提供的 Ed25519 公钥；`pay` 只用这把公钥
 验 agent 签名。换钥重绑被 `E_ATTEST_BIND` 拒绝。`attest` 复用 core `attestation.rs`：
-binding 消息 = `MERIDIAN-BINDING-v1\0 || x_le || y_le`，`agent_commit = sha256(x_le||y_le)`。
+binding 消息 = `MIST-BINDING-v1\0 || x_le || y_le`，`agent_commit = sha256(x_le||y_le)`。
 
 ### D5. stdio 单进程（S-13 用户拍板）
 MCP 服务器内嵌真实聚合器（WAL），框架经 stdio 连各自实例。网络 Transport + 独立
@@ -150,23 +150,23 @@ S-40/S-43/S-46/S-47/S-51 把装配面铺到 SDK / 网关 / 桥 / demo 后，MCP 
 with_noir` 同源模型的客户端形态），作为 `pay` 的可选 `proof` 入参随意图提交，服务器只
 验证。这与网关摄取面的信任模型一致（客户端提交信封、服务器验证记账）。配套新增第 6
 工具 `revocation_witness`（客户端构建真证明所需的唯一服务器侧事实，S-45 网关端点的
-MCP 面）；bin 经 `MERIDIAN_VERIFY_BACKEND=bb` 装配真验证后端 + S-48 撤销根绑定闸。
+MCP 面）；bin 经 `MIST_VERIFY_BACKEND=bb` 装配真验证后端 + S-48 撤销根绑定闸。
 `attestation_secret` 永不上服务器——keyless 是设计约束不是待办。
 
 ## 测试
 
 ```bash
-cargo test -p meridian-mcp        # 单元 + 12 集成（真实聚合器 + 临时 WAL + rmcp duplex）
-cargo clippy -p meridian-mcp --all-targets -- -D warnings
+cargo test -p mist-mcp        # 单元 + 12 集成（真实聚合器 + 临时 WAL + rmcp duplex）
+cargo clippy -p mist-mcp --all-targets -- -D warnings
 ```
 
 集成测试 `tests/mcp_flow.rs` 用官方 rmcp client 通过 `tokio::io::duplex` 连
-MeridianServer，走完整 MCP JSON-RPC：authorize→pay 闭环、幂等 re-ack、伪造签名、
+MistServer，走完整 MCP JSON-RPC：authorize→pay 闭环、幂等 re-ack、伪造签名、
 超预算、未注册、verify_receipt、attest 篡改、客户端直通证明（format 后端接受 +
 `RejectAllVerifier` 对照组证真通进验证缝）、revocation_witness 正/负向全部覆盖。
 **密钥与签名全部用 core 原语现场构造，绝无 mock。**
 
-门控 e2e `tests/mcp_noir_e2e.rs`（`MERIDIAN_MCP_NOIR_E2E=1`，verify.sh 步 9f / CI
+门控 e2e `tests/mcp_noir_e2e.rs`（`MIST_MCP_NOIR_E2E=1`，verify.sh 步 9f / CI
 noir job）：客户端侧 `NoirProver` 真电路证明 → MCP `pay` 直通 → `BbVerifier` +
 撤销根绑定闸聚合器密码学接受；对照组占位 pay 必拒 `E_PROOF`。
 
@@ -175,10 +175,10 @@ noir job）：客户端侧 `NoirProver` 真电路证明 → MCP `pay` 直通 →
 ```
 mcp-server/
 ├── src/
-│   ├── lib.rs        # MeridianServer::new(Arc<Aggregator>) + ServerHandler
+│   ├── lib.rs        # MistServer::new(Arc<Aggregator>) + ServerHandler
 │   ├── state.rs      # 薄 keyless 层：验签 + 挂真实聚合器 + 6 工具回执
 │   ├── tools.rs      # #[tool_router]/#[tool_handler] + 入参类型 + hex 解码
 │   └── main.rs       # stdio 入口（WAL 路径优先级 + 验证后端装配 + 聚合器接线）
 ├── tests/mcp_flow.rs     # 12 个验收集成测试（真实 MCP client + 临时 WAL）
-└── tests/mcp_noir_e2e.rs # S-52 门控真 ZK e2e（MERIDIAN_MCP_NOIR_E2E=1）
+└── tests/mcp_noir_e2e.rs # S-52 门控真 ZK e2e（MIST_MCP_NOIR_E2E=1）
 ```

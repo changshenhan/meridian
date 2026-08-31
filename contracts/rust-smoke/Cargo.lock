@@ -1323,10 +1323,10 @@ dependencies = [
  "alloy",
  "anyhow",
  "hex",
- "meridian-aggregator",
- "meridian-core",
- "meridian-monitor",
- "meridian-sdk",
+ "mist-aggregator",
+ "mist-core",
+ "mist-monitor",
+ "mist-sdk",
  "serde_json",
  "tokio",
  "url",
@@ -2686,12 +2686,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "meridian-aggregator"
+name = "mist-aggregator"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
  "hex",
- "meridian-core",
+ "mist-core",
  "rayon",
  "serde",
  "serde_json",
@@ -2700,7 +2700,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "meridian-core"
+name = "mist-core"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
@@ -2711,25 +2711,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "meridian-monitor"
+name = "mist-monitor"
 version = "0.1.0"
 dependencies = [
  "hex",
- "meridian-aggregator",
- "meridian-core",
+ "mist-aggregator",
+ "mist-core",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "meridian-sdk"
+name = "mist-sdk"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
  "k256",
- "meridian-aggregator",
- "meridian-core",
+ "mist-aggregator",
+ "mist-core",
  "serde",
  "serde_json",
  "sha2",

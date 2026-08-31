@@ -5,7 +5,7 @@
 //!
 //! 后端现状（S-10，诚实口径）：S-09 电路的 in-process 验证包装（`bb_rs` / stdlib 封装）是
 //! 路线图里单独列出的 Phase 1 交付物（TECH_SPEC §5.3 "Rust 侧封装"），**未在本 crate 落地**。
-//! 聚合器内置的格式校验后端（TEMPORARY，PoC ② 同口径）见 `meridian-aggregator::proof`，
+//! 聚合器内置的格式校验后端（TEMPORARY，PoC ② 同口径）见 `mist-aggregator::proof`，
 //! 真实后端直接实现 `SpendVerifier` 插此接口即可。
 
 use crate::dsa::{AgentSigningKey, Amount, Category, Did, SignedDelegation, SpendIntent};

@@ -11,15 +11,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::dsa::owner_signing_key_from_bytes;
-use meridian_gateway::http::serve;
-use meridian_gateway::{
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::dsa::owner_signing_key_from_bytes;
+use mist_gateway::http::serve;
+use mist_gateway::{
     Config, Gateway, TenantConf, TenantTable, E_AUTH, E_MALFORMED, E_NOT_FOUND, E_RATE_LIMITED,
 };
-use meridian_sdk::{
+use mist_sdk::{
     AgentWallet, DelegationLimits, HttpTransport, PayParams, RetryPolicy, SdkClient, SdkError,
 };
 
@@ -31,10 +31,7 @@ static WAL_SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn wal_path(tag: &str) -> PathBuf {
     let seq = WAL_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "meridian-gw-{}-{tag}-{seq}.wal",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("mist-gw-{}-{tag}-{seq}.wal", std::process::id()))
 }
 
 fn aggregator(tag: &str) -> (PathBuf, Arc<Aggregator>) {
@@ -282,7 +279,7 @@ fn handle_revocation_witness_gate_hash_and_revoked() {
         b"",
     );
     assert_eq!(r.status, 200);
-    let dto: meridian_aggregator::wire::RevocationWitnessResponse =
+    let dto: mist_aggregator::wire::RevocationWitnessResponse =
         serde_json::from_str(&r.body).expect("witness dto");
     assert_eq!(dto.delegation_hash, hex::encode(dh));
     let w = dto.into_witness().expect("witness roundtrip");
@@ -294,7 +291,7 @@ fn handle_revocation_witness_gate_hash_and_revoked() {
     assert_eq!(w.path.len(), 256);
     assert_eq!(
         w.root,
-        meridian_aggregator::revocation::RevocationSet::new().sparse_root()
+        mist_aggregator::revocation::RevocationSet::new().sparse_root()
     );
 
     // 已撤销目标 → 404 E_REVOKED（成员陈述不由非成员接口给出，S-42 fail-closed）。
@@ -306,7 +303,7 @@ fn handle_revocation_witness_gate_hash_and_revoked() {
         b"",
     );
     assert_eq!(r.status, 404);
-    assert!(r.body.contains(meridian_gateway::E_REVOKED));
+    assert!(r.body.contains(mist_gateway::E_REVOKED));
 
     // 撤销后其他委托的 witness 根推进（同一棵确定性树的当刻快照）。
     let other = [8u8; 32];
@@ -317,7 +314,7 @@ fn handle_revocation_witness_gate_hash_and_revoked() {
         b"",
     );
     assert_eq!(r.status, 200);
-    let dto: meridian_aggregator::wire::RevocationWitnessResponse =
+    let dto: mist_aggregator::wire::RevocationWitnessResponse =
         serde_json::from_str(&r.body).expect("witness dto");
     assert_eq!(
         dto.into_witness().expect("roundtrip").root,
@@ -660,7 +657,7 @@ fn admin_reload_over_real_socket() {
 //      §4.6 撤销事件流「运营者调 Aggregator::revoke」的网络入口。
 // ---------------------------------------------------------------------------
 
-use meridian_core::dsa::{
+use mist_core::dsa::{
     delegation_hash, sign_delegation, AgentPubKey, AgentSigningKey, Delegation, RateLimit,
 };
 
@@ -709,7 +706,7 @@ fn admin_revoke_revokes_advances_root_and_is_idempotent() {
         &revoke_body(&dh),
     );
     assert_eq!(r.status, 200, "body: {}", r.body);
-    let resp: meridian_gateway::AdminRevocationResponse =
+    let resp: mist_gateway::AdminRevocationResponse =
         serde_json::from_str(&r.body).expect("revoke dto");
     assert!(resp.newly_revoked);
     assert_eq!(resp.revoked_len, 1);
@@ -729,7 +726,7 @@ fn admin_revoke_revokes_advances_root_and_is_idempotent() {
         b"",
     );
     assert_eq!(r.status, 404);
-    assert!(r.body.contains(meridian_gateway::E_REVOKED));
+    assert!(r.body.contains(mist_gateway::E_REVOKED));
 
     // 幂等重放（0x 前缀宽容）：newly_revoked=false，根与 revoked_len 不变。
     let r = gw.handle(
@@ -739,7 +736,7 @@ fn admin_revoke_revokes_advances_root_and_is_idempotent() {
         &format!(r#"{{"delegation_hash":"0x{}"}}"#, hex::encode(dh)).into_bytes(),
     );
     assert_eq!(r.status, 200, "body: {}", r.body);
-    let resp2: meridian_gateway::AdminRevocationResponse =
+    let resp2: mist_gateway::AdminRevocationResponse =
         serde_json::from_str(&r.body).expect("revoke dto");
     assert!(!resp2.newly_revoked);
     assert_eq!(resp2.revoked_len, 1, "重复撤销不增计数");
@@ -763,11 +760,11 @@ fn admin_revoke_rejects_unregistered_and_malformed() {
         &revoke_body(&unknown),
     );
     assert_eq!(r.status, 400, "body: {}", r.body);
-    assert!(r.body.contains(meridian_gateway::E_DELEG_UNKNOWN));
+    assert!(r.body.contains(mist_gateway::E_DELEG_UNKNOWN));
     assert_eq!(agg.revoked_len(), 0);
     assert_eq!(
         agg.revocation_root(),
-        meridian_aggregator::revocation::RevocationSet::new().sparse_root(),
+        mist_aggregator::revocation::RevocationSet::new().sparse_root(),
         "被拒撤销不换根（仍是空撤销集根）"
     );
 
@@ -858,7 +855,7 @@ fn admin_revoke_face_isolation_and_no_tenant_rate_limit() {
         &revoke_body(&[9u8; 32]),
     );
     assert_eq!(r.status, 400, "管理面不受租户限流，打到业务校验（未注册）");
-    assert!(r.body.contains(meridian_gateway::E_DELEG_UNKNOWN));
+    assert!(r.body.contains(mist_gateway::E_DELEG_UNKNOWN));
 }
 
 /// S-57 真 socket e2e：authorize（SDK 全链路）→ 管理端点撤销 → 同委托 pay 业务拒绝
@@ -908,7 +905,7 @@ fn e2e_admin_revoke_blocks_paying_over_http() {
     // 撤销后 pay → 业务拒绝 E_REVOKED（定局，不是传输错误）。
     let err = client.pay(&pay_params(dh, 100)).unwrap_err();
     assert!(
-        matches!(err, SdkError::Meridian(_)),
+        matches!(err, SdkError::Mist(_)),
         "撤销是新意图的业务拒绝，非传输错误: {err:?}"
     );
     assert_eq!(err.code(), "E_REVOKED", "err: {err:?}");
@@ -922,7 +919,7 @@ fn e2e_admin_revoke_blocks_paying_over_http() {
 //       （安全优先），再并行转发到对端同款端点，逐对端结果 fail-visible。
 // ---------------------------------------------------------------------------
 
-use meridian_gateway::RevocationPeer;
+use mist_gateway::RevocationPeer;
 
 /// 起一个真 socket 网关，返回 (addr, agg句柄)——带 admin key（fanout 对端形态）。
 fn spawn_admin_gateway(
@@ -1004,7 +1001,7 @@ fn fanout_propagates_revocation_to_all_peers() {
         &revoke_body(&dh),
     );
     assert_eq!(status, 200, "body: {body}");
-    let resp: meridian_gateway::AdminRevocationResponse =
+    let resp: mist_gateway::AdminRevocationResponse =
         serde_json::from_str(&body).expect("revoke dto");
     assert!(resp.newly_revoked);
     let mut fan = resp.fanout.clone();
@@ -1061,7 +1058,7 @@ fn fanout_peer_down_is_fail_visible_and_local_still_revokes() {
         &revoke_body(&dh),
     );
     assert_eq!(status, 200, "对端宕机不降级整体状态，body: {body}");
-    let resp: meridian_gateway::AdminRevocationResponse =
+    let resp: mist_gateway::AdminRevocationResponse =
         serde_json::from_str(&body).expect("revoke dto");
     assert!(resp.newly_revoked, "本地撤销照常生效");
     let dead_out = resp
@@ -1134,7 +1131,7 @@ fn fanout_idempotent_replay_retries_failed_peer() {
         &revoke_body(&dh),
     );
     assert_eq!(r.status, 200, "body: {}", r.body);
-    let resp: meridian_gateway::AdminRevocationResponse =
+    let resp: mist_gateway::AdminRevocationResponse =
         serde_json::from_str(&r.body).expect("revoke dto");
     assert!(!resp.newly_revoked, "幂等重放不重复撤销");
     assert_eq!(resp.fanout.len(), 1);
@@ -1526,10 +1523,10 @@ fn e2e_business_rejection_is_final_not_transport() {
     let rec = client.authorize(&owner, [1u8; 20], &limits(1_000)).unwrap();
     let dh = rec.delegation_hash;
 
-    // 超单笔上限：业务拒绝经 200 + reject_reason 透传 → SdkError::Meridian（非 Transport）。
+    // 超单笔上限：业务拒绝经 200 + reject_reason 透传 → SdkError::Mist（非 Transport）。
     let err = client.pay(&pay_params(dh, 2_000)).unwrap_err();
     assert!(
-        matches!(err, SdkError::Meridian(_)),
+        matches!(err, SdkError::Mist(_)),
         "business rejection must not surface as transport error: {err:?}"
     );
     assert_eq!(err.code(), "E_BUDGET_PER_SPEND");
@@ -1602,7 +1599,7 @@ fn config_revocation_watch_default_omitted_roundtrip_kept() {
 
     // 配置观察面：roundtrip 保留（bin 装配消费同一形状）。
     let with_watch = Config {
-        revocation_watch: Some(meridian_gateway::watch::RevocationWatchConf {
+        revocation_watch: Some(mist_gateway::watch::RevocationWatchConf {
             rpc_url: "http://127.0.0.1:8545".into(),
             registry_address: format!("0x{}", "33".repeat(20)),
             poll_interval_ms: 15_000,

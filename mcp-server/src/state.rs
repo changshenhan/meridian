@@ -1,6 +1,6 @@
 //! S-13 MCP 服务器正式版状态层：**薄 keyless 层包住真实聚合器内核**。
 //!
-//! 与内核的分工：`meridian-aggregator`（S-10/S-12）负责一切账本执行——WAL 持久化、
+//! 与内核的分工：`mist-aggregator`（S-10/S-12）负责一切账本执行——WAL 持久化、
 //! 幂等 re-ack（同意图重发返回先前 seq）、单调 seq、预算强制、真错误码。本层只保留：
 //!   1. 已授权委托的内存表（`total_cap` 给 balance；`agent_pub` 给 EAttestBind 与 attest）；
 //!   2. authorize 的 owner 验签与委托字段自洽（探针既有逻辑原样保留）；
@@ -21,15 +21,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::Signature as AgentSignature;
 use ed25519_dalek::VerifyingKey as AgentPubKey;
-use meridian_aggregator::ingest::Aggregator;
-use meridian_aggregator::receipt::IntentEnvelope;
-use meridian_core::attestation::{agent_commit, verify_binding, AttestationPubKey};
-use meridian_core::dsa::{
+use mist_aggregator::ingest::Aggregator;
+use mist_aggregator::receipt::IntentEnvelope;
+use mist_core::attestation::{agent_commit, verify_binding, AttestationPubKey};
+use mist_core::dsa::{
     delegation_hash, verify_delegation, Amount, Delegation, Did, OwnerPubKey, Signature64,
     SignedDelegation, SpendIntent,
 };
-use meridian_core::error::Error;
-use meridian_core::zk::{SpendProof, SpendPublicInputs};
+use mist_core::error::Error;
+use mist_core::zk::{SpendProof, SpendPublicInputs};
 
 /// 服务器登记的委托：委托本体 + 该 agent 的 Ed25519 传输公钥。
 /// （`SignedDelegation` 不含 agent 公钥，EAttestBind / attest 需要它，故单独携带。）
@@ -141,7 +141,7 @@ impl AppState {
         }
     }
 
-    /// 注册委托（meridian.authorize）。
+    /// 注册委托（mist.authorize）。
     ///
     /// 校验：owner 对 delegation_hash 的 secp256k1 签名；委托字段自洽
     /// （not_before ≤ expires_at；单笔 ≤ 窗口 ≤ 总额，否则后续必然红）。
@@ -211,7 +211,7 @@ impl AppState {
         Ok(receipt_from(delegation))
     }
 
-    /// 执行一笔支付（meridian.pay）。
+    /// 执行一笔支付（mist.pay）。
     ///
     /// 证明来源（S-52，TECH_SPEC §6.16）：`proof = Some` 时**客户端直通**——框架侧
     /// 客户端产真电路证明（`NoirProver`，keyless 保形：attestation secret 不上服务器），
@@ -243,7 +243,7 @@ impl AppState {
         }
     }
 
-    /// 查询委托剩余额度（meridian.balance）。
+    /// 查询委托剩余额度（mist.balance）。
     pub fn balance(&self, dh: &[u8; 32]) -> Result<BalanceReceipt, Error> {
         let stored = self
             .delegations
@@ -263,7 +263,7 @@ impl AppState {
         })
     }
 
-    /// 双钥绑定凭据（meridian.attest，S-05）。
+    /// 双钥绑定凭据（mist.attest，S-05）。
     ///
     /// agent Ed25519（authorize 时绑定到 dh）对 BabyJubJub attestation 公钥做绑定签名；
     /// 服务器重算 `agent_commit = sha256(x_le ‖ y_le)` 并用存储的 agent_pub 验签。
@@ -291,7 +291,7 @@ impl AppState {
         })
     }
 
-    /// 只读确认（meridian.verify_receipt）：`(dh, spend_nonce, intent_hash)` 是否已被
+    /// 只读确认（mist.verify_receipt）：`(dh, spend_nonce, intent_hash)` 是否已被
     /// 接受及 seq。拒绝（预算拒）与未知同报 accepted=false（infallible）。
     pub fn verify_receipt(
         &self,
@@ -309,7 +309,7 @@ impl AppState {
         }
     }
 
-    /// 撤销非成员 witness（meridian.revocation_witness，S-52 §6.16）。
+    /// 撤销非成员 witness（mist.revocation_witness，S-52 §6.16）。
     ///
     /// 客户端构建真电路证明所需的唯一服务器侧事实（S-45 网关同款语义）：`root` =
     /// 当前撤销状态根（BE Field 32B），`path` = 深度 256 兄弟路径扁平 hex（与
@@ -329,7 +329,7 @@ impl AppState {
     /// `agent_commit` / `revocation_root` = [0;32]（TEMPORARY），`now` = unix。
     /// `FormatVerifier` 只查 proof 非空 + 公共输入与 intent 一致（`check_public_inputs_consistent`），
     /// 不查这两项 → 占位成立。真 ZK 语义自 S-52 起：客户端直通证明经 `pay` 入参进入
-    /// 同一验证缝（§6.16），bb 装配（main.rs `MERIDIAN_VERIFY_BACKEND=bb`）下占位被全拒。
+    /// 同一验证缝（§6.16），bb 装配（main.rs `MIST_VERIFY_BACKEND=bb`）下占位被全拒。
     fn build_proof(intent: &SpendIntent) -> SpendProof {
         SpendProof {
             proof: vec![0x00, 0x01, 0x02],

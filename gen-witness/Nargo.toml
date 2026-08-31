@@ -2,7 +2,7 @@
 name = "gen_witness"
 version = "0.1.0"
 type = "bin"
-authors = ["Meridian Labs"]
+authors = ["Mist Labs"]
 
 # S-09 正式电路 witness 生成器（确定性，CI prove/verify 管线用）。
 # 与 circuits/ 同工具链锁定与 git 依赖（见 circuits/Nargo.toml 注释）。

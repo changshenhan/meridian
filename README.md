@@ -1,8 +1,8 @@
-# Meridian
+# Mist
 
 Agent 经济基础设施层 —— 机器商务的结算与信任铁轨。
 
-Meridian 做"AI Agent 之间怎么互相花钱、互相信任"的标准 + 参考实现 + 基础设施：
+Mist 做"AI Agent 之间怎么互相花钱、互相信任"的标准 + 参考实现 + 基础设施：
 **DSA 授权原语**（Delegated Spend Authority）+ **结算聚合器**。代码以最顶级性能为标准，每一行按"要发表 benchmark"的要求写。
 
 ## 文档
@@ -29,14 +29,14 @@ Meridian 做"AI Agent 之间怎么互相花钱、互相信任"的标准 + 参考
 ## Workspace
 
 ```
-core/          DSA 授权原语 + 预算账本（meridian-core）
-aggregator/    结算内核：ingest / commitment lattice / WAL / 净额（meridian-aggregator）
-gateway/       S-29 网络 ingest 网关：多租户 Bearer + 每租户令牌桶，std-only HTTP/1.1（meridian-gateway）
-sdk/           Agent 集成层：authorize / pay / attest + 幂等重试 + x402 fetch 拦截（S-30b）（meridian-sdk）
-facilitator/   S-30c x402 merchant 参考实现：网关回执验证，fail-closed，std-only HTTP/1.1（meridian-facilitator）
-mcp-server/    MCP stdio 服务器：6 工具、keyless、真 ZK 证明直通（meridian-mcp）
+core/          DSA 授权原语 + 预算账本（mist-core）
+aggregator/    结算内核：ingest / commitment lattice / WAL / 净额（mist-aggregator）
+gateway/       S-29 网络 ingest 网关：多租户 Bearer + 每租户令牌桶，std-only HTTP/1.1（mist-gateway）
+sdk/           Agent 集成层：authorize / pay / attest + 幂等重试 + x402 fetch 拦截（S-30b）（mist-sdk）
+facilitator/   S-30c x402 merchant 参考实现：网关回执验证，fail-closed，std-only HTTP/1.1（mist-facilitator）
+mcp-server/    MCP stdio 服务器：6 工具、keyless、真 ZK 证明直通（mist-mcp）
 monitor/       S-15 可观测性：/metrics Prometheus 文本 + /healthz 健康判定（std-only）
-bench/         基准基座 + 零分配门禁 + CI gate（meridian-bench）
+bench/         基准基座 + 零分配门禁 + CI gate（mist-bench）
 contracts/     Solidity：DSA / RevocationRegistry / BatchSettler + rust-smoke（独立 workspace）
 circuits/      Noir ZK 电路（intent_hash 绑定 + 撤销非成员）
 demos/         三框架演示闭环（LangChain / AutoGen / Eliza）
@@ -54,16 +54,16 @@ bash scripts/verify.sh
 # M1 端到端 demo（10 万笔 → 净额结算，Anvil 全绿；需 foundry）
 cd contracts/rust-smoke && cargo run --release --bin m1_demo
 # 监控（S-15）：健康检查 + Prometheus 指标端点
-cargo run -p meridian-monitor --bin meridian-monitor -- --wal <path> --once        # 一次快照
-cargo run -p meridian-monitor --bin meridian-monitor -- --wal <path> --port 9100   # HTTP 服务
+cargo run -p mist-monitor --bin mist-monitor -- --wal <path> --once        # 一次快照
+cargo run -p mist-monitor --bin mist-monitor -- --wal <path> --port 9100   # HTTP 服务
 # 网络 ingest 网关（S-29）：POST /v1/authorize、/v1/intents + GET /v1/receipts/{hash}（S-30a）+ /healthz
-cargo run -p meridian-gateway --bin meridian-gateway -- gateway.json
+cargo run -p mist-gateway --bin mist-gateway -- gateway.json
 # 性能基座
-cargo run -p meridian-bench --bin gate -- --record          # 记录 baseline（3 整轮取中位）
-cargo run -p meridian-bench --bin gate                       # 与 baseline 比较，疑似回归自动复测
-cargo bench -p meridian-bench --no-run                        # criterion 基准编译
+cargo run -p mist-bench --bin gate -- --record          # 记录 baseline（3 整轮取中位）
+cargo run -p mist-bench --bin gate                       # 与 baseline 比较，疑似回归自动复测
+cargo bench -p mist-bench --no-run                        # criterion 基准编译
 # 吞吐验收
-cargo run -p meridian-bench --bin poc_aggregator -- --check 100000
+cargo run -p mist-bench --bin poc_aggregator -- --check 100000
 # v0.1 release 工装（门禁 → 构建 → dist 装配 + sha256；暂不公开）
 bash scripts/release.sh
 # 交付证明复现（首次编译拉 tlsn/mpz 框架，较久）

@@ -1,4 +1,4 @@
-//! Meridian 聚合器可观测性脚手架（S-15）。
+//! Mist 聚合器可观测性脚手架（S-15）。
 //!
 //! 零新依赖：Prometheus 文本导出格式手写（精确按 exposition spec），HTTP 用 std
 //! `TcpListener` 自写（metrics/healthz 两个只读端点足够；S-15 真实部署如需要高级路由/
@@ -35,7 +35,7 @@ pub use server::{serve, Report, Reporter};
 
 use std::path::Path;
 
-use meridian_aggregator::wal::{DecodedRecord, Wal};
+use mist_aggregator::wal::{DecodedRecord, Wal};
 
 /// 独立重放 WAL，统计 Intent 记录数。
 ///

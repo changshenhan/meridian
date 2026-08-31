@@ -1,21 +1,21 @@
 //! B7 基准：100k 笔排序 + 承诺（commitment lattice，TECH_SPEC §8.1 B7）。
 //!
 //! 验收（MASTER_PLAN S-10 / §8.1）：**100k 排序+承诺 < 1s、< 1GB**。
-//! 本 bin 直接调 `meridian-aggregator::lattice` 全管线（`commitment_root` → `reorder` →
+//! 本 bin 直接调 `mist-aggregator::lattice` 全管线（`commitment_root` → `reorder` →
 //! `aggregate` → `netting_root`，即 §6.3 步骤 A-E 的纯计算侧），测墙钟（5 轮取最短）与累计
 //! 分配字节。累计分配 ≥ 峰值驻留，作 **<1GB 的保守上界**断言。
 //!
 //! 确定性夹具：固定 seed 的 xorshift64*，不依赖 rand（B11 风格）。S-10d 的 `agg_sim` 会把
 //! B7 并入门禁 baseline（`gate.rs --record`）；这里给出 S-10b 的参考机实测记录。
 //!
-//! 用法：`cargo run --release -p meridian-bench --bin lattice_b7`
+//! 用法：`cargo run --release -p mist-bench --bin lattice_b7`
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use meridian_aggregator::lattice::{self, EpochResult};
-use meridian_aggregator::window::WindowEntry;
-use meridian_bench::{section_alloc_bytes, NoAllocGuard};
+use mist_aggregator::lattice::{self, EpochResult};
+use mist_aggregator::window::WindowEntry;
+use mist_bench::{section_alloc_bytes, NoAllocGuard};
 
 const N: usize = 100_000;
 /// B7 墙钟上界。
@@ -64,7 +64,7 @@ fn run_pipeline(entries: &[WindowEntry]) -> EpochResult {
         Some((r, amount))
     };
     // 撤销根参数（S-11）：空撤销集根（bench 不测撤销稀疏根）。
-    let empty_rev_root = meridian_aggregator::revocation::RevocationSet::new().sparse_root();
+    let empty_rev_root = mist_aggregator::revocation::RevocationSet::new().sparse_root();
     lattice::build_epoch(0, 1_700_000_000, entries, &mut resolve, empty_rev_root)
         .expect("resolver total")
 }

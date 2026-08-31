@@ -9,7 +9,7 @@ chcp 65001 | Out-Null
 $DIST = 'MeridianUbuntu'
 $VHD_DIR = 'D:\WSL\ubuntu'
 $ROOTFS = 'D:\WSL\downloads\ubuntu-noble.rootfs.tar.gz'
-$REPO = 'C:\Users\18299\Desktop\Meridian\meridian'
+$REPO = 'C:\Users\18299\Desktop\Mist\mist'
 
 Write-Output "=== [0] 校验 VirtualMachinePlatform 已落地 ==="
 $vmc = Get-Service -Name vmcompute -ErrorAction SilentlyContinue

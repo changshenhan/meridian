@@ -1,4 +1,4 @@
-//! `meridian-monitor` CLI：生产配置聚合器 + 健康检查 + Prometheus 端点。
+//! `mist-monitor` CLI：生产配置聚合器 + 健康检查 + Prometheus 端点。
 //!
 //! 两种模式：
 //! - 默认：HTTP 服务 `http://127.0.0.1:<port>`（`/healthz` JSON + `/metrics` Prometheus 文本）。
@@ -17,17 +17,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_monitor::cluster::{evaluate_cluster, render_cluster_metrics, ClusterView};
-use meridian_monitor::count_wal_intents;
-use meridian_monitor::health::evaluate;
-use meridian_monitor::metrics::{rate_from_delta, render_prometheus};
-use meridian_monitor::reputation::{
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::proof::FormatVerifier;
+use mist_monitor::cluster::{evaluate_cluster, render_cluster_metrics, ClusterView};
+use mist_monitor::count_wal_intents;
+use mist_monitor::health::evaluate;
+use mist_monitor::metrics::{rate_from_delta, render_prometheus};
+use mist_monitor::reputation::{
     fetch_reputation, render_read_ok, render_reputation, ReputationSnapshot,
 };
-use meridian_monitor::rpc::JsonRpc;
-use meridian_monitor::server::{serve, Report, Reporter};
+use mist_monitor::rpc::JsonRpc;
+use mist_monitor::server::{serve, Report, Reporter};
 
 fn main() {
     let mut wal_paths: Vec<PathBuf> = Vec::new();
@@ -57,7 +57,7 @@ fn main() {
                 rpc_url = Some(args.next().expect("--rpc <url>"));
             }
             "--help" | "-h" => {
-                println!("usage: meridian-monitor [--wal <path>]... [--port <n>] [--once]");
+                println!("usage: mist-monitor [--wal <path>]... [--port <n>] [--once]");
                 println!(
                     "  --wal 可重复传多个 = 热备副本组集群聚合（instance label = WAL 文件名）"
                 );
@@ -74,13 +74,13 @@ fn main() {
         }
     }
     if wal_paths.is_empty() {
-        wal_paths.push(PathBuf::from("meridian.wal"));
+        wal_paths.push(PathBuf::from("mist.wal"));
     }
 
-    let reputation = match meridian_monitor::reputation::parse_reputation_args(settler, rpc_url) {
+    let reputation = match mist_monitor::reputation::parse_reputation_args(settler, rpc_url) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("meridian-monitor: {e}");
+            eprintln!("mist-monitor: {e}");
             std::process::exit(2);
         }
     };
@@ -88,7 +88,7 @@ fn main() {
     match run(&wal_paths, port, once, reputation) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("meridian-monitor: {e}");
+            eprintln!("mist-monitor: {e}");
             std::process::exit(1);
         }
     }
@@ -126,7 +126,7 @@ fn run(
         )?;
         if truncated {
             eprintln!(
-                "meridian-monitor: warning: 副本 {name} WAL 尾部损坏已截断恢复\
+                "mist-monitor: warning: 副本 {name} WAL 尾部损坏已截断恢复\
                  （崩溃时未同步的字节）。建议尽快接管该 WAL 并核对结算账本。"
             );
         }
@@ -136,7 +136,7 @@ fn run(
         let snap = agg.snapshot();
         if snap.accepted_count != wal_intents {
             eprintln!(
-                "meridian-monitor: warning: 副本 {name} 内存 accepted_count={} ≠ WAL Intent 数={} \
+                "mist-monitor: warning: 副本 {name} 内存 accepted_count={} ≠ WAL Intent 数={} \
                  （一致性降级，/healthz 将报 503）",
                 snap.accepted_count, wal_intents
             );
@@ -272,7 +272,7 @@ impl Reporter for ReputationReporter {
             }
             Err(e) => {
                 eprintln!(
-                    "meridian-monitor: warning: 声誉面抓取失败（保留上次快照，\
+                    "mist-monitor: warning: 声誉面抓取失败（保留上次快照，\
                      chain_read_ok=0）：{e}"
                 );
             }

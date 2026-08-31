@@ -26,14 +26,14 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use anyhow::{Context, Result};
 
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::lattice::EpochResult;
-use meridian_aggregator::merkle::{acceptance_leaf, inclusion_proof, leaf as merkle_leaf};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_aggregator::window::WindowEntry;
-use meridian_core::dsa::{self, AgentSigningKey, Delegation, RateLimit};
-use meridian_core::error::Error;
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::lattice::EpochResult;
+use mist_aggregator::merkle::{acceptance_leaf, inclusion_proof, leaf as merkle_leaf};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_aggregator::window::WindowEntry;
+use mist_core::dsa::{self, AgentSigningKey, Delegation, RateLimit};
+use mist_core::error::Error;
 
 /// S-14 共享件：anvil 部署 / sol! 绑定 / 信封构造（S-11d 与 M1 demo 复用）。
 use contract_smoke::common::*;
@@ -102,7 +102,7 @@ async fn run_smoke() -> Result<()> {
     );
 
     let clock = Arc::new(AtomicU64::new(1_700_000_000));
-    let wal_path = std::env::temp_dir().join(format!("meridian-smoke-{}.wal", std::process::id()));
+    let wal_path = std::env::temp_dir().join(format!("mist-smoke-{}.wal", std::process::id()));
     let agent_key = AgentSigningKey::from_bytes(&AGENT_KEY_BYTES);
     let agg = aggregator(clock.clone(), &wal_path);
 
@@ -114,7 +114,7 @@ async fn run_smoke() -> Result<()> {
         .send().await?
         .get_receipt().await?;
     let registered_a: bool = dsa_c.isRegistered(B256::from(dh_a)).call().await?;
-    assert!(registered_a, "on-chain sha256(delegationABI) 必须等于 meridian-core delegation_hash");
+    assert!(registered_a, "on-chain sha256(delegationABI) 必须等于 mist-core delegation_hash");
     let onchain_owner_a: Address = dsa_c.ownerOf(B256::from(dh_a)).call().await?;
     assert_eq!(onchain_owner_a, Address::from_slice(&d_a.owner), "ownerOf 必须等于 owner");
     agg.register(sd_a, agent_key.verifying_key());
@@ -126,7 +126,7 @@ async fn run_smoke() -> Result<()> {
         .send().await?
         .get_receipt().await?;
     let registered_b: bool = dsa_c.isRegistered(B256::from(dh_b)).call().await?;
-    assert!(registered_b, "on-chain sha256(delegationABI) 必须等于 meridian-core delegation_hash");
+    assert!(registered_b, "on-chain sha256(delegationABI) 必须等于 mist-core delegation_hash");
     let onchain_owner_b: Address = dsa_c.ownerOf(B256::from(dh_b)).call().await?;
     assert_eq!(onchain_owner_b, Address::from_slice(&d_b.owner), "ownerOf 必须等于 owner");
     agg.register(sd_b, agent_key.verifying_key());

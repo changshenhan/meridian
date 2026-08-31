@@ -1,7 +1,7 @@
 //! S-13a 验收集成测试：真实 MCP 协议闭环 + 真实聚合器内核（WAL 持久化）。
 //!
 //! 用官方 rmcp client（任何 `ClientHandler`）通过 `tokio::io::duplex` 连接
-//! MeridianServer，走完整 MCP JSON-RPC：`initialize` → `tools/call authorize/pay/
+//! MistServer，走完整 MCP JSON-RPC：`initialize` → `tools/call authorize/pay/
 //! balance/attest/verify_receipt`。证明"agent 框架经 MCP 完成 DSA 授权 → 支付 → 对账"
 //! 的全链路落在真实内核上（幂等 re-ack、单调 seq、预算强制、真错误码）。密钥与签名
 //! 全部用 core 原语现场构造——绝无 mock。
@@ -11,16 +11,16 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey as AgentSigningKey;
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::attestation::{agent_commit, sign_binding, AttestationPubKey};
-use meridian_core::dsa::{
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::attestation::{agent_commit, sign_binding, AttestationPubKey};
+use mist_core::dsa::{
     delegation_hash, intent_hash, owner_signing_key_from_bytes, sign_delegation, sign_intent,
     Amount, Delegation, OwnerSigningKey, RateLimit, SpendIntent, PROTOCOL_VERSION,
 };
-use meridian_mcp::tools::{AuthorizeRequest, PayRequest};
-use meridian_mcp::MeridianServer;
+use mist_mcp::tools::{AuthorizeRequest, PayRequest};
+use mist_mcp::MistServer;
 use rmcp::model::{CallToolRequestParams, ClientInfo, JsonObject};
 use rmcp::{ClientHandler, ServiceExt};
 use serde_json::{json, Value};
@@ -35,7 +35,7 @@ static WAL_SEQ: AtomicU32 = AtomicU32::new(0);
 fn wal_path(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "meridian-mcp-{}-{}-{}.wal",
+        "mist-mcp-{}-{}-{}.wal",
         std::process::id(),
         tag,
         WAL_SEQ.fetch_add(1, Ordering::Relaxed)
@@ -196,7 +196,7 @@ async fn setup(
     let (server_transport, client_transport) = tokio::io::duplex(4096);
     let server_agg = Arc::clone(&agg);
     let server_handle = tokio::spawn(async move {
-        MeridianServer::new(server_agg)
+        MistServer::new(server_agg)
             .serve(server_transport)
             .await?
             .waiting()
@@ -651,7 +651,7 @@ fn proof_args(
         memo: None,
         expires_at: i.expires_at,
         signature: hex::encode(sig.to_bytes()),
-        proof: Some(meridian_mcp::tools::ProofRequest {
+        proof: Some(mist_mcp::tools::ProofRequest {
             proof_hex: hex::encode(proof_bytes),
             agent_commit: hex::encode(agent_commit),
             revocation_root: hex::encode(revocation_root),
@@ -731,14 +731,14 @@ async fn pay_client_proof_reaches_verifier_not_server_placeholder() -> anyhow::R
         let wal = Wal::open(&wal_path("proof_reject_all"), 1_000).unwrap();
         Arc::new(Aggregator::new(
             IngestConfig::default(),
-            Box::new(meridian_aggregator::proof::RejectAllVerifier),
+            Box::new(mist_aggregator::proof::RejectAllVerifier),
             wal,
         ))
     };
     let (server_transport, client_transport) = tokio::io::duplex(4096);
     let server_agg = Arc::clone(&agg);
     let server_handle = tokio::spawn(async move {
-        MeridianServer::new(server_agg)
+        MistServer::new(server_agg)
             .serve(server_transport)
             .await?
             .waiting()

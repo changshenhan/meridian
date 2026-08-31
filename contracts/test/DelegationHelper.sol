@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 pragma solidity ^0.8.24;
 
-/// @notice meridian-core `canonical_delegation` 的 Solidity 镜像（forge 测试 / alloy 冒烟共用）。
+/// @notice mist-core `canonical_delegation` 的 Solidity 镜像（forge 测试 / alloy 冒烟共用）。
 ///         两侧 `sha256` 必须一致——这是 TECH_SPEC §7 "链上与链下同一 delegation_hash" 的
 ///         交叉实现契约：改任何一侧，另一侧的 sha256 校验立即失配（§11 E-03）。
 ///         与 core/src/dsa.rs::sample_delegation 的字段定序逐字节对齐。

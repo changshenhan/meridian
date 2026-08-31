@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use meridian_aggregator::ingest::Aggregator;
+use mist_aggregator::ingest::Aggregator;
 
 use crate::binding::rpc_post;
 
@@ -35,7 +35,7 @@ fn revoked_topic0() -> [u8; 32] {
 
 /// 撤销观察面配置（config.json `revocation_watch` 节，§6.24.1 定夺 6）。缺省不配置 =
 /// 不观察（缺省口径逐字节不变，序列化不出现本节）。不用 env：观察面是部署拓扑配置
-///（与 `revocation_peers` 同面），也不复用绑定闸 `MERIDIAN_RPC_URL`——绑定闸
+///（与 `revocation_peers` 同面），也不复用绑定闸 `MIST_RPC_URL`——绑定闸
 ///「三同给同不给」的半装配语义与观察面无关，纠缠只会制造静默漏配。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RevocationWatchConf {
@@ -193,9 +193,9 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
 
-    use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-    use meridian_aggregator::proof::FormatVerifier;
-    use meridian_aggregator::wal::Wal;
+    use mist_aggregator::ingest::{Aggregator, IngestConfig};
+    use mist_aggregator::proof::FormatVerifier;
+    use mist_aggregator::wal::Wal;
 
     /// `cast keccak "Revoked(bytes32,address)"`（foundry keccak）独立锚定——实现侧
     /// sha3 现算必须等于此字面量（§6.19.3 selector 同纪律，不手算）。
@@ -334,7 +334,7 @@ mod tests {
 
     fn aggregator(tag: &str) -> (PathBuf, Aggregator) {
         let path =
-            std::env::temp_dir().join(format!("meridian-watch-{}-{tag}.wal", std::process::id()));
+            std::env::temp_dir().join(format!("mist-watch-{}-{tag}.wal", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let wal = Wal::open(&path, 1_000).expect("open wal");
         let agg = Aggregator::new(IngestConfig::default(), Box::new(FormatVerifier), wal);

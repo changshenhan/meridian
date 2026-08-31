@@ -172,45 +172,45 @@ pub fn render_reputation(s: &ReputationSnapshot, settler: &str) -> String {
     };
     let sl = format!("settler=\"{}\"", escape_label(settler));
     push(
-        "meridian_operator_epochs_committed_total",
+        "mist_operator_epochs_committed_total",
         "已提交 epoch 数（Commit 事件计数，含后被 voided 的；TECH_SPEC §6.22）。",
         sl.clone(),
         s.epochs_committed as f64,
     );
     push(
-        "meridian_operator_epochs_settled_total",
+        "mist_operator_epochs_settled_total",
         "已结算 epoch 数（Settled 事件计数）。",
         sl.clone(),
         s.epochs_settled as f64,
     );
     push(
-        "meridian_operator_slash_total",
+        "mist_operator_slash_total",
         "罚没次数（ChallengeSucceeded 事件数 = voided epoch 数；决策 E 只读派生不进判定面）。",
         sl.clone(),
         s.slash_total as f64,
     );
     for (kind, count) in &s.kind_counts {
         push(
-            "meridian_operator_slash_kind_total",
+            "mist_operator_slash_kind_total",
             "罚没按欺诈 kind 分解（kind = BatchSettler 欺诈证明 kind，十进制）。",
             format!("{sl},kind=\"{kind}\""),
             *count as f64,
         );
     }
     push(
-        "meridian_operator_bond_committed_wei",
+        "mist_operator_bond_committed_wei",
         "债券承诺累计（Σ Commit.bondedAmount，在押上界；f64 渲染 > 2^53 按浮点舍入）。",
         sl.clone(),
         wei_f64(s.bond_committed_wei),
     );
     push(
-        "meridian_operator_bond_claimed_wei",
+        "mist_operator_bond_claimed_wei",
         "运营者已领取额（Σ Claimed.amount）。",
         sl.clone(),
         wei_f64(s.bond_claimed_wei),
     );
     push(
-        "meridian_operator_contract_balance_wei",
+        "mist_operator_contract_balance_wei",
         "BatchSettler 合约余额（eth_getBalance；含未领取结算资金/挑战者退款留存，不等于净债券）。",
         sl,
         wei_f64(s.contract_balance_wei),
@@ -221,9 +221,9 @@ pub fn render_reputation(s: &ReputationSnapshot, settler: &str) -> String {
 /// 读面健康序列（定夺 5）：ok=false 时其他声誉序列可能是旧快照，告警以此行判定新鲜度。
 pub fn render_read_ok(settler: &str, ok: bool) -> String {
     format!(
-        "# HELP meridian_operator_chain_read_ok 声誉面链上读健康（1=本轮抓取成功；0=失败，保留上次快照）。\n\
-         # TYPE meridian_operator_chain_read_ok gauge\n\
-         meridian_operator_chain_read_ok{{settler=\"{}\"}} {}\n",
+        "# HELP mist_operator_chain_read_ok 声誉面链上读健康（1=本轮抓取成功；0=失败，保留上次快照）。\n\
+         # TYPE mist_operator_chain_read_ok gauge\n\
+         mist_operator_chain_read_ok{{settler=\"{}\"}} {}\n",
         escape_label(settler),
         if ok { 1 } else { 0 }
     )
@@ -434,24 +434,24 @@ mod tests {
         let text = render_reputation(&s, SETTLER);
 
         assert!(text.contains(
-            "meridian_operator_epochs_committed_total{settler=\"0x0000000000000000000000000000000000000042\"} 3"
+            "mist_operator_epochs_committed_total{settler=\"0x0000000000000000000000000000000000000042\"} 3"
         ));
-        assert!(text.contains("meridian_operator_slash_total{settler=") && text.contains("} 2"));
+        assert!(text.contains("mist_operator_slash_total{settler=") && text.contains("} 2"));
         // kind 分解升序（BTreeMap），label 形如 ,kind="1"。
         assert!(text.contains(",kind=\"1\"} 1"));
         assert!(text.contains(",kind=\"2\"} 1"));
         // Rust f64 Display 不用科学计数法：3 ETH wei 原样十进制。
         assert!(text.contains(
-            "meridian_operator_bond_committed_wei{settler=\"0x0000000000000000000000000000000000000042\"} 3000000000000000000"
+            "mist_operator_bond_committed_wei{settler=\"0x0000000000000000000000000000000000000042\"} 3000000000000000000"
         ));
-        assert!(text.contains("meridian_operator_contract_balance_wei") && text.contains("} 123"));
+        assert!(text.contains("mist_operator_contract_balance_wei") && text.contains("} 123"));
         // HELP/TYPE 成对。
         assert_eq!(
             text.matches("# TYPE").count(),
             text.matches("# HELP").count()
         );
         // 全部 gauge。
-        assert!(!text.contains("# TYPE meridian_operator_slash_kind_total counter"));
+        assert!(!text.contains("# TYPE mist_operator_slash_kind_total counter"));
     }
 
     #[test]

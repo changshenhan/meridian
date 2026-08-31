@@ -1,26 +1,26 @@
-//! 网关守护进程入口（S-29）：`meridian-gateway <config.json>`。
+//! 网关守护进程入口（S-29）：`mist-gateway <config.json>`。
 //!
 //! 聚合器内核参数沿用默认（IngestConfig::default；bb 验证后端时撤销根绑定闸同步
 //! 开启，S-48 装配面配对闸）+ WAL 路径来自配置 `wal_path`
-//! （缺省 `./gateway.wal`）。运营者绑定闸（S-62，§6.19.3）：`MERIDIAN_RPC_URL` +
-//! `MERIDIAN_DSA_ADDRESS` + `MERIDIAN_SELF_OPERATOR` 三者同给同不给（半装配启动即退）。
+//! （缺省 `./gateway.wal`）。运营者绑定闸（S-62，§6.19.3）：`MIST_RPC_URL` +
+//! `MIST_DSA_ADDRESS` + `MIST_SELF_OPERATOR` 三者同给同不给（半装配启动即退）。
 //! 生产部署：明文 HTTP，前置反代终结 TLS（§6.7 诚实边界）。
 
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_aggregator::bb::BbVerifier;
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::zk::SpendVerifier;
-use meridian_gateway::{Config, Gateway};
+use mist_aggregator::bb::BbVerifier;
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::zk::SpendVerifier;
+use mist_gateway::{Config, Gateway};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("usage: meridian-gateway <config.json>");
+        eprintln!("usage: mist-gateway <config.json>");
         std::process::exit(2);
     }
     let cfg = Config::from_path(std::path::Path::new(&args[1])).unwrap_or_else(|e| {
@@ -28,13 +28,11 @@ fn main() {
         std::process::exit(2);
     });
 
-    // 聚合器内核：验证后端由 `MERIDIAN_VERIFY_BACKEND` 选择（S-40，TECH_SPEC §6.13）——
+    // 聚合器内核：验证后端由 `MIST_VERIFY_BACKEND` 选择（S-40，TECH_SPEC §6.13）——
     // 缺省 `format`（FormatVerifier TEMPORARY 口径，生产默认不变）；`bb` 走真 ZK 验证
-    // （BbVerifier，需 `MERIDIAN_BB_VK` + 可得的 bb 工具链；构造失败启动即退 fail-closed）。
-    let verifier: Box<dyn SpendVerifier + Send + Sync> = match std::env::var(
-        "MERIDIAN_VERIFY_BACKEND",
-    )
-    .as_deref()
+    // （BbVerifier，需 `MIST_BB_VK` + 可得的 bb 工具链；构造失败启动即退 fail-closed）。
+    let verifier: Box<dyn SpendVerifier + Send + Sync> = match std::env::var("MIST_VERIFY_BACKEND")
+        .as_deref()
     {
         Ok("bb") => match BbVerifier::from_env() {
             Ok(v) => {
@@ -45,7 +43,7 @@ fn main() {
             }
             Err(e) => {
                 eprintln!(
-                        "MERIDIAN_VERIFY_BACKEND=bb 但后端不可得（{e}）：需 MERIDIAN_BB_VK + nargo/bb 工具链（Windows 原生或 WSL2 兜底）"
+                        "MIST_VERIFY_BACKEND=bb 但后端不可得（{e}）：需 MIST_BB_VK + nargo/bb 工具链（Windows 原生或 WSL2 兜底）"
                     );
                 std::process::exit(2);
             }
@@ -60,17 +58,17 @@ fn main() {
     if verifier.requires_revocation_root_binding() {
         ingest_cfg.enforce_revocation_root = true;
     }
-    let wal_path = std::env::var("MERIDIAN_GATEWAY_WAL").unwrap_or_else(|_| "gateway.wal".into());
+    let wal_path = std::env::var("MIST_GATEWAY_WAL").unwrap_or_else(|_| "gateway.wal".into());
     let wal = Wal::open(std::path::Path::new(&wal_path), 10_000).expect("open wal");
     let mut agg = Aggregator::new(ingest_cfg, verifier, wal);
 
     // 运营者绑定闸（S-62，§6.19.3，Phase 2 P2-2）：三环境变量同给同不给——半装配
     // （只给其一）启动即退 fail-fast，绝不落「闸语义不明」的静默态。未配置 = 无闸
     // （缺省口径逐字节不变，单运营者形态）。
-    let binding_state = meridian_gateway::binding::parse_binding_env(
-        std::env::var("MERIDIAN_RPC_URL").ok(),
-        std::env::var("MERIDIAN_DSA_ADDRESS").ok(),
-        std::env::var("MERIDIAN_SELF_OPERATOR").ok(),
+    let binding_state = mist_gateway::binding::parse_binding_env(
+        std::env::var("MIST_RPC_URL").ok(),
+        std::env::var("MIST_DSA_ADDRESS").ok(),
+        std::env::var("MIST_SELF_OPERATOR").ok(),
     )
     .unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -90,7 +88,7 @@ fn main() {
     // 重试（stderr 一行），绝不退进程——观察面挂掉不阻网关服务（admin API / fanout
     // 撤销路径仍可达）。不配置 = 不观察（缺省口径逐字节不变）。
     if let Some(watch_conf) = &cfg.revocation_watch {
-        let watch = meridian_gateway::watch::RevocationWatch::new(
+        let watch = mist_gateway::watch::RevocationWatch::new(
             &watch_conf.rpc_url,
             &watch_conf.registry_address,
             watch_conf.poll_interval_ms,
@@ -138,12 +136,12 @@ fn main() {
     }
     let gw = Arc::new(Gateway::new(agg, &cfg));
     eprintln!(
-        "meridian-gateway listening on {} (tenants: {tenants}, max_conn: {}, admin: {admin}, revocation_peers: {peers}, revocation_watch: {watch}, operator binding: {})",
+        "mist-gateway listening on {} (tenants: {tenants}, max_conn: {}, admin: {admin}, revocation_peers: {peers}, revocation_watch: {watch}, operator binding: {})",
         cfg.listen,
         cfg.max_connections,
         if binding_on { "on" } else { "off" }
     );
-    meridian_gateway::http::serve(
+    mist_gateway::http::serve(
         gw,
         listener,
         cfg.max_connections,

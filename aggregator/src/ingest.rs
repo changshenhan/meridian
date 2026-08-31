@@ -35,12 +35,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use meridian_core::dsa::{
+use mist_core::dsa::{
     delegation_hash, intent_hash, verify_intent, AgentPubKey, Delegation, SignedDelegation,
 };
-use meridian_core::error::Error;
-use meridian_core::ledger::{check_budget, BudgetState};
-use meridian_core::zk::SpendVerifier;
+use mist_core::error::Error;
+use mist_core::ledger::{check_budget, BudgetState};
+use mist_core::zk::SpendVerifier;
 use sha2::{Digest, Sha256};
 
 use crate::apply::{apply_log, state_digest};
@@ -595,7 +595,7 @@ pub struct Aggregator {
     binding: Option<Arc<crate::binding::BindingGate>>,
     /// 本实例启动时刻（unix 秒；`snapshot()` 健康快照用）。
     started_at: u64,
-    /// 实例标识（`meridian-<pid>`；S-15 多实例时每实例一 metrics endpoint）。
+    /// 实例标识（`mist-<pid>`；S-15 多实例时每实例一 metrics endpoint）。
     instance_id: String,
     now_fn: Box<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -702,7 +702,7 @@ impl Aggregator {
             revocation_roots: RwLock::new(HashSet::new()),
             binding: None,
             started_at: now,
-            instance_id: format!("meridian-{}", std::process::id()),
+            instance_id: format!("mist-{}", std::process::id()),
             now_fn,
         };
         agg.seed_revocation_roots();
@@ -1187,11 +1187,11 @@ impl Aggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_core::dsa::{
+    use mist_core::dsa::{
         owner_signing_key_from_bytes, sign_delegation, sign_intent, AgentSigningKey, RateLimit,
         SpendIntent,
     };
-    use meridian_core::zk::{SpendProof, SpendPublicInputs};
+    use mist_core::zk::{SpendProof, SpendPublicInputs};
     use std::collections::HashSet;
 
     use crate::bb::{BbBackend, BbVerifier};
@@ -1271,11 +1271,7 @@ mod tests {
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "meridian-ingest-test-{}-{}",
-            name,
-            std::process::id()
-        ));
+        p.push(format!("mist-ingest-test-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -1328,7 +1324,7 @@ mod tests {
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let agent_pub = agent_key.verifying_key();
         agg.register(sd, agent_pub);
-        (meridian_core::dsa::delegation_hash(&d), agent_pub)
+        (mist_core::dsa::delegation_hash(&d), agent_pub)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1354,7 +1350,7 @@ mod tests {
         let sig = sign_intent(&intent, agent_key);
         let proof = SpendProof {
             proof: vec![1, 2, 3],
-            public_inputs: meridian_core::zk::SpendPublicInputs {
+            public_inputs: mist_core::zk::SpendPublicInputs {
                 agent_commit: [0u8; 32],
                 delegation_hash: dh,
                 recipient,
@@ -1393,7 +1389,7 @@ mod tests {
         // 回执的 intent_hash 与意图一致。
         assert_eq!(
             r1.intent_hash,
-            meridian_core::dsa::intent_hash(
+            mist_core::dsa::intent_hash(
                 &make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now).intent
             )
         );
@@ -1414,7 +1410,7 @@ mod tests {
         let env1 = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now);
         let r1 = agg.submit(&env1);
         assert!(r1.accepted);
-        let ih1 = meridian_core::dsa::intent_hash(&env1.intent);
+        let ih1 = mist_core::dsa::intent_hash(&env1.intent);
         assert_eq!(agg.accepted_seq(&dh, 1, ih1), Some(0));
 
         // 预算拒（max_per_spend=1_000，付 2_000）→ nonce 已消耗但未接受 → None。
@@ -1422,14 +1418,14 @@ mod tests {
         let r2 = agg.submit(&env2);
         assert!(!r2.accepted);
         assert_eq!(r2.reject_reason, Some(Error::EBudgetPerSpend));
-        let ih2 = meridian_core::dsa::intent_hash(&env2.intent);
+        let ih2 = mist_core::dsa::intent_hash(&env2.intent);
         assert_eq!(agg.accepted_seq(&dh, 2, ih2), None);
 
         // 跨意图同 nonce 复用 → E_NONCE，lookup_accept 也不认 → None。
         let env3 = make_env(dh, [1u8; 20], &agent_key, [0xCC; 20], 1, 1, now);
         let r3 = agg.submit(&env3);
         assert_eq!(r3.reject_reason, Some(Error::ENonce));
-        let ih3 = meridian_core::dsa::intent_hash(&env3.intent);
+        let ih3 = mist_core::dsa::intent_hash(&env3.intent);
         assert_eq!(agg.accepted_seq(&dh, 1, ih3), None);
 
         // 从未见过的 nonce → None。
@@ -1448,7 +1444,7 @@ mod tests {
         let path = tmp_path("unknown");
         let agg = test_aggregator(&clock, &path);
         let d = delegation([1u8; 20], 1_000, 1_000_000);
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, 1_700_000_000);
         let r = agg.submit(&env);
@@ -1549,7 +1545,7 @@ mod tests {
         let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         agg.register(sd, agent_key.verifying_key());
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
         let now = clock.load(Ordering::Relaxed);
         let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 101, 1, now);
         let r1 = agg.submit(&env);
@@ -1573,7 +1569,7 @@ mod tests {
         let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         agg.register(sd, agent_key.verifying_key());
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
         let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 101, 1, 1_700_000_000);
         let r = agg.submit(&env);
         assert!(!r.accepted);
@@ -1590,7 +1586,7 @@ mod tests {
         let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         agg.register(sd, agent_key.verifying_key());
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
         let now = clock.load(Ordering::Relaxed);
         assert!(
             agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 60, 1, now))
@@ -1636,7 +1632,7 @@ mod tests {
         let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         agg.register(sd, agent_key.verifying_key());
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
         let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, 1_700_000_000);
         let r = agg.submit(&env);
         assert!(!r.accepted);
@@ -1886,7 +1882,7 @@ mod tests {
         let now = clock.load(Ordering::Relaxed);
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let d = delegation([1u8; 20], 1_000, 1_000_000);
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
 
         {
             let agg = test_aggregator(&clock, &path);
@@ -1985,7 +1981,7 @@ mod tests {
         let now = clock.load(Ordering::Relaxed);
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let d = delegation([1u8; 20], 100, 1_000_000); // max_per_spend=100
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
         let mut expected: Vec<(bool, [u8; 32], u64)> = Vec::new();
         {
             let agg = test_aggregator(&clock, &path);
@@ -2004,16 +2000,16 @@ mod tests {
                 );
                 let r = agg.submit(&env);
                 assert!(r.accepted);
-                expected.push((true, meridian_core::dsa::intent_hash(&env.intent), amt));
+                expected.push((true, mist_core::dsa::intent_hash(&env.intent), amt));
             }
             let over = make_env(dh, [1u8; 20], &agent_key, [0xEE; 20], 101, 4, now);
             let r = agg.submit(&over);
             assert_eq!(r.reject_reason, Some(Error::EBudgetPerSpend));
-            expected.push((false, meridian_core::dsa::intent_hash(&over.intent), 101));
+            expected.push((false, mist_core::dsa::intent_hash(&over.intent), 101));
             let dup = make_env(dh, [1u8; 20], &agent_key, [0xDD; 20], 5, 2, now);
             let r = agg.submit(&dup);
             assert_eq!(r.reject_reason, Some(Error::ENonce));
-            expected.push((false, meridian_core::dsa::intent_hash(&dup.intent), 5));
+            expected.push((false, mist_core::dsa::intent_hash(&dup.intent), 5));
             agg.wal.flush().unwrap();
             // 手工追加撕裂尾：一条头完整、payload 残缺 + 错 crc 的 Intent 记录。
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
@@ -2058,7 +2054,7 @@ mod tests {
         let now = clock.load(Ordering::Relaxed);
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let d = delegation([1u8; 20], 1_000, 1_000_000);
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
         let mut cfg = test_cfg();
         cfg.epoch_capacity = 4;
         {
@@ -2122,7 +2118,7 @@ mod tests {
         let now = clock.load(Ordering::Relaxed);
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let d = delegation([1u8; 20], 1_000, 1_000_000);
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
         let mut cfg = test_cfg();
         cfg.epoch_capacity = 4;
         {
@@ -2284,7 +2280,7 @@ mod tests {
         let now = clock.load(Ordering::Relaxed);
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         let d = delegation([1u8; 20], 1_000, 1_000_000);
-        let dh = meridian_core::dsa::delegation_hash(&d);
+        let dh = mist_core::dsa::delegation_hash(&d);
         let expect_root;
         {
             let agg = test_aggregator(&clock, &path);
@@ -2348,7 +2344,7 @@ mod tests {
                     let env = make_env(dh, agent, &agent_key, [i as u8; 20], 10, i + 1, now);
                     let r = agg.submit(&env);
                     assert!(r.accepted);
-                    expected.push((true, meridian_core::dsa::intent_hash(&env.intent), 10));
+                    expected.push((true, mist_core::dsa::intent_hash(&env.intent), 10));
                 }
             }
             // 撤销 A。
@@ -2358,13 +2354,13 @@ mod tests {
             let r = agg.submit(&env_rev);
             assert!(!r.accepted);
             assert_eq!(r.reject_reason, Some(Error::ERevoked));
-            expected.push((false, meridian_core::dsa::intent_hash(&env_rev.intent), 10));
+            expected.push((false, mist_core::dsa::intent_hash(&env_rev.intent), 10));
             assert_eq!(agg.accepted_count(), 6, "ERevoked 不耗窗口槽");
             for i in 4..6u64 {
                 let env = make_env(dh_b, [0x02; 20], &agent_key, [i as u8; 20], 5, i + 1, now);
                 let r = agg.submit(&env);
                 assert!(r.accepted);
-                expected.push((true, meridian_core::dsa::intent_hash(&env.intent), 5));
+                expected.push((true, mist_core::dsa::intent_hash(&env.intent), 5));
             }
             expect_root = agg.revocation_root();
             agg.wal.flush().unwrap();
@@ -2395,7 +2391,7 @@ mod tests {
         let r = agg2.submit(&env);
         assert!(r.accepted);
         assert_eq!(r.seq, 8, "恢复后 seq 从已接受数续接");
-        expected.push((true, meridian_core::dsa::intent_hash(&env.intent), 5));
+        expected.push((true, mist_core::dsa::intent_hash(&env.intent), 5));
         let r = agg2.submit(&make_env(
             dh_a, [0x01; 20], &agent_key, [0xCC; 20], 10, 5, now,
         ));
@@ -2542,7 +2538,7 @@ mod tests {
             .map(|env| {
                 (
                     true,
-                    meridian_core::dsa::intent_hash(&env.intent),
+                    mist_core::dsa::intent_hash(&env.intent),
                     env.intent.amount,
                 )
             })
@@ -2607,7 +2603,7 @@ mod tests {
                 let r = agg.submit(&env);
                 expected.push((
                     r.accepted,
-                    meridian_core::dsa::intent_hash(&env.intent),
+                    mist_core::dsa::intent_hash(&env.intent),
                     amount,
                 ));
             }
@@ -2690,7 +2686,7 @@ mod tests {
                             nonce_b += 1;
                             expected.push((
                                 r.accepted,
-                                meridian_core::dsa::intent_hash(&env.intent),
+                                mist_core::dsa::intent_hash(&env.intent),
                                 amount,
                             ));
                         }
@@ -2716,7 +2712,7 @@ mod tests {
                             }
                             expected.push((
                                 r.accepted,
-                                meridian_core::dsa::intent_hash(&env.intent),
+                                mist_core::dsa::intent_hash(&env.intent),
                                 amount,
                             ));
                         }
@@ -2755,7 +2751,7 @@ mod tests {
                 );
                 let rb = agg2.submit(&env);
                 nonce_b += 1;
-                expected2.push((rb.accepted, meridian_core::dsa::intent_hash(&env.intent), 1));
+                expected2.push((rb.accepted, mist_core::dsa::intent_hash(&env.intent), 1));
                 let env = make_env(
                     dh_a,
                     [0x01; 20],
@@ -2769,7 +2765,7 @@ mod tests {
                 nonce_a += 1;
                 assert!(!ra.accepted, "恢复后 A 仍 E_REVOKED");
                 assert_eq!(ra.reject_reason, Some(Error::ERevoked));
-                expected2.push((false, meridian_core::dsa::intent_hash(&env.intent), 1));
+                expected2.push((false, mist_core::dsa::intent_hash(&env.intent), 1));
             }
             settle_all_and_check(&agg2, &expected2);
             let _ = std::fs::remove_file(&path);
@@ -2831,7 +2827,7 @@ mod tests {
         let now = clock.load(Ordering::Relaxed);
         let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
         // register_default 内部构造同参委托 → delegation_hash 一致。
-        let dh = meridian_core::dsa::delegation_hash(&delegation([1u8; 20], 1_000, 1_000_000));
+        let dh = mist_core::dsa::delegation_hash(&delegation([1u8; 20], 1_000, 1_000_000));
 
         {
             let agg = test_aggregator(&clock, &path);

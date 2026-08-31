@@ -6,17 +6,17 @@
 //! 真证明接受 / 篡改 proof 拒 / 篡改 pi 拒；「pi 与信封不一致」为纯 Rust 一致性比对
 //! （`check_public_inputs_consistent`，无需 bb）。
 //!
-//! 门控：`MERIDIAN_BB_E2E=1` 才跑（verify.sh 第 9 步 formal_zk 之后挂起；CI noir job
+//! 门控：`MIST_BB_E2E=1` 才跑（verify.sh 第 9 步 formal_zk 之后挂起；CI noir job
 //! formal 之后同款）。工件缺失或 bb 工具链不可得时打印跳过原因并返回（不静默成功：
 //! 每次跳过都显式说明）。
 
 use std::path::PathBuf;
 
-use meridian_aggregator::bb::{BbBackend, BbVerifier};
-use meridian_aggregator::proof::check_public_inputs_consistent;
-use meridian_core::dsa::SpendIntent;
-use meridian_core::error::Error;
-use meridian_core::zk::{SpendProof, SpendPublicInputs, SpendVerifier};
+use mist_aggregator::bb::{BbBackend, BbVerifier};
+use mist_aggregator::proof::check_public_inputs_consistent;
+use mist_core::dsa::SpendIntent;
+use mist_core::error::Error;
+use mist_core::zk::{SpendProof, SpendPublicInputs, SpendVerifier};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -127,8 +127,8 @@ fn intent_for(pi: &SpendPublicInputs) -> SpendIntent {
 
 #[test]
 fn bb_verify_e2e_real_proof_positive_and_negative() {
-    if std::env::var("MERIDIAN_BB_E2E").as_deref() != Ok("1") {
-        println!("SKIP: MERIDIAN_BB_E2E=1 未设（纯 Rust 侧不碰 bb 工具链）");
+    if std::env::var("MIST_BB_E2E").as_deref() != Ok("1") {
+        println!("SKIP: MIST_BB_E2E=1 未设（纯 Rust 侧不碰 bb 工具链）");
         return;
     }
     let root = repo_root();

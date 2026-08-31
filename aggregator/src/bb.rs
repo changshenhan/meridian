@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use meridian_core::error::Error;
-use meridian_core::zk::{SpendProof, SpendPublicInputs, SpendVerifier};
+use mist_core::error::Error;
+use mist_core::zk::{SpendProof, SpendPublicInputs, SpendVerifier};
 
 /// bb verifier target，必须与写 VK 时一致（UltraKeccakFlavor，VK 1888B）。
 pub const VERIFIER_TARGET: &str = "evm-no-zk";
@@ -72,18 +72,18 @@ pub fn serialize_public_inputs(pi: &SpendPublicInputs) -> Vec<u8> {
 /// bb 调用方式（探测逻辑与 verify.sh 第 9 步同款，TECH_SPEC §8.3）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BbBackend {
-    /// 原生 bb（Windows/Linux PATH，或 `MERIDIAN_BB_BIN` 指定路径）。
+    /// 原生 bb（Windows/Linux PATH，或 `MIST_BB_BIN` 指定路径）。
     Native { bin: String },
     /// WSL2 兜底：`wsl.exe -d <distro> -u root`，Windows 路径经 `/mnt/<盘>/` 转换。
     Wsl { distro: String },
 }
 
 impl BbBackend {
-    /// 环境解析：`MERIDIAN_BB_BIN` 有值走原生；否则探 PATH 上的 `bb`；再探 WSL 兜底
-    /// （`MERIDIAN_WSL_DISTRO`，缺省 MeridianUbuntu）。皆不可得返回 None（构造期报错，
+    /// 环境解析：`MIST_BB_BIN` 有值走原生；否则探 PATH 上的 `bb`；再探 WSL 兜底
+    /// （`MIST_WSL_DISTRO`，缺省 MeridianUbuntu）。皆不可得返回 None（构造期报错，
     /// 不落运行时半可用态）。
     pub fn detect() -> Option<BbBackend> {
-        if let Ok(bin) = std::env::var("MERIDIAN_BB_BIN") {
+        if let Ok(bin) = std::env::var("MIST_BB_BIN") {
             if !bin.is_empty() && native_bb_ok(&bin) {
                 return Some(BbBackend::Native { bin });
             }
@@ -91,8 +91,7 @@ impl BbBackend {
         if native_bb_ok("bb") {
             return Some(BbBackend::Native { bin: "bb".into() });
         }
-        let distro =
-            std::env::var("MERIDIAN_WSL_DISTRO").unwrap_or_else(|_| "MeridianUbuntu".into());
+        let distro = std::env::var("MIST_WSL_DISTRO").unwrap_or_else(|_| "MeridianUbuntu".into());
         if wsl_bb_ok(&distro) {
             return Some(BbBackend::Wsl { distro });
         }
@@ -193,14 +192,14 @@ impl BbVerifier {
         }
     }
 
-    /// 环境装配（`meridian-gateway` 用）：`MERIDIAN_BB_VK`（必填）、`MERIDIAN_BB_BIN`
-    /// /`MERIDIAN_WSL_DISTRO`（后端解析）、`MERIDIAN_BB_TMP`（临时目录根，缺省
+    /// 环境装配（`mist-gateway` 用）：`MIST_BB_VK`（必填）、`MIST_BB_BIN`
+    /// /`MIST_WSL_DISTRO`（后端解析）、`MIST_BB_TMP`（临时目录根，缺省
     /// `target/bb-verify`）。任一前置缺失即 `E_VERIFY_BACKEND`——bin 侧启动即退。
     pub fn from_env() -> Result<Self, Error> {
-        let vk_path = std::env::var("MERIDIAN_BB_VK").map_err(|_| Error::EVerifyBackend)?;
+        let vk_path = std::env::var("MIST_BB_VK").map_err(|_| Error::EVerifyBackend)?;
         let vk = std::fs::read(&vk_path).map_err(|_| Error::EVerifyBackend)?;
         let backend = BbBackend::detect().ok_or(Error::EVerifyBackend)?;
-        let tmp_root = std::env::var("MERIDIAN_BB_TMP")
+        let tmp_root = std::env::var("MIST_BB_TMP")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("target/bb-verify"));
         Ok(BbVerifier::from_parts(vk, backend, absolute(&tmp_root)))
@@ -277,7 +276,7 @@ fn absolute(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_core::zk::SpendPublicInputs;
+    use mist_core::zk::SpendPublicInputs;
 
     fn pi() -> SpendPublicInputs {
         SpendPublicInputs {
@@ -375,9 +374,9 @@ mod tests {
             BbBackend::Native {
                 bin: "definitely-not-bb".into(),
             },
-            std::env::temp_dir().join("meridian-bb-test"),
+            std::env::temp_dir().join("mist-bb-test"),
         );
-        let p = meridian_core::zk::SpendProof {
+        let p = mist_core::zk::SpendProof {
             proof: vec![],
             public_inputs: pi(),
         };

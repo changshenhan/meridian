@@ -4,13 +4,13 @@
 //! 独立分片——集群账本指标取 max（最新推进副本），sum 会把备份副本双计。副本间分歧只
 //! 报告（degraded + lag gauge），不裁决真值（裁决 = 接管 WAL 人工核对，ops.md §5）。
 
-use meridian_aggregator::health::HealthSnapshot;
+use mist_aggregator::health::HealthSnapshot;
 
 use crate::health::{evaluate, HealthCheck, HealthReport};
 use crate::metrics::{render_prometheus_labeled, PromSample};
 
 /// 副本收敛口径：`replicas_converged` 要求三元组严格相等（滞后 0），无「可调滞后阈值」
-/// ——异步副本（跨机）部署的滞后告警走 `meridian_cluster_replica_lag` gauge（ops.md §5），
+/// ——异步副本（跨机）部署的滞后告警走 `mist_cluster_replica_lag` gauge（ops.md §5），
 /// 健康检查只认完全一致，避免「允许落后 N 笔」把账本分歧常态化（fail-closed）。
 ///
 /// 一次集群聚合的输入：副本名（WAL 文件名 stem，作 `instance` label）+ 其健康快照。
@@ -39,25 +39,25 @@ pub fn cluster_samples(views: &[ClusterView]) -> Vec<PromSample> {
         .unwrap_or(0);
     vec![
         PromSample {
-            name: "meridian_cluster_instances",
+            name: "mist_cluster_instances",
             help: "被监控副本数（--wal 个数）。",
             labels: vec![],
             value: views.len() as f64,
         },
         PromSample {
-            name: "meridian_cluster_accepted_total",
+            name: "mist_cluster_accepted_total",
             help: "副本间 accepted_count 最大值（热备副本组同一逻辑账本，取最新推进副本；求和会双计备份副本，TECH_SPEC 6.12）。",
             labels: vec![],
             value: max_acc as f64,
         },
         PromSample {
-            name: "meridian_cluster_replica_lag",
+            name: "mist_cluster_replica_lag",
             help: "副本间 accepted_count 最大差（备份滞后笔数，0 = 收敛）。",
             labels: vec![],
             value: (max_acc - min_acc) as f64,
         },
         PromSample {
-            name: "meridian_cluster_pending_sealed",
+            name: "mist_cluster_pending_sealed",
             help: "副本间最差结算滞后（max，取最差副本）。",
             labels: vec![],
             value: max_pending as f64,
@@ -120,7 +120,7 @@ pub fn evaluate_cluster(views: &[ClusterView], wal_intents: &[u64]) -> HealthRep
             .collect();
         report.checks.push(HealthCheck {
             // 严格收敛（三元组相等 ⇔ lag 0）：fail-closed，无「可调滞后阈值」——异步副本
-            // 部署的滞后告警走 `meridian_cluster_replica_lag` gauge（ops.md §5），健康检查
+            // 部署的滞后告警走 `mist_cluster_replica_lag` gauge（ops.md §5），健康检查
             // 只认完全一致，避免「允许落后 N 笔」把账本分歧常态化。
             name: "replicas_converged",
             ok: converged,
@@ -140,7 +140,7 @@ pub fn evaluate_cluster(views: &[ClusterView], wal_intents: &[u64]) -> HealthRep
 mod tests {
     use super::*;
     use crate::metrics::render_prometheus;
-    use meridian_aggregator::hist::LatencySnapshot;
+    use mist_aggregator::hist::LatencySnapshot;
 
     fn snap(instance: &str, accepted: u64) -> HealthSnapshot {
         HealthSnapshot {
@@ -166,7 +166,7 @@ mod tests {
     fn single_replica_matches_standalone() {
         let v = ClusterView {
             name: "primary".into(),
-            snap: snap("meridian-123", 42),
+            snap: snap("mist-123", 42),
         };
         let r = evaluate_cluster(std::slice::from_ref(&v), &[42]);
         let solo = evaluate(&v.snap, 42);
@@ -180,7 +180,7 @@ mod tests {
         // 集群渲染 = 逐副本带标签渲染（label = 副本名）+ 集群 gauge 追加在尾部。
         let m = render_cluster_metrics(std::slice::from_ref(&v), &[0.5]);
         assert!(m.starts_with(&render_prometheus_labeled(&v.snap, 0.5, "primary".into())));
-        assert!(m.contains("meridian_cluster_instances 1"));
+        assert!(m.contains("mist_cluster_instances 1"));
     }
 
     #[test]
@@ -198,14 +198,14 @@ mod tests {
         ];
         let s = cluster_samples(&views);
         let get = |n: &str| s.iter().find(|x| x.name == n).unwrap().value;
-        assert_eq!(get("meridian_cluster_instances"), 2.0);
-        assert_eq!(get("meridian_cluster_accepted_total"), 42.0);
-        assert_eq!(get("meridian_cluster_replica_lag"), 1.0);
-        assert_eq!(get("meridian_cluster_pending_sealed"), 0.0);
+        assert_eq!(get("mist_cluster_instances"), 2.0);
+        assert_eq!(get("mist_cluster_accepted_total"), 42.0);
+        assert_eq!(get("mist_cluster_replica_lag"), 1.0);
+        assert_eq!(get("mist_cluster_pending_sealed"), 0.0);
         // 集群 gauge 不带 instance label。
         let text = render_cluster_metrics(&views, &[1.0, 0.0]);
-        assert!(text.contains("meridian_cluster_instances 2"));
-        assert!(!text.contains("meridian_cluster_instances{"));
+        assert!(text.contains("mist_cluster_instances 2"));
+        assert!(!text.contains("mist_cluster_instances{"));
     }
 
     #[test]

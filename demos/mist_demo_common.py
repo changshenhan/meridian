@@ -162,7 +162,7 @@ class MockVendor:
             "credits_granted": amount * 1000,
             "credits_total": self.credits[did],
             "data": [  # 模拟数据行：agent 用 DSA 买到的"数据/API 额度"
-                {"row": 1, "ticker": "MERIDIAN", "price": amount, "ok": True},
+                {"row": 1, "ticker": "MIST", "price": amount, "ok": True},
                 {"row": 2, "ticker": "DSA", "price": amount * 2, "ok": True},
             ],
         }

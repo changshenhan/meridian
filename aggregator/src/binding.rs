@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use meridian_core::error::Error;
+use mist_core::error::Error;
 
 /// 运营者地址（EVM 20B，与 DSA `operators` 映射同形态）。
 pub type OperatorAddress = [u8; 20];

@@ -27,22 +27,22 @@ jobs:
         run: cargo test --workspace
 
       - name: bench (compile only)
-        run: cargo bench -p meridian-bench --no-run
+        run: cargo bench -p mist-bench --no-run
 
       # 性能门禁（TECH_SPEC §8.3）：同一 runner 上先记录再比对，机器无关。
       # GitHub Actions runner 共享 CPU，实测噪声可到 ±10% 以上（intent_verify_ops
       # 是 ~35µs 的 Ed25519 验签，对 turbo/争用最敏感，曾测出 -10.28% 假阳性）。
       # 阈值必须高于噪声地板：CI 用 15% 抓灾难性回归，1% 精准基线（§6.5）留在
       # 受控参考平台上手动执行：
-      #   cargo run --release -p meridian-bench --bin gate -- --record
-      #   cargo run --release -p meridian-bench --bin gate -- --fail-over 1
+      #   cargo run --release -p mist-bench --bin gate -- --record
+      #   cargo run --release -p mist-bench --bin gate -- --fail-over 1
       # S-35b：--ci 追加共享 runner 噪声地板阈值（agg_kernel_ingest_ops 25%）——
       # 6400 笔 ≈ 0.2s 短突发指标的 record/compare 阶段级漂移实测 -16~20%，15% 低于
       # 噪声地板等于抛硬币（TECH_SPEC §8.3）。本地参考机不传 --ci，精度口径不变。
       - name: perf gate (release)
         run: |
-          cargo run --release -p meridian-bench --bin gate -- --record
-          cargo run --release -p meridian-bench --bin gate -- --ci --fail-over 15
+          cargo run --release -p mist-bench --bin gate -- --record
+          cargo run --release -p mist-bench --bin gate -- --ci --fail-over 15
 
       # S-10 聚合器内核硬断言回归（确定性，机器无关）：B8 热路径零分配 + B11 确定性
       # （同 seed 两跑 lattice 输出哈希一致）。全量 B5/B6/B7/B10 验收在参考机跑
@@ -50,8 +50,8 @@ jobs:
       # 复用上方 gate 的 release 构建，无额外编译开销。
       - name: agg_sim regression (B8 zero-alloc + B11 determinism)
         run: |
-          cargo run --release -p meridian-bench --bin agg_sim -- --check-alloc
-          cargo run --release -p meridian-bench --bin agg_sim -- --check-determinism
+          cargo run --release -p mist-bench --bin agg_sim -- --check-alloc
+          cargo run --release -p mist-bench --bin agg_sim -- --check-determinism
 
   # Noir（S-05）—— Windows 无法构建 nargo_cli v1.0.0-beta.26（termion 仅 unix），
   # 且该版本无 Windows 预编译二进制、无 prove/verify 子命令（proving 已外移到 bb）。
@@ -108,7 +108,7 @@ jobs:
       - name: bb-verify e2e (S-40)
         run: |
           export PATH="$HOME/.bb:$PATH"
-          MERIDIAN_BB_E2E=1 cargo test -p meridian-aggregator --test bb_verify_e2e
+          MIST_BB_E2E=1 cargo test -p mist-aggregator --test bb_verify_e2e
 
       # S-43（TECH_SPEC §6.14）：真 prover e2e——SDK 侧 NoirProver 出真证明（Noir
       # oracle + 电路断言 1-9 自校验 + bb prove）× BbVerifier 密码学验证。与本地
@@ -116,7 +116,7 @@ jobs:
       - name: noir-prover e2e (S-43)
         run: |
           export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"
-          MERIDIAN_ZK_PROVER_E2E=1 cargo test -p meridian-sdk --test noir_prover_e2e
+          MIST_ZK_PROVER_E2E=1 cargo test -p mist-sdk --test noir_prover_e2e
 
       # S-47（TECH_SPEC §6.10/§6.14）：桥接真 prover e2e——facilitator EIP-3009 桥经
       # BridgeConfig.noir（SdkClient::with_noir）在真 BbVerifier 网关上摄取成功；
@@ -125,7 +125,7 @@ jobs:
       - name: bridge noir-prover e2e (S-47)
         run: |
           export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"
-          MERIDIAN_ZK_PROVER_E2E=1 cargo test -p meridian-facilitator --test facilitator e2e_bridge_with_noir_prover
+          MIST_ZK_PROVER_E2E=1 cargo test -p mist-facilitator --test facilitator e2e_bridge_with_noir_prover
 
       # S-52（TECH_SPEC §6.16）：MCP 面真 ZK e2e——客户端侧 NoirProver 真电路证明经
       # MCP pay 工具直通（keyless 保形：服务器只验证），BbVerifier + 撤销根绑定闸聚合器
@@ -133,7 +133,7 @@ jobs:
       - name: mcp noir-prover e2e (S-52)
         run: |
           export PATH="$HOME/.nargo/bin:$HOME/.bb:$PATH"
-          MERIDIAN_MCP_NOIR_E2E=1 cargo test -p meridian-mcp --test mcp_noir_e2e
+          MIST_MCP_NOIR_E2E=1 cargo test -p mist-mcp --test mcp_noir_e2e
 
       - name: upload ZK artifacts (baseline report + EVM verifier)
         uses: actions/upload-artifact@v4
@@ -192,7 +192,7 @@ jobs:
           bash scripts/coverage_gate.sh
 
       # 链上冒烟：spawn anvil → 部署三合约 → register→revoke→commit→settle 全链路。
-      # 交叉实现契约：Solidity sha256(delegationABI) == meridian-core delegation_hash。
+      # 交叉实现契约：Solidity sha256(delegationABI) == mist-core delegation_hash。
       - name: alloy smoke — anvil deploy + full chain
         working-directory: contracts/rust-smoke
         run: |

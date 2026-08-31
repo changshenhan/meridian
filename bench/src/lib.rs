@@ -113,8 +113,8 @@ impl Xs {
 /// （§6.3 步骤 A-E 纯计算侧）。5 轮取最短墙钟；每轮累计分配字节（≥ 峰值，作 <1GiB
 /// 保守上界断言）。确定性夹具，零随机。返回 (best_wall_secs, max_cum_alloc_bytes)。
 pub fn b7_measure() -> (f64, usize) {
-    use meridian_aggregator::lattice;
-    use meridian_aggregator::window::WindowEntry;
+    use mist_aggregator::lattice;
+    use mist_aggregator::window::WindowEntry;
     use std::hint::black_box;
     use std::time::Instant;
 
@@ -144,7 +144,7 @@ pub fn b7_measure() -> (f64, usize) {
             Some((r, amount))
         };
         // 撤销根参数（S-11）：空撤销集根（bench 不测撤销稀疏根，取空集常量即可）。
-        let empty_rev_root = meridian_aggregator::revocation::RevocationSet::new().sparse_root();
+        let empty_rev_root = mist_aggregator::revocation::RevocationSet::new().sparse_root();
         lattice::build_epoch(0, 1_700_000_000, entries, &mut resolve, empty_rev_root)
             .expect("resolver total")
     };

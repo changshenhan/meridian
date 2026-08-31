@@ -1,7 +1,7 @@
 //! S-30b x402 客户端集成验收（TECH_SPEC §6.8）：scripted Fetch mock 走线格式全链路，
 //! 支付路径用真实聚合器（进程内 + 真实密码学，与 e2e.rs 同口径）。
 //!
-//! 覆盖：free 透传 / 402→pay→X-PAYMENT 重放（真实记账 + 网关回执可查）/ 无 meridian-v1
+//! 覆盖：free 透传 / 402→pay→X-PAYMENT 重放（真实记账 + 网关回执可查）/ 无 mist-v1
 //! 条目拒 / 二次 402 拒 / category 绑定 owner 白名单 / HttpFetch 真 socket。
 
 use std::io::{Read, Write};
@@ -10,16 +10,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::dsa::owner_signing_key_from_bytes;
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::dsa::owner_signing_key_from_bytes;
 
-use meridian_sdk::x402::{
+use mist_sdk::x402::{
     base64url_encode, category_from_resource, Fetch, HttpFetch, ResourceRequest, X402Client,
     X402Outcome,
 };
-use meridian_sdk::{AgentWallet, DelegationLimits, InProcessAggregator, SdkClient, SdkError};
+use mist_sdk::{AgentWallet, DelegationLimits, InProcessAggregator, SdkClient, SdkError};
 
 // ---------------------------------------------------------------------------
 // 脚手架（与 e2e.rs 同款）
@@ -29,7 +29,7 @@ static WAL_SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn aggregator(tag: &str) -> (PathBuf, Arc<Aggregator>) {
     let path = std::env::temp_dir().join(format!(
-        "meridian-sdk-x402-{}-{tag}-{seq}.wal",
+        "mist-sdk-x402-{}-{tag}-{seq}.wal",
         std::process::id(),
         seq = WAL_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
@@ -99,19 +99,19 @@ fn base64url_decode(s: &str) -> Option<Vec<u8>> {
 
 struct ScriptedFetch {
     /// 每次 fetch 依序取一个响应。
-    script: Mutex<Vec<meridian_sdk::x402::ResourceResponse>>,
-    seen: Mutex<Vec<meridian_sdk::x402::ResourceRequest>>,
+    script: Mutex<Vec<mist_sdk::x402::ResourceResponse>>,
+    seen: Mutex<Vec<mist_sdk::x402::ResourceRequest>>,
 }
 
 impl ScriptedFetch {
-    fn new(responses: Vec<meridian_sdk::x402::ResourceResponse>) -> Self {
+    fn new(responses: Vec<mist_sdk::x402::ResourceResponse>) -> Self {
         ScriptedFetch {
             script: Mutex::new(responses),
             seen: Mutex::new(Vec::new()),
         }
     }
 
-    fn requests(&self) -> Vec<meridian_sdk::x402::ResourceRequest> {
+    fn requests(&self) -> Vec<mist_sdk::x402::ResourceRequest> {
         self.seen.lock().expect("seen").clone()
     }
 }
@@ -119,8 +119,8 @@ impl ScriptedFetch {
 impl Fetch for ScriptedFetch {
     fn fetch(
         &self,
-        req: &meridian_sdk::x402::ResourceRequest,
-    ) -> Result<meridian_sdk::x402::ResourceResponse, SdkError> {
+        req: &mist_sdk::x402::ResourceRequest,
+    ) -> Result<mist_sdk::x402::ResourceResponse, SdkError> {
         self.seen.lock().expect("seen").push(req.clone());
         self.script
             .lock()
@@ -130,8 +130,8 @@ impl Fetch for ScriptedFetch {
     }
 }
 
-fn response(status: u16, body: String) -> meridian_sdk::x402::ResourceResponse {
-    meridian_sdk::x402::ResourceResponse {
+fn response(status: u16, body: String) -> mist_sdk::x402::ResourceResponse {
+    mist_sdk::x402::ResourceResponse {
         status,
         headers: vec![("content-type".into(), "application/json".into())],
         body: body.into_bytes(),
@@ -184,7 +184,7 @@ fn e2e_402_pay_replay_x402_wire() {
         // 第二次（重放）：资源服务器放行。
         response(200, "{\"weather\":\"clear+28C\"}".into()),
         // 第一次：402 + paymentRequirements。
-        response(402, payment_required_body("meridian-v1", "10000")),
+        response(402, payment_required_body("mist-v1", "10000")),
     ]);
     let x = X402Client::new(&client, &fetch, dh);
 
@@ -213,7 +213,7 @@ fn e2e_402_pay_replay_x402_wire() {
     );
     let json = String::from_utf8(base64url_decode(header).expect("decode")).expect("utf8");
     assert!(json.contains("\"x402Version\":1"));
-    assert!(json.contains("\"scheme\":\"meridian-v1\""));
+    assert!(json.contains("\"scheme\":\"mist-v1\""));
     assert!(json.contains("\"network\":\"base\""));
     assert!(json.contains(&format!("\"resource\":\"{RESOURCE}\"")));
     assert!(json.contains("\"intentHash\":\"0x"));
@@ -237,11 +237,11 @@ fn e2e_402_pay_replay_x402_wire() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. 402 无 meridian-v1 条目 → Local（不伪装成其它 scheme 的 client）
+// 3. 402 无 mist-v1 条目 → Local（不伪装成其它 scheme 的 client）
 // ---------------------------------------------------------------------------
 
 #[test]
-fn no_meridian_scheme_entry_is_local_error() {
+fn no_mist_scheme_entry_is_local_error() {
     let (path, agg, client, dh) = setup("no-scheme", limits());
     let fetch = ScriptedFetch::new(vec![response(402, payment_required_body("exact", "10000"))]);
     let x = X402Client::new(&client, &fetch, dh);
@@ -262,8 +262,8 @@ fn no_meridian_scheme_entry_is_local_error() {
 fn second_402_is_local_error() {
     let (path, agg, client, dh) = setup("second-402", limits());
     let fetch = ScriptedFetch::new(vec![
-        response(402, payment_required_body("meridian-v1", "10000")),
-        response(402, payment_required_body("meridian-v1", "10000")),
+        response(402, payment_required_body("mist-v1", "10000")),
+        response(402, payment_required_body("mist-v1", "10000")),
     ]);
     let x = X402Client::new(&client, &fetch, dh);
 
@@ -298,7 +298,7 @@ fn category_maps_to_delegation_whitelist() {
     let (path, agg, client, dh) = setup("cat-ok", allow);
     let fetch = ScriptedFetch::new(vec![
         response(200, "ok".into()),
-        response(402, payment_required_body("meridian-v1", "100")),
+        response(402, payment_required_body("mist-v1", "100")),
     ]);
     let x = X402Client::new(&client, &fetch, dh);
     assert!(matches!(

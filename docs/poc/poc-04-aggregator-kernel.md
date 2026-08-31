@@ -8,7 +8,7 @@
 ## 结论
 
 PoC ② 原型（488,738 笔/s，无 WAL / 无 lattice / 无 ZK 接口）升级为**生产内核**
-（`meridian-aggregator`）：验签快路径 → `SpendVerifier` → 预算 → 入窗 → WAL 追加 →
+（`mist-aggregator`）：验签快路径 → `SpendVerifier` → 预算 → 入窗 → WAL 追加 →
 commitment lattice → 净额，全管线在参考机上**大幅越过 10 万笔/秒**，且热路径零分配、
 输出确定性、崩溃可恢复。
 
@@ -49,7 +49,7 @@ torn-write 检测，replay 重建 registry+nonce+ledger+seq。FaultInjection 测
   + `public_inputs` 与 intent 逐字段一致）。与 PoC ② 同口径，诚实边界见下。
 - **无跨次污染**：每次 run 全新 `Aggregator`（容量预置：nonce 集 / 意图索引 / 窗口槽位）。
 - **复现**：
-  - `cargo run --release -p meridian-bench --bin agg_sim`（全量报告）
+  - `cargo run --release -p mist-bench --bin agg_sim`（全量报告）
   - `agg_sim --check 100000`（B5）、`--check-alloc`（B8）、`--check-determinism`（B11）
   - `agg_sim --gen-fixture`（生成器改动后重新快照）
   - **门禁**：`scripts/verify.sh`（主门禁，跑在参考机，替代被计费卡死的 GitHub CI；

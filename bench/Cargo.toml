@@ -1,13 +1,13 @@
 [package]
-name = "meridian-bench"
+name = "mist-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-meridian-core.workspace = true
+mist-core.workspace = true
 # S-10 生产内核（B7 承诺 lattice、B8 零分配钩子、B5/B6/B10/B11 全管线）。
-meridian-aggregator.workspace = true
+mist-aggregator.workspace = true
 # PoC ② ingest 夹具要用 agent 签名原语现场造意图（与 core 同版本）。
 ed25519-dalek.workspace = true
 # agg_sim 生产内核 B5：有界 rayon 线程池（submit_batch，MASTER_PLAN 技术源）。

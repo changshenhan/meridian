@@ -1,19 +1,19 @@
 //! x402 merchant 参考实现（S-30c，TECH_SPEC §6.9，docs/x402-adapter.md §2.1 server 侧）。
 //!
-//! 受保护资源服务器怎么接 `meridian-v1` 支付：验证逻辑**全部**落在"对 Meridian 网关
+//! 受保护资源服务器怎么接 `mist-v1` 支付：验证逻辑**全部**落在"对 Mist 网关
 //! 查回执"（S-30a 的 [`HttpTransport::receipt`] 即验证接口），零密码学依赖。
 //! （S-32 起另含可选的 EIP-3009 兼容桥 [`eip3009`]——那条路径带 ecrecover。）
 //!
 //! # 分发逻辑（[`Facilitator::handle`] 纯分发，单测不经 socket）
 //!
 //! - `GET /healthz` → 200；其它路径 = 单一受保护资源（v1）。
-//! - 无 `X-PAYMENT` → 402 + paymentRequirements（`meridian-v1`；配置了桥时附
+//! - 无 `X-PAYMENT` → 402 + paymentRequirements（`mist-v1`；配置了桥时附
 //!   `exact` 条目——S-32 EIP-3009 兼容桥，[`eip3009`]）。
 //! - 带 `X-PAYMENT` → base64url 解码 → 按 `scheme` 分发：
-//!   - `meridian-v1`：校验 scheme/network/resource → 查网关：`Some` → 200 放行；
+//!   - `mist-v1`：校验 scheme/network/resource → 查网关：`Some` → 200 放行；
 //!     `None` → 402（**404 ≠ 未支付**语义下"不可验证即不放行"）；`Err` → 503
 //!     fail-closed（验证面不可用绝不放行）。
-//!   - `exact`（S-32）：EIP-712 验签 → 桥转投 Meridian 摄取（垫付模型）→ 查网关
+//!   - `exact`（S-32）：EIP-712 验签 → 桥转投 Mist 摄取（垫付模型）→ 查网关
 //!     回执放行（TECH_SPEC §6.10）；重放闸 S-33 起可持久化（[`replay`]），日志落盘
 //!     失败 → 503 `E_REPLAY_JOURNAL` fail-closed。
 //!
@@ -26,10 +26,10 @@
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use meridian_sdk::x402::{
+use mist_sdk::x402::{
     base64url_decode, PaymentPayload, PaymentRequired, PaymentRequirements, X402_VERSION,
 };
-use meridian_sdk::{HttpTransport, Receipt, SdkError};
+use mist_sdk::{HttpTransport, Receipt, SdkError};
 
 pub mod eip3009;
 pub mod replay;
@@ -46,7 +46,7 @@ pub const E_REPLAY_JOURNAL: &str = "E_REPLAY_JOURNAL";
 /// facilitator 配置（单一受保护资源）。
 #[derive(Debug, Clone)]
 pub struct FacilitatorConfig {
-    /// Meridian 网关地址，如 `"127.0.0.1:9400"`。
+    /// Mist 网关地址，如 `"127.0.0.1:9400"`。
     pub gateway_addr: String,
     /// 网关租户表里的 bearer key。
     pub gateway_bearer: String,
@@ -84,7 +84,7 @@ impl Facilitator {
         Facilitator::with_bridge(cfg, None)
     }
 
-    /// 带桥构造（S-32：接受标准 `exact` scheme，验签后转投 Meridian 摄取）。
+    /// 带桥构造（S-32：接受标准 `exact` scheme，验签后转投 Mist 摄取）。
     pub fn with_bridge(cfg: FacilitatorConfig, bridge: Option<Eip3009Bridge>) -> Self {
         let transport = HttpTransport::new(cfg.gateway_addr.clone(), cfg.gateway_bearer.clone());
         Facilitator {
@@ -100,12 +100,12 @@ impl Facilitator {
         &self.cfg
     }
 
-    /// 402 体（`meridian-v1` 条目 + 配置了桥时的 `exact` 条目；构造失败是配置错误，
+    /// 402 体（`mist-v1` 条目 + 配置了桥时的 `exact` 条目；构造失败是配置错误，
     /// panic 合理——启动即暴露）。
     fn payment_required_json(&self) -> &str {
         self.payment_required.get_or_init(|| {
             let mut accepts = vec![PaymentRequirements {
-                scheme: meridian_sdk::x402::SCHEME.to_string(),
+                scheme: mist_sdk::x402::SCHEME.to_string(),
                 network: self.cfg.network.clone(),
                 max_amount_required: self.cfg.amount.clone(),
                 resource: self.cfg.resource.clone(),
@@ -126,7 +126,7 @@ impl Facilitator {
                     pay_to: self.cfg.pay_to.clone(),
                     max_timeout_seconds: Some(self.cfg.max_timeout_seconds),
                     asset: self.cfg.asset.clone(),
-                    extra: Some(meridian_sdk::x402::Eip3009Extra {
+                    extra: Some(mist_sdk::x402::Eip3009Extra {
                         name: d.name.clone(),
                         version: d.version.clone(),
                     }),
@@ -177,7 +177,7 @@ impl Facilitator {
             Ok(d) => d,
             Err(e) => return self.unauthorized(&format!("bad X-PAYMENT encoding: {e}")),
         };
-        // 2. 先取 `scheme` 分发（S-32：meridian-v1 / exact 双 scheme）。
+        // 2. 先取 `scheme` 分发（S-32：mist-v1 / exact 双 scheme）。
         let value: serde_json::Value = match serde_json::from_slice(&decoded) {
             Ok(v) => v,
             Err(e) => return self.unauthorized(&format!("bad X-PAYMENT payload: {e}")),
@@ -187,18 +187,18 @@ impl Facilitator {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         match scheme {
-            meridian_sdk::x402::SCHEME => self.verify_meridian_v1(&value),
+            mist_sdk::x402::SCHEME => self.verify_mist_v1(&value),
             eip3009::EXACT_SCHEME => self.ingest_exact(&value),
             other => self.unauthorized(&format!(
                 "unsupported scheme {other:?} (only {:?} / {})",
-                meridian_sdk::x402::SCHEME,
+                mist_sdk::x402::SCHEME,
                 eip3009::EXACT_SCHEME
             )),
         }
     }
 
-    /// `meridian-v1` 路径（S-30c 原样）：校验绑定 → 网关查回执。
-    fn verify_meridian_v1(&self, value: &serde_json::Value) -> FacilitatorResponse {
+    /// `mist-v1` 路径（S-30c 原样）：校验绑定 → 网关查回执。
+    fn verify_mist_v1(&self, value: &serde_json::Value) -> FacilitatorResponse {
         let payload: PaymentPayload = match serde_json::from_value(value.clone()) {
             Ok(p) => p,
             Err(e) => return self.unauthorized(&format!("bad X-PAYMENT payload: {e}")),
@@ -230,7 +230,7 @@ impl Facilitator {
         self.receipt_gate(intent_hash)
     }
 
-    /// `exact` 路径（S-32，TECH_SPEC §6.10）：桥验签 + 转投 Meridian 摄取 → 回执闸。
+    /// `exact` 路径（S-32，TECH_SPEC §6.10）：桥验签 + 转投 Mist 摄取 → 回执闸。
     fn ingest_exact(&self, value: &serde_json::Value) -> FacilitatorResponse {
         let Some(bridge) = &self.bridge else {
             return self.unauthorized("exact scheme not enabled (no bridge configured)");
@@ -240,10 +240,10 @@ impl Facilitator {
             Err(e) => return self.unauthorized(&format!("bad exact payload: {e}")),
         };
         match bridge.ingest(&payment, self.binding(), unix_now()) {
-            // 摄取成功 → 走同一回执闸（merchant 验证面与 meridian-v1 完全一致）。
+            // 摄取成功 → 走同一回执闸（merchant 验证面与 mist-v1 完全一致）。
             Ok(intent_hash) => self.receipt_gate(intent_hash),
             Err(e) => match e.gateway_unavailable_sdk() {
-                // 网关不可达 → 503 fail-closed（与 meridian-v1 同口径）。
+                // 网关不可达 → 503 fail-closed（与 mist-v1 同口径）。
                 Some(sdk) => FacilitatorResponse {
                     status: 503,
                     body: gateway_error_body(sdk),

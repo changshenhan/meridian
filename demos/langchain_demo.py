@@ -1,10 +1,10 @@
-"""S-13b 演示①：LangChain 经 MCP 接入 Meridian DSA（闭环：authorize→revocation_witness→pay→balance→verify_receipt→vendor）。
+"""S-13b 演示①：LangChain 经 MCP 接入 Mist DSA（闭环：authorize→revocation_witness→pay→balance→verify_receipt→vendor）。
 
 用法（在仓库根）：
-    cargo build -p meridian-mcp --release
+    cargo build -p mist-mcp --release
     demos/.venv/Scripts/python.exe demos/langchain_demo.py
 
-`MultiServerMCPClient` 以 stdio 拉起 `target/release/meridian-mcp`（内嵌真实聚合器 +
+`MultiServerMCPClient` 以 stdio 拉起 `target/release/mist-mcp`（内嵌真实聚合器 +
 WAL），把 6 个工具暴露给 LangChain。本脚本用 LangChain 的 `get_tools()` 拿工具、
 `ainvoke` 依次调用，闭环序列与 common 里完全一致（含逐字节自检）。
 """
@@ -16,19 +16,19 @@ from pathlib import Path
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 
-from meridian_demo_common import run_closed_loop
+from mist_demo_common import run_closed_loop
 
 REPO = Path(__file__).resolve().parent.parent
-BIN = REPO / "target" / "release" / "meridian-mcp.exe"
+BIN = REPO / "target" / "release" / "mist-mcp.exe"
 WAL_DIR = str(Path(__file__).resolve().parent / ".wal")
 
 
 async def main() -> None:
     config = {
-        "meridian": {
+        "mist": {
             "command": str(BIN),
             "args": [],
-            "env": {"MERIDIAN_WAL_DIR": WAL_DIR},
+            "env": {"MIST_WAL_DIR": WAL_DIR},
             "transport": "stdio",
         }
     }
@@ -36,7 +36,7 @@ async def main() -> None:
     # 新聚合器，authorize 与 pay 就落到不同内核了）。必须用 `session()` 绑定**单一**会话，
     # 工具共享同一 server 进程，DSA 委托状态才连续。
     client = MultiServerMCPClient(config)
-    async with client.session("meridian") as session:
+    async with client.session("mist") as session:
         tools = {t.name: t for t in await load_mcp_tools(session)}
         expected = {
             "authorize",

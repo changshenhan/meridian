@@ -8,19 +8,19 @@ default-run = "contract-smoke"
 
 # S-11d：Anvil 端到端（聚合器 + BatchSettler v2 全链路）。
 # 独立 workspace：不污染主仓 fmt/clippy/test 门禁（同 circuits/smoke-gen 惯例）。
-# 依赖 meridian-core（授权原语）+ meridian-aggregator（L3 结算内核）走 path；
+# 依赖 mist-core（授权原语）+ mist-aggregator（L3 结算内核）走 path；
 # alloy 做链上交互（版本锁定见 contracts/README.md）。
 [workspace]
 
 [dependencies]
-meridian-core = { path = "../../core" }
-meridian-aggregator = { path = "../../aggregator" }
+mist-core = { path = "../../core" }
+mist-aggregator = { path = "../../aggregator" }
 # S-51（TECH_SPEC §6.15）：demo 层真 ZK 装配示例——SdkClient::with_noir + NoirProver
 # 经 path 依赖进独立 workspace（同 core/aggregator 惯例）。
-meridian-sdk = { path = "../../sdk" }
+mist-sdk = { path = "../../sdk" }
 # S-65（TECH_SPEC §6.22.4）：verifier_drill 幕 4 = P2-5 声誉面核对——monitor 的
 # fetch_reputation 对同一 settler 抓取，锚定事件解码路径的链上真实性。
-meridian-monitor = { path = "../../monitor" }
+mist-monitor = { path = "../../monitor" }
 alloy = { version = "2.4", features = ["sol-types", "signer-local", "provider-anvil-api"] }
 url = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }

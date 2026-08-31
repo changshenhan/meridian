@@ -1,7 +1,7 @@
-"""S-13b 演示②：AutoGen 经 MCP 接入 Meridian DSA（闭环：authorize→revocation_witness→pay→balance→verify_receipt→vendor）。
+"""S-13b 演示②：AutoGen 经 MCP 接入 Mist DSA（闭环：authorize→revocation_witness→pay→balance→verify_receipt→vendor）。
 
 用法（在仓库根）：
-    cargo build -p meridian-mcp --release
+    cargo build -p mist-mcp --release
     demos/.venv/Scripts/python.exe demos/autogen_demo.py
 
 `autogen_ext.tools.mcp.mcp_server_tools` 把 MCP 工具注册为 AutoGen `Tool`（run_json 驱动，
@@ -19,7 +19,7 @@ from autogen_ext.tools.mcp import StdioServerParams, mcp_server_tools
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from meridian_demo_common import run_closed_loop
+from mist_demo_common import run_closed_loop
 
 # autogen 的 schema→pydantic 转换只认它自己的 FORMAT_MAPPING；rmcp/schemars 对
 # u64/u32/u8 字段标 `format: "uint64"` 等，autogen 不认识就抛
@@ -48,15 +48,15 @@ def _fold_null_union(self, key, value, model_name, root_schema):
 _json_to_pydantic._JSONSchemaToPydantic._extract_field_type = _fold_null_union
 
 REPO = Path(__file__).resolve().parent.parent
-BIN = REPO / "target" / "release" / "meridian-mcp.exe"
+BIN = REPO / "target" / "release" / "mist-mcp.exe"
 WAL_DIR = str(Path(__file__).resolve().parent / ".wal")
 
 
 async def main() -> None:
-    env = {"MERIDIAN_WAL_DIR": WAL_DIR}
+    env = {"MIST_WAL_DIR": WAL_DIR}
     params = StdioServerParams(command=str(BIN), args=[], env=env)
 
-    # 共享会话：stdio_client 拉起**一个** meridian-mcp 子进程；factory 复用该会话。
+    # 共享会话：stdio_client 拉起**一个** mist-mcp 子进程；factory 复用该会话。
     async with stdio_client(
         StdioServerParameters(command=str(BIN), args=[], env=env)
     ) as (read, write):

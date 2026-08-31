@@ -160,9 +160,9 @@ pub struct NonMembershipWitness {
 
 /// S-43：聚合器产出 → prover 请求消费的契约类型转换（TECH_SPEC §6.14）。
 /// 字段同构（root + BE Field 32B 路径），单一转换点防两处口径漂移。
-impl From<NonMembershipWitness> for meridian_core::zk::RevocationWitness {
+impl From<NonMembershipWitness> for mist_core::zk::RevocationWitness {
     fn from(w: NonMembershipWitness) -> Self {
-        meridian_core::zk::RevocationWitness {
+        mist_core::zk::RevocationWitness {
             root: w.root,
             path: w.path,
         }

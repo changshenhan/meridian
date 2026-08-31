@@ -1,17 +1,17 @@
 # S-30c facilitator —— x402 merchant 参考实现（TECH_SPEC §6.9）。
 #
-# 受保护资源服务器参考：验证逻辑 = 对 Meridian 网关查回执（S-30a），零密码学依赖。
+# 受保护资源服务器参考：验证逻辑 = 对 Mist 网关查回执（S-30a），零密码学依赖。
 # std-only 手写 HTTP/1.1（§6.7 同先例）；axum/tokio 允许但不必要。
 [package]
-name = "meridian-facilitator"
+name = "mist-facilitator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Meridian x402 merchant reference implementation (S-30c)"
+description = "Mist x402 merchant reference implementation (S-30c)"
 
 [dependencies]
-meridian-sdk = { workspace = true }
+mist-sdk = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 hex = { workspace = true }
@@ -22,6 +22,6 @@ sha3 = { workspace = true }
 
 # e2e：真聚合器 + 真网关（三角色验收）。
 [dev-dependencies]
-meridian-aggregator = { workspace = true }
-meridian-core = { workspace = true }
-meridian-gateway = { workspace = true }
+mist-aggregator = { workspace = true }
+mist-core = { workspace = true }
+mist-gateway = { workspace = true }

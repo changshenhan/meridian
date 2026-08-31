@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 /// @title DSA —— Delegated Spend Authority 注册（Contract 模式，TECH_SPEC §7）
 /// @notice 链上与链下**同一 delegation_hash**：`registerDelegation` 用
-///         `sha256(delegationABI)` 复算哈希，而 `delegationABI` 就是 meridian-core
+///         `sha256(delegationABI)` 复算哈希，而 `delegationABI` 就是 mist-core
 ///         `delegation_abi()` 产出的规范字节原样上链（core/src/dsa.rs）。这样聚合器
 ///         （S-10）在 Contract 模式只依赖链上锚点，不重算哈希——两侧任何一侧改规范，
 ///         另一侧的 `sha256` 校验就会立即失配（§11 E-03 无反序列化歧义）。
@@ -51,7 +51,7 @@ contract DSA {
     error AlreadyBound(bytes32 delegationHash);
     error ZeroOperator();
 
-    /// @param delegationABI meridian-core `canonical_delegation` 的原样字节
+    /// @param delegationABI mist-core `canonical_delegation` 的原样字节
     ///        （前缀 "DSAv1\0" 6 + agent 20 + owner 20 + 其余字段，owner 定位于 [26:46]）
     /// @param ownerSig      owner 对 `sha256(delegationABI)` 的 secp256k1 紧凑签名 r||s（64 字节）
     function registerDelegation(bytes calldata delegationABI, bytes calldata ownerSig) external {

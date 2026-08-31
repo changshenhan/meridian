@@ -8,7 +8,7 @@ edition = "2021"
 # 配合 nargo compile/execute → bb prove/verify → 公共输入回读。
 # 验证完成后删除；不进 SPEC / 文档（仅 circuits/README.md 一行 TEMPORARY 备注）。
 #
-# 独立工作区：不进 meridian 主 workspace，避免污染主仓 fmt/clippy/test 门禁。
+# 独立工作区：不进 mist 主 workspace，避免污染主仓 fmt/clippy/test 门禁。
 [workspace]
 
 [dependencies]

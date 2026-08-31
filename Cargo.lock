@@ -795,126 +795,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "meridian-aggregator"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "hex",
- "meridian-core",
- "proptest",
- "rand 0.8.7",
- "rayon",
- "serde",
- "serde_json",
- "sha2",
- "sha3",
-]
-
-[[package]]
-name = "meridian-bench"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "ed25519-dalek",
- "meridian-aggregator",
- "meridian-core",
- "rayon",
- "serde",
- "serde_json",
- "sha2",
- "windows-sys",
-]
-
-[[package]]
-name = "meridian-core"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "hex",
- "k256",
- "proptest",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "meridian-facilitator"
-version = "0.1.0"
-dependencies = [
- "hex",
- "k256",
- "meridian-aggregator",
- "meridian-core",
- "meridian-gateway",
- "meridian-sdk",
- "serde",
- "serde_json",
- "sha3",
-]
-
-[[package]]
-name = "meridian-gateway"
-version = "0.1.0"
-dependencies = [
- "hex",
- "k256",
- "meridian-aggregator",
- "meridian-core",
- "meridian-sdk",
- "serde",
- "serde_json",
- "sha3",
-]
-
-[[package]]
-name = "meridian-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ed25519-dalek",
- "hex",
- "k256",
- "meridian-aggregator",
- "meridian-core",
- "meridian-sdk",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "meridian-monitor"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "hex",
- "meridian-aggregator",
- "meridian-core",
- "serde",
- "serde_json",
- "sha3",
-]
-
-[[package]]
-name = "meridian-sdk"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "hex",
- "k256",
- "meridian-aggregator",
- "meridian-core",
- "serde",
- "serde_json",
- "sha2",
- "sha3",
-]
-
-[[package]]
 name = "mio"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -923,6 +803,126 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "mist-aggregator"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "hex",
+ "mist-core",
+ "proptest",
+ "rand 0.8.7",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3",
+]
+
+[[package]]
+name = "mist-bench"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "ed25519-dalek",
+ "mist-aggregator",
+ "mist-core",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "windows-sys",
+]
+
+[[package]]
+name = "mist-core"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "k256",
+ "proptest",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "mist-facilitator"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "k256",
+ "mist-aggregator",
+ "mist-core",
+ "mist-gateway",
+ "mist-sdk",
+ "serde",
+ "serde_json",
+ "sha3",
+]
+
+[[package]]
+name = "mist-gateway"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "k256",
+ "mist-aggregator",
+ "mist-core",
+ "mist-sdk",
+ "serde",
+ "serde_json",
+ "sha3",
+]
+
+[[package]]
+name = "mist-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "hex",
+ "k256",
+ "mist-aggregator",
+ "mist-core",
+ "mist-sdk",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mist-monitor"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "mist-aggregator",
+ "mist-core",
+ "serde",
+ "serde_json",
+ "sha3",
+]
+
+[[package]]
+name = "mist-sdk"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "k256",
+ "mist-aggregator",
+ "mist-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3",
 ]
 
 [[package]]

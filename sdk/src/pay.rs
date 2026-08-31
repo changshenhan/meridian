@@ -8,7 +8,7 @@
 //!    拒绝 → 原原因（不透传成成功）。
 //!
 //! 证明 = [`PlaceholderProver`]（与聚合器 `FormatVerifier` 配套的 TEMPORARY 口径）；
-//! 真实 S-09 电路 prover 实现 `meridian_core::zk::SpendProver`，经 `SdkClient::with_prover`
+//! 真实 S-09 电路 prover 实现 `mist_core::zk::SpendProver`，经 `SdkClient::with_prover`
 //! 接入，本函数不变。
 //!
 //! S-45 撤销 witness 自动新鲜度（§6.14 诚实边界 3 SDK 半边）：缓存（per-dh）未命中
@@ -20,10 +20,10 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use meridian_aggregator::receipt::IntentEnvelope;
-use meridian_core::dsa::{Amount, Category, Did};
-use meridian_core::error::Error;
-use meridian_core::zk::{
+use mist_aggregator::receipt::IntentEnvelope;
+use mist_core::dsa::{Amount, Category, Did};
+use mist_core::error::Error;
+use mist_core::zk::{
     RevocationWitness, SpendProof, SpendProofRequest, SpendProver, SpendPublicInputs,
 };
 
@@ -198,7 +198,7 @@ pub(crate) fn pay(client: &SdkClient, params: &PayParams) -> Result<PayReceipt, 
                 revocation: w,
                 now,
             })
-            .map_err(SdkError::Meridian)
+            .map_err(SdkError::Mist)
     };
     let mut env = IntentEnvelope {
         intent: intent.clone(),
@@ -234,13 +234,13 @@ pub(crate) fn pay(client: &SdkClient, params: &PayParams) -> Result<PayReceipt, 
                     let fresh = client
                         .transport()
                         .revocation_witness(&dh)?
-                        .ok_or(SdkError::Meridian(reason))?; // 已撤销 → 原拒绝定局
+                        .ok_or(SdkError::Mist(reason))?; // 已撤销 → 原拒绝定局
                     client.store_revocation_witness(&dh, fresh.clone());
                     env.proof = prove(fresh)?;
                     continue;
                 }
                 // 永久拒绝：错误码透传，不重试。nonce 已被聚合器消耗，本笔到此为止。
-                return Err(SdkError::Meridian(reason));
+                return Err(SdkError::Mist(reason));
             }
             Err(e) => {
                 // 仅传输错误重试；nonce/信封固定 → 聚合器幂等 re-ack → 不双花。
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn placeholder_prover_is_format_verifier_compatible() {
         // 构造最小 req（真实信封），验证产出的公共输入与 intent 一致（check_* 可过）。
-        let owner_key = meridian_core::dsa::owner_signing_key_from_bytes([7u8; 32]);
+        let owner_key = mist_core::dsa::owner_signing_key_from_bytes([7u8; 32]);
         let wallet = crate::identity::AgentWallet::from_seed([9u8; 32]);
         let limits = crate::identity::DelegationLimits {
             max_per_spend: 1_000,
@@ -304,7 +304,7 @@ mod tests {
         let sd = crate::identity::create_delegation(&owner_key, [1u8; 20], 1, &limits).unwrap();
         let (intent, _sig) = wallet.create_intent(
             [1u8; 20],
-            meridian_core::dsa::delegation_hash(&sd.delegation),
+            mist_core::dsa::delegation_hash(&sd.delegation),
             [3u8; 20],
             42,
             [0xCD; 32],
@@ -317,7 +317,7 @@ mod tests {
             intent: &intent,
             agent_key: &wallet.agent_key,
             attestation_secret: [0u8; 32],
-            revocation: meridian_core::zk::RevocationWitness {
+            revocation: mist_core::zk::RevocationWitness {
                 root: [0u8; 32],
                 path: Vec::new(),
             },
@@ -397,8 +397,8 @@ mod tests {
     impl crate::transport::Transport for MockTransport {
         fn authorize(
             &self,
-            _: meridian_core::dsa::SignedDelegation,
-            _: meridian_core::dsa::AgentPubKey,
+            _: mist_core::dsa::SignedDelegation,
+            _: mist_core::dsa::AgentPubKey,
         ) -> Result<(), SdkError> {
             Ok(())
         }
@@ -406,7 +406,7 @@ mod tests {
         fn submit(
             &self,
             env: &IntentEnvelope,
-        ) -> Result<meridian_aggregator::receipt::Receipt, SdkError> {
+        ) -> Result<mist_aggregator::receipt::Receipt, SdkError> {
             self.0.submissions.fetch_add(1, Ordering::SeqCst);
             // 模拟「提交瞬间聚合器换代」：首提交后当刻 witness 变化（只触发一次）。
             if let Some(w) = self
@@ -428,7 +428,7 @@ mod tests {
                 .reject_before
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
-            Ok(meridian_aggregator::receipt::Receipt {
+            Ok(mist_aggregator::receipt::Receipt {
                 intent_hash: [0xAB; 32],
                 accepted: !spent,
                 reject_reason: spent.then_some(Error::ERevRoot),
@@ -469,7 +469,7 @@ mod tests {
 
     fn refreshed_client(mock: MockTransport) -> (SdkClient, k256::ecdsa::SigningKey) {
         let wallet = crate::identity::AgentWallet::from_seed([9u8; 32]);
-        let owner = meridian_core::dsa::owner_signing_key_from_bytes([7u8; 32]);
+        let owner = mist_core::dsa::owner_signing_key_from_bytes([7u8; 32]);
         (SdkClient::new(wallet, Box::new(mock)), owner)
     }
 

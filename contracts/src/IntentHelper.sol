@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 pragma solidity ^0.8.24;
 
-/// @notice meridian-core `intent_hash` 的 Solidity 镜像（S-11 欺诈证明重算用）。
+/// @notice mist-core `intent_hash` 的 Solidity 镜像（S-11 欺诈证明重算用）。
 ///         「链上与链下同一 intent_hash」交叉实现契约（TECH_SPEC §7 / §11 E-03）：
 ///         改任一侧，另一侧的重算立即失配。与 core/src/dsa.rs::intent_hash 的字节序列
 ///         逐字节对齐（前缀 "INTv1\0" + 各字段 u64 小端），golden vector 锁常量

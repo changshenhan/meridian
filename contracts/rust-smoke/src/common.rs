@@ -12,10 +12,10 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
 use anyhow::{Context, Result};
 
-use meridian_aggregator::lattice::EpochResult;
-use meridian_aggregator::receipt::IntentEnvelope;
-use meridian_core::dsa::{self, AgentSigningKey, SpendIntent};
-use meridian_core::zk::{SpendProof, SpendPublicInputs};
+use mist_aggregator::lattice::EpochResult;
+use mist_aggregator::receipt::IntentEnvelope;
+use mist_core::dsa::{self, AgentSigningKey, SpendIntent};
+use mist_core::zk::{SpendProof, SpendPublicInputs};
 
 sol! {
     #[sol(rpc)]

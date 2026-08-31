@@ -15,24 +15,22 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_aggregator::bb::{BbBackend, BbVerifier};
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_core::dsa::owner_signing_key_from_bytes;
-use meridian_facilitator::eip3009::{
+use mist_aggregator::bb::{BbBackend, BbVerifier};
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_core::dsa::owner_signing_key_from_bytes;
+use mist_facilitator::eip3009::{
     eip3009_digest, keccak256, parse_addr20, Authorization, BridgeConfig, Eip3009Bridge,
     Eip3009Domain, ExactPayload, ExactPayment, NoirAssembly,
 };
-use meridian_facilitator::{Facilitator, FacilitatorConfig};
-use meridian_gateway::http::serve as gateway_serve;
-use meridian_gateway::{Gateway, TenantConf, TenantTable};
-use meridian_sdk::x402::{
+use mist_facilitator::{Facilitator, FacilitatorConfig};
+use mist_gateway::http::serve as gateway_serve;
+use mist_gateway::{Gateway, TenantConf, TenantTable};
+use mist_sdk::x402::{
     base64url_encode, Fetch, HttpFetch, PaymentRequired, ResourceRequest, X402Client, X402Outcome,
 };
-use meridian_sdk::{
-    AgentWallet, DelegationLimits, HttpTransport, RetryPolicy, SdkClient, SdkError,
-};
+use mist_sdk::{AgentWallet, DelegationLimits, HttpTransport, RetryPolicy, SdkClient, SdkError};
 
 // ---------------------------------------------------------------------------
 // 脚手架
@@ -42,7 +40,7 @@ static WAL_SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn aggregator(tag: &str) -> (PathBuf, Arc<Aggregator>) {
     let path = std::env::temp_dir().join(format!(
-        "meridian-fac-{}-{tag}-{seq}.wal",
+        "mist-fac-{}-{tag}-{seq}.wal",
         std::process::id(),
         seq = WAL_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
@@ -136,7 +134,7 @@ fn no_payment_returns_parseable_402_requirements() {
     assert_eq!(pr.x402_version, 1);
     assert_eq!(pr.accepts.len(), 1);
     let req = &pr.accepts[0];
-    assert_eq!(req.scheme, "meridian-v1");
+    assert_eq!(req.scheme, "mist-v1");
     assert_eq!(req.network, NETWORK);
     assert_eq!(req.resource, resource);
     assert_eq!(req.pay_to, PAY_TO);
@@ -190,7 +188,7 @@ fn scheme_network_resource_binding_enforced() {
 
     // 错 network。
     let h = payment_header(
-        "meridian-v1",
+        "mist-v1",
         "sepolia",
         resource,
         &format!("0x{}", hex::encode([1u8; 32])),
@@ -201,7 +199,7 @@ fn scheme_network_resource_binding_enforced() {
 
     // 错 resource（重放头绑定的资源不是本服务器）。
     let h = payment_header(
-        "meridian-v1",
+        "mist-v1",
         NETWORK,
         "http://other.example.com/x",
         &format!("0x{}", hex::encode([1u8; 32])),
@@ -211,14 +209,14 @@ fn scheme_network_resource_binding_enforced() {
     assert!(r.body.contains("resource mismatch"), "{}", r.body);
 
     // 坏 intentHash hex。
-    let h = payment_header("meridian-v1", NETWORK, resource, "0xzz");
+    let h = payment_header("mist-v1", NETWORK, resource, "0xzz");
     let r = f.handle("GET", "/", Some(&h));
     assert_eq!(r.status, 402);
     assert!(r.body.contains("bad intentHash hex"), "{}", r.body);
 
     // intentHash 长度不对（31 字节）。
     let h = payment_header(
-        "meridian-v1",
+        "mist-v1",
         NETWORK,
         resource,
         &format!("0x{}", hex::encode([1u8; 31])),
@@ -334,9 +332,9 @@ fn exact_scheme_402_advertises_both_schemes() {
     assert_eq!(r.status, 402);
     let pr: PaymentRequired = serde_json::from_str(&r.body).expect("parse 402 body");
     assert_eq!(pr.accepts.len(), 2);
-    assert_eq!(pr.accepts[0].scheme, "meridian-v1");
+    assert_eq!(pr.accepts[0].scheme, "mist-v1");
     assert_eq!(pr.accepts[1].scheme, "exact");
-    // exact 条目带 EIP-3009 域参数（extra）；meridian-v1 条目不带。
+    // exact 条目带 EIP-3009 域参数（extra）；mist-v1 条目不带。
     let extra = pr.accepts[1].extra.as_ref().expect("extra");
     assert_eq!(extra.name, "USD Coin");
     assert_eq!(extra.version, "2");
@@ -484,7 +482,7 @@ fn spawn_facilitator(gateway_addr: &str, resource: &str) -> String {
         protected_body: "{\"weather\":\"clear+28C\"}".into(),
     }));
     std::thread::spawn(move || {
-        let _ = meridian_facilitator::http::serve(f, listener);
+        let _ = mist_facilitator::http::serve(f, listener);
     });
     format!("http://{addr}/")
 }
@@ -540,7 +538,7 @@ fn e2e_forged_intent_hash_is_rejected_with_402() {
 
     // 重放头里的 resource 绑定 402 body 里的 resource（非 socket URL）。
     let header = payment_header(
-        "meridian-v1",
+        "mist-v1",
         NETWORK,
         "http://fac.example.com/weather",
         &format!("0x{}", hex::encode([0xEE; 32])),
@@ -560,7 +558,7 @@ fn e2e_gateway_down_is_503_fail_closed() {
     let url = spawn_facilitator(&dead_addr, "http://fac.example.com/weather");
 
     let header = payment_header(
-        "meridian-v1",
+        "mist-v1",
         NETWORK,
         "http://fac.example.com/weather",
         &format!("0x{}", hex::encode([1u8; 32])),
@@ -597,7 +595,7 @@ fn spawn_facilitator_with_bridge(
         Some(bridge),
     ));
     std::thread::spawn(move || {
-        let _ = meridian_facilitator::http::serve(f, listener);
+        let _ = mist_facilitator::http::serve(f, listener);
     });
     format!("http://{addr}/")
 }
@@ -638,7 +636,7 @@ fn _fetch_is_object_safe() -> Box<dyn Fetch> {
 fn _type_witness(_: SdkError, _: PaymentRequired) {}
 
 // ---------------------------------------------------------------------------
-// 4. S-32：EIP-3009 兼容桥 e2e——标准 exact client（不会说 meridian-v1）→
+// 4. S-32：EIP-3009 兼容桥 e2e——标准 exact client（不会说 mist-v1）→
 //    桥验签转投摄取 → 真网关真记账 → 回执放行；重放不再摄取；伪造 → 402。
 // ---------------------------------------------------------------------------
 
@@ -711,7 +709,7 @@ fn e2e_exact_scheme_bridge_ingests_verifies_and_dedups_replay() {
 fn e2e_replay_gate_survives_bridge_restart() {
     let (gw_addr, wal, agg) = spawn_gateway("e2e-replay-journal");
     let journal = std::env::temp_dir().join(format!(
-        "meridian-fac-e2e-journal-{}-{:x}.jsonl",
+        "mist-fac-e2e-journal-{}-{:x}.jsonl",
         std::process::id(),
         0x533_0001u32
     ));
@@ -799,7 +797,7 @@ fn spawn_gateway_bb(
     // 自建 Wal（`aggregator()` 助手把 Wal 封进 FormatVerifier 聚合器，bb 模式需要
     // 自带 BbVerifier 的聚合器）。
     let wal_path = std::env::temp_dir().join(format!(
-        "meridian-fac-{}-{tag}-{seq}.wal",
+        "mist-fac-{}-{tag}-{seq}.wal",
         std::process::id(),
         seq = WAL_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
@@ -833,8 +831,8 @@ fn spawn_gateway_bb(
 
 #[test]
 fn e2e_bridge_with_noir_prover_pays_real_proof_into_bb_gateway() {
-    if std::env::var("MERIDIAN_ZK_PROVER_E2E").as_deref() != Ok("1") {
-        println!("SKIP: MERIDIAN_ZK_PROVER_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
+    if std::env::var("MIST_ZK_PROVER_E2E").as_deref() != Ok("1") {
+        println!("SKIP: MIST_ZK_PROVER_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
         return;
     }
     let root = repo_root();
@@ -894,7 +892,7 @@ fn e2e_bridge_with_noir_prover_pays_real_proof_into_bb_gateway() {
         Some(Eip3009Bridge::new(cfg)),
     ));
     std::thread::spawn(move || {
-        let _ = meridian_facilitator::http::serve(f, listener);
+        let _ = mist_facilitator::http::serve(f, listener);
     });
     let url = format!("http://{fac_addr}/");
 
@@ -953,7 +951,7 @@ fn e2e_bridge_with_noir_prover_pays_real_proof_into_bb_gateway() {
         Some(Eip3009Bridge::new(cfg2)),
     ));
     std::thread::spawn(move || {
-        let _ = meridian_facilitator::http::serve(f2, listener2);
+        let _ = mist_facilitator::http::serve(f2, listener2);
     });
     let url2 = format!("http://{fac2}/");
     let fresh = exact_payment(&ExactSpec {

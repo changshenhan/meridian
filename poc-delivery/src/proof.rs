@@ -34,7 +34,7 @@ use tlsn::{
 use crate::certs::{Certs, DELIVERY_DOMAIN};
 
 /// 交付令牌（secret）：prover 知道、对 verifier 隐藏。
-pub const DELIVERY_TOKEN: &str = "meridian-delivery-token-2f3c9a";
+pub const DELIVERY_TOKEN: &str = "mist-delivery-token-2f3c9a";
 
 /// 交付载荷 JSON（reveal 给 verifier）。
 pub const DELIVERY_BODY: &str = r#"{"order_id":"ORD-001","payload_hash":"c0ffee","recipient":"did:agent:b","ts":1700000000}"#;

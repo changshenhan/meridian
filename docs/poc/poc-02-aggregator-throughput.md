@@ -27,7 +27,7 @@
 - **完整管线**：intent↔委托绑定 → agent Ed25519 验签（`verify_intent`）→ nonce 防重放
   （64 片 `Mutex<HashSet>`）→ 预算检查 + 记账（core `ShardedLedger`，64 片）。
 - **无跨次污染**：每次 run 用全新 `ShardedIngest`（nonce 集 / 账本不残留）。
-- **复现**：`cargo run --release -p meridian-bench --bin poc_aggregator -- --check 100000`。
+- **复现**：`cargo run --release -p mist-bench --bin poc_aggregator -- --check 100000`。
 - **机器**：32 核 Windows x86_64（基准平台，TECH_SPEC §8.1 口径）。
 
 ## 测量说明（诚实边界）

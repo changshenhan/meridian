@@ -6,7 +6,7 @@
 //! 折算成 ops/s。多线程放大见 `bin/poc_aggregator`（10 万笔/秒验收）。
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use meridian_bench::ingest::{Batch, FixtureParams, ShardedIngest};
+use mist_bench::ingest::{Batch, FixtureParams, ShardedIngest};
 
 fn bench_aggregator_ingest(c: &mut Criterion) {
     // 32 代理 × 512 意图 = 16_384 笔；一次整批 ~0.4s，criterion 自适应到 ~5s。

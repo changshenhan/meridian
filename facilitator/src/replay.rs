@@ -151,7 +151,7 @@ mod tests {
     /// 唯一临时路径（不删旧重建同一路径；测试末尾自行清理）。
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "meridian-fac-replay-{tag}-{}-{}.jsonl",
+            "mist-fac-replay-{tag}-{}-{}.jsonl",
             std::process::id(),
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))

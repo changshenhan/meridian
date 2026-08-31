@@ -8,7 +8,7 @@ use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// 交付端点域名（叶证书 SAN；tlsn 客户端按它校验 server_name）。
-pub const DELIVERY_DOMAIN: &str = "delivery.meridian.test";
+pub const DELIVERY_DOMAIN: &str = "delivery.mist.test";
 
 /// 现场生成的证书三元组。
 pub struct Certs {
@@ -27,7 +27,7 @@ pub fn generate() -> Result<Certs> {
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
         .distinguished_name
-        .push(DnType::CommonName, "Meridian Delivery Test CA");
+        .push(DnType::CommonName, "Mist Delivery Test CA");
     let ca_kp = KeyPair::generate().context("ca keygen")?;
     let ca_cert = ca_params
         .self_signed(&ca_kp)

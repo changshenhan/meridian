@@ -1,6 +1,6 @@
 # 集成指南（三种角色）
 
-Meridian 的集成面按**角色**分三条路，各自独立可接。本文按角色给 API、契约与坑。
+Mist 的集成面按**角色**分三条路，各自独立可接。本文按角色给 API、契约与坑。
 
 ```text
    owner                    agent                   framework
@@ -20,10 +20,10 @@ Meridian 的集成面按**角色**分三条路，各自独立可接。本文按�
 
 ## 作为 Agent（替 owner 花钱）
 
-**用 `meridian-sdk`（Rust）**。同步内核，无 async runtime；核心三点：
+**用 `mist-sdk`（Rust）**。同步内核，无 async runtime；核心三点：
 
 ```rust
-use meridian_sdk::{SdkClient, PayParams};
+use mist_sdk::{SdkClient, PayParams};
 
 let mut client = SdkClient::in_process(owner_key, agent_key, limits)?;
 client.authorize()?;                       // 注册 DSA（本地限额校验，错误码透传）
@@ -36,7 +36,7 @@ let cred = client.attest_identity()?;   // 双钥绑定凭据（NoirProver keyri
 1. **固定 nonce**：每笔逻辑支付取固定 `spend_nonce`，整个重试周期不复用、不推进；
    只有聚合器返回**定局**（accepted 或永久拒绝）后，下一笔才拿新 nonce。
 2. **只重试传输错误**：`SdkError::Transport` 触发重试（指数退避 + 封顶）；
-   `SdkError::Meridian`（业务拒绝，错误码透传）**永不重试**。
+   `SdkError::Mist`（业务拒绝，错误码透传）**永不重试**。
 3. **聚合器侧幂等**（S-12）：同一 `(spend_nonce, intent_hash)` 重发返回先前结果——
    accepted → 原 `seq`（不重复分配/记账）；rejected → 原原因。此闸口在过期检查之前 →
    已过期但曾被接受的意图重发仍 re-ack，绝不误判失败去换 nonce 重发（那才是双花来源）。
@@ -65,18 +65,18 @@ let cred = client.attest_identity()?;   // 双钥绑定凭据（NoirProver keyri
 
 ---
 
-## 作为 Framework（给 agent 暴露 Meridian）
+## 作为 Framework（给 agent 暴露 Mist）
 
-**用 `meridian-mcp`（stdio）**。MCP 服务器**内嵌真实聚合器内核**（WAL + 幂等 + seq +
+**用 `mist-mcp`（stdio）**。MCP 服务器**内嵌真实聚合器内核**（WAL + 幂等 + seq +
 预算强制），**keyless**：服务器无任何私钥，owner secp256k1 与 agent Ed25519 签名都在
 框架侧，服务器只验签 + 执行。
 
 ```sh
-cargo build -p meridian-mcp --release
-MERIDIAN_WAL_DIR=demos/.wal target/release/meridian-mcp     # 默认 ./meridian.wal
+cargo build -p mist-mcp --release
+MIST_WAL_DIR=demos/.wal target/release/mist-mcp     # 默认 ./mist.wal
 ```
 
-任何支持 stdio MCP 的框架都能挂成工具。自述名 `meridian`，版本 `0.2.0`。
+任何支持 stdio MCP 的框架都能挂成工具。自述名 `mist`，版本 `0.2.0`。
 
 ### 6 工具
 
@@ -90,13 +90,13 @@ MERIDIAN_WAL_DIR=demos/.wal target/release/meridian-mcp     # 默认 ./meridian.
 | `verify_receipt` | `delegation_hash, spend_nonce, intent_hash` | `VerifyReceiptResult {accepted, seq}` | 只读；幂等表确认 |
 
 错误统一回 `{"ok":false,"error":"E_..."}`。完整错误码表见 `mcp-server/README.md`；
-代码在 `meridian_core::error::Error::as_code()`。
+代码在 `mist_core::error::Error::as_code()`。
 
 ### 框架适配坑（已踩平）
 
 - **langchain-mcp-adapters 0.1.0**：`get_tools()` 每工具每次调用新建 MCP 会话（→ 新
   子进程 → 新聚合器，authorize 与 pay 落到不同内核 → `E_DELEG_UNKNOWN`）。必须
-  `client.session("meridian")` + `load_mcp_tools(session)` 共享**单一**会话。
+  `client.session("mist")` + `load_mcp_tools(session)` 共享**单一**会话。
 - **autogen-ext 0.7.5**：同样须显式传共享 `ClientSession`（`stdio_client` +
   `ClientSession`）。另需两个兼容层：(1) `FORMAT_MAPPING` 补
   `uint8/16/32/64 → int`（rmcp/schemars 的 `format:"uint64"` autogen 不认识）；
@@ -153,7 +153,7 @@ vendor 要做的：**等到挑战窗过** → `claim(epoch, idx)` 收钱。挑�
 
 ---
 
-## 错误码速查（`meridian_core::error::Error::as_code()`）
+## 错误码速查（`mist_core::error::Error::as_code()`）
 
 | 码 | 含义 |
 |---|---|

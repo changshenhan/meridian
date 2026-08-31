@@ -1,11 +1,11 @@
-// S-13b 演示③：ElizaOS 同栈 MCP client（@modelcontextprotocol/sdk）接入 Meridian DSA。
+// S-13b 演示③：ElizaOS 同栈 MCP client（@modelcontextprotocol/sdk）接入 Mist DSA。
 //
 // 用法（在 demos/eliza/ 下）：
 //     node eliza_client.mjs
 //
 // 两条接入面：
 //   1. character.json —— 官方 @elizaos/plugin-mcp 的集成配置面（settings.mcp.servers.
-//      meridian，stdio 拉起 meridian-mcp）。本脚本启动时按本机绝对路径自动生成，
+//      mist，stdio 拉起 mist-mcp）。本脚本启动时按本机绝对路径自动生成，
 //      配置给真实 Eliza 运行时即可把 6 个工具暴露给 agent 的 LLM。
 //   2. eliza_client.mjs —— 用与 plugin 相同的 @modelcontextprotocol/sdk 栈直连跑同一
 //      闭环（authorize→revocation_witness→pay→balance→verify_receipt→vendor），
@@ -26,7 +26,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(__dirname, "..", "..");
-const BIN = resolve(REPO, "target", "release", "meridian-mcp.exe");
+const BIN = resolve(REPO, "target", "release", "mist-mcp.exe");
 const WAL_DIR = resolve(__dirname, "..", ".wal");
 
 // ---- 规范编码（逐字节镜像 core/src/dsa.rs） -----------------------------------
@@ -128,7 +128,7 @@ function mockVendorGrant(receipt, amount) {
     credits_granted: amount * 1000,
     credits_total: credits.get(key),
     data: [
-      { row: 1, ticker: "MERIDIAN", price: amount, ok: true },
+      { row: 1, ticker: "MIST", price: amount, ok: true },
       { row: 2, ticker: "DSA", price: amount * 2, ok: true },
     ],
   };
@@ -216,15 +216,15 @@ async function runClosedLoop(callTool, log) {
 async function main() {
   // 配置面：为真实 @elizaos/plugin-mcp 生成 character.json（绝对路径 stdio 配置）。
   const character = {
-    name: "meridian-buyer",
+    name: "mist-buyer",
     modelProvider: "anthropic",
     settings: {
       mcp: {
         servers: {
-          meridian: {
+          mist: {
             command: BIN,
             args: [],
-            env: { MERIDIAN_WAL_DIR: WAL_DIR },
+            env: { MIST_WAL_DIR: WAL_DIR },
           },
         },
       },
@@ -236,9 +236,9 @@ async function main() {
   const transport = new StdioClientTransport({
     command: BIN,
     args: [],
-    env: { MERIDIAN_WAL_DIR: WAL_DIR },
+    env: { MIST_WAL_DIR: WAL_DIR },
   });
-  const client = new Client({ name: "meridian-eliza-demo", version: "0.1.0" });
+  const client = new Client({ name: "mist-eliza-demo", version: "0.1.0" });
   await client.connect(transport);
 
   const { tools } = await client.listTools();

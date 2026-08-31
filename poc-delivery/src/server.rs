@@ -109,7 +109,7 @@ async fn deliver(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper:
         order_id,
         recipient,
         payload_hash,
-        delivery_ack: hex::encode(Sha256::digest(b"meridian-delivery-ack")),
+        delivery_ack: hex::encode(Sha256::digest(b"mist-delivery-ack")),
         received: true,
         ts: 1_700_000_000,
     };

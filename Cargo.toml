@@ -6,14 +6,14 @@ members = ["core", "aggregator", "bench", "facilitator", "gateway", "mcp-server"
 version = "0.1.0"
 edition = "2021"
 license = "Elastic-2.0"
-authors = ["Meridian Labs"]
+authors = ["Mist Labs"]
 
 [workspace.dependencies]
-meridian-core = { path = "core" }
-meridian-aggregator = { path = "aggregator" }
-meridian-facilitator = { path = "facilitator" }
-meridian-gateway = { path = "gateway" }
-meridian-sdk = { path = "sdk" }
+mist-core = { path = "core" }
+mist-aggregator = { path = "aggregator" }
+mist-facilitator = { path = "facilitator" }
+mist-gateway = { path = "gateway" }
+mist-sdk = { path = "sdk" }
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"

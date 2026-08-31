@@ -1,9 +1,9 @@
 //! CI 性能门禁（TECH_SPEC §8.3 / MASTER_PLAN S-04）。
 //!
 //! 用法：
-//!   cargo run -p meridian-bench --bin gate -- --record           # 写入 baseline.json
-//!   cargo run -p meridian-bench --bin gate                        # 与 baseline 比较，回归 > 阈值则退出码 1
-//!   cargo run -p meridian-bench --bin gate -- --fail-over 1.0     # 自定义阈值（%）
+//!   cargo run -p mist-bench --bin gate -- --record           # 写入 baseline.json
+//!   cargo run -p mist-bench --bin gate                        # 与 baseline 比较，回归 > 阈值则退出码 1
+//!   cargo run -p mist-bench --bin gate -- --fail-over 1.0     # 自定义阈值（%）
 //!
 //! 度量：固定输入集 + 固定迭代，输出 ops/sec，写入/比对 baseline.json。
 //! 所有数字可复现（固定 seed、固定输入）。机器差异通过在同一参考平台上记录 baseline 消除。
@@ -16,16 +16,16 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use meridian_bench::agg_fixture::{
+use mist_bench::agg_fixture::{
     measure_kernel_rss_mib, measure_kernel_single_threaded, KernelBatch, KernelFixtureParams,
     MASTER_SEED,
 };
-use meridian_bench::b7_measure;
-use meridian_bench::ingest::{measure_single_threaded, Batch, FixtureParams};
-use meridian_core::dsa::{self, AgentSigningKey, Delegation, RateLimit, SpendIntent};
-use meridian_core::ledger::{check_budget, BudgetState};
+use mist_bench::b7_measure;
+use mist_bench::ingest::{measure_single_threaded, Batch, FixtureParams};
+use mist_core::dsa::{self, AgentSigningKey, Delegation, RateLimit, SpendIntent};
+use mist_core::ledger::{check_budget, BudgetState};
 
-const SUITE: &str = "meridian-bench";
+const SUITE: &str = "mist-bench";
 const DEFAULT_FAIL_OVER_PCT: f64 = 1.0;
 
 /// 每指标阈值，**始终生效**（不随显式 `--fail-over` 放宽）。
@@ -257,7 +257,7 @@ fn main() {
                     per_agent: 200,
                 })),
             ),
-            // S-10 生产内核（meridian-aggregator）：单线程 ingest 全管线吞吐
+            // S-10 生产内核（mist-aggregator）：单线程 ingest 全管线吞吐
             // （验签 → SpendVerifier → 预算 → 入窗 → WAL），B5 口径的单线程基线。
             // B8 零分配 / B11 确定性是硬断言，走 agg_sim --check-alloc / --check-determinism
             // （CI 回归），不进吞吐 baseline。

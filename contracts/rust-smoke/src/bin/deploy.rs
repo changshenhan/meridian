@@ -5,12 +5,12 @@
 //!   cd contracts && forge build
 //!
 //!   # 默认 dry-run：打印部署计划（链/操作者/产物/构造参数/预估 gas），**不上链**。
-//!   MERIDIAN_RPC_URL=https://sepolia.base.org \
+//!   MIST_RPC_URL=https://sepolia.base.org \
 //!     cargo run --release --manifest-path contracts/rust-smoke/Cargo.toml --bin deploy
 //!
 //!   # 真实部署（operator 私钥从 env 注入，绝不明文入参；部署方 = 操作者 operator）：
-//!   MERIDIAN_RPC_URL=https://sepolia.base.org \
-//!   MERIDIAN_OPERATOR_KEY=0x... \
+//!   MIST_RPC_URL=https://sepolia.base.org \
+//!   MIST_OPERATOR_KEY=0x... \
 //!     cargo run --release --manifest-path contracts/rust-smoke/Cargo.toml --bin deploy -- --live
 //!
 //! 目标链通过 RPC 自动识别（chain_id 84532 = Base Sepolia；8453 = Base 主网；1337 = anvil）。
@@ -19,12 +19,12 @@
 //! BatchSettler(操作者+资产+challengeBond ← 调度读数 + DSA/RevocationRegistry 锚面) →
 //! registerOperator(settler)。
 //!
-//! S-28 结算资产：`MERIDIAN_SETTLEMENT_ASSET`（hex 地址）= ERC-20 结算资产（如 USDC）；
+//! S-28 结算资产：`MIST_SETTLEMENT_ASSET`（hex 地址）= ERC-20 结算资产（如 USDC）；
 //! 未设置 = 原生 ETH（asset = address(0)，v2 行为）。Base 主网 USDC =
 //! 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913；Base Sepolia =
 //! 0x036CbD53842c5426634e7929541eC2318f3dCF7e。
 //!
-//! S-64（TECH_SPEC §6.21）金额调度：MERIDIAN_BOND / MERIDIAN_CHALLENGE_BOND（wei，
+//! S-64（TECH_SPEC §6.21）金额调度：MIST_BOND / MIST_CHALLENGE_BOND（wei，
 //! 缺省 1 ETH / 0.1 ETH）→ appendSchedule → currentSchedule() 读数 → BatchSettler 构造
 //! 参数（决策 D「新实例读取当刻值固化」的读取点在部署流程，BatchSettler 构造 ABI 不动）
 //! → 部署后 challengeBond() 回读交叉核对。
@@ -153,11 +153,11 @@ async fn run<P: Provider>(
     let gas_price = provider.get_gas_price().await?;
 
     println!("══════════════════════════════════════════════════════════");
-    println!("  Meridian 合同栈部署计划");
+    println!("  Mist 合同栈部署计划");
     println!("  目标链    : {}（chain_id {chain_id}）", chain_name);
     println!(
         "  RPC       : {}",
-        env_or("MERIDIAN_RPC_URL", "http://127.0.0.1:8545")
+        env_or("MIST_RPC_URL", "http://127.0.0.1:8545")
     );
     println!(
         "  操作者    : {operator_addr}{}",
@@ -198,7 +198,7 @@ async fn run<P: Provider>(
                 }
             );
         }
-        println!("\ndry-run 完成：未上链。--live 需 env MERIDIAN_OPERATOR_KEY。");
+        println!("\ndry-run 完成：未上链。--live 需 env MIST_OPERATOR_KEY。");
         return Ok(());
     }
 
@@ -231,14 +231,14 @@ async fn run<P: Provider>(
     );
     deployed.push(("OperatorRegistry", registry_addr));
 
-    // 金额调度初值：MERIDIAN_BOND / MERIDIAN_CHALLENGE_BOND（wei，缺省 1 ETH / 0.1 ETH，
+    // 金额调度初值：MIST_BOND / MIST_CHALLENGE_BOND（wei，缺省 1 ETH / 0.1 ETH，
     // 与 rust-smoke common::CHALLENGE_BOND 同基线）。零金额被合约构造性拒绝（ZeroScheduleAmount）。
-    let bond: u128 = env_or("MERIDIAN_BOND", "1000000000000000000")
+    let bond: u128 = env_or("MIST_BOND", "1000000000000000000")
         .parse()
-        .context("MERIDIAN_BOND 非法（wei 整数）")?;
-    let challenge_bond: u128 = env_or("MERIDIAN_CHALLENGE_BOND", "100000000000000000")
+        .context("MIST_BOND 非法（wei 整数）")?;
+    let challenge_bond: u128 = env_or("MIST_CHALLENGE_BOND", "100000000000000000")
         .parse()
-        .context("MERIDIAN_CHALLENGE_BOND 非法（wei 整数）")?;
+        .context("MIST_CHALLENGE_BOND 非法（wei 整数）")?;
     let receipt = send_tx(
         provider,
         registry_addr,
@@ -272,9 +272,9 @@ async fn run<P: Provider>(
         }
     );
 
-    // S-28：结算资产（MERIDIAN_SETTLEMENT_ASSET，未设 = 原生 ETH）。
-    let asset: Address = match std::env::var("MERIDIAN_SETTLEMENT_ASSET") {
-        Ok(s) if !s.is_empty() => s.parse().context("MERIDIAN_SETTLEMENT_ASSET 非法地址")?,
+    // S-28：结算资产（MIST_SETTLEMENT_ASSET，未设 = 原生 ETH）。
+    let asset: Address = match std::env::var("MIST_SETTLEMENT_ASSET") {
+        Ok(s) if !s.is_empty() => s.parse().context("MIST_SETTLEMENT_ASSET 非法地址")?,
         _ => Address::ZERO,
     };
 
@@ -371,12 +371,12 @@ async fn main() -> Result<()> {
         .and_then(|p| args.get(p + 1))
         .and_then(|v| v.parse::<u64>().ok());
 
-    let rpc = env_or("MERIDIAN_RPC_URL", "http://127.0.0.1:8545");
+    let rpc = env_or("MIST_RPC_URL", "http://127.0.0.1:8545");
 
     if live {
-        let key = std::env::var("MERIDIAN_OPERATOR_KEY")
-            .context("--live 需要 env MERIDIAN_OPERATOR_KEY（部署方 = 操作者 operator 私钥）")?;
-        let signer: PrivateKeySigner = key.parse().context("MERIDIAN_OPERATOR_KEY 解析失败")?;
+        let key = std::env::var("MIST_OPERATOR_KEY")
+            .context("--live 需要 env MIST_OPERATOR_KEY（部署方 = 操作者 operator 私钥）")?;
+        let signer: PrivateKeySigner = key.parse().context("MIST_OPERATOR_KEY 解析失败")?;
         let live_operator = signer.address();
         let provider = ProviderBuilder::new()
             .wallet(signer)

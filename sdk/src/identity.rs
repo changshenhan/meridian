@@ -11,12 +11,12 @@ use ed25519_dalek::Signature as AgentSignature;
 use k256::ecdsa::SigningKey as OwnerSigningKey;
 use sha3::{Digest, Keccak256};
 
-use meridian_core::dsa::{
+use mist_core::dsa::{
     delegation_hash, sign_delegation, sign_intent, verify_delegation, AgentPubKey, Amount,
     Category, Delegation, Did, OwnerPubKey, RateLimit, SignedDelegation, SpendIntent,
     PROTOCOL_VERSION,
 };
-use meridian_core::error::Error;
+use mist_core::error::Error;
 
 /// 委托限额（§4.1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,7 +141,7 @@ pub fn create_delegation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_core::dsa::{owner_signing_key_from_bytes, verify_intent};
+    use mist_core::dsa::{owner_signing_key_from_bytes, verify_intent};
 
     fn limits(max_per_spend: u64, total_cap: u64) -> DelegationLimits {
         DelegationLimits {

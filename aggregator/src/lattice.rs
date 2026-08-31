@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use meridian_core::error::Error;
+use mist_core::error::Error;
 use sha3::{Digest, Keccak256};
 
 use crate::merkle::{acceptance_leaf, leaf, merkle_root};

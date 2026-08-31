@@ -6,7 +6,7 @@
 
 use ed25519_dalek::Signature as AgentSignature;
 
-use meridian_core::attestation::{agent_commit, sign_binding, verify_binding, AttestationPubKey};
+use mist_core::attestation::{agent_commit, sign_binding, verify_binding, AttestationPubKey};
 
 use crate::error::SdkError;
 use crate::identity::AgentWallet;

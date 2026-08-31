@@ -1,8 +1,8 @@
 //! 意图信封与回执（TECH_SPEC §6.1/6.2）。
 
-use meridian_core::dsa::{AgentSignature, SpendIntent};
-use meridian_core::error::Error;
-use meridian_core::zk::SpendProof;
+use mist_core::dsa::{AgentSignature, SpendIntent};
+use mist_core::error::Error;
+use mist_core::zk::SpendProof;
 
 /// 意图信封（§6.1）。比 spec 伪代码多带 `agent_sig`：§6.2 摄入管线第一步是
 /// "验签（Ed25519 快路径）"——这是证明前的廉价 DoS 闸门，必须由信封携带 S-02 传输层签名。

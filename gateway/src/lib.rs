@@ -1,4 +1,4 @@
-//! Meridian 网络 ingest 网关（S-29，TECH_SPEC §6.7）。
+//! Mist 网络 ingest 网关（S-29，TECH_SPEC §6.7）。
 //!
 //! std-only 线程网关：把 `Aggregator::register` / `submit` 暴露为 HTTP/1.1 端点。
 //! 分层——`Gateway::handle(method, path, bearer, body)` 是**纯分发**（不碰 socket，
@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use meridian_aggregator::ingest::Aggregator;
-use meridian_aggregator::wire::{
+use mist_aggregator::ingest::Aggregator;
+use mist_aggregator::wire::{
     AuthorizeRequest, AuthorizeResponse, GatewayError, IntentEnvelopeDto, NextNonceResponse,
     ReceiptDto, RevocationWitnessResponse,
 };
@@ -508,7 +508,7 @@ impl Gateway {
             .delegation_hash
             .strip_prefix("0x")
             .unwrap_or(&req.delegation_hash);
-        let dh = match meridian_aggregator::wire::hex_to_bytes32(dh_hex) {
+        let dh = match mist_aggregator::wire::hex_to_bytes32(dh_hex) {
             Ok(dh) => dh,
             Err(e) => {
                 return Response::error(400, E_MALFORMED, format!("bad delegation_hash: {e}"))
@@ -617,7 +617,7 @@ impl Gateway {
         }
         // 0x 前缀宽容（x402 生态惯例是 0x hex）；其余不合法 → 400。
         let hash_hex = hash_hex.strip_prefix("0x").unwrap_or(hash_hex);
-        let ih = match meridian_aggregator::wire::hex_to_bytes32(hash_hex) {
+        let ih = match mist_aggregator::wire::hex_to_bytes32(hash_hex) {
             Ok(ih) => ih,
             Err(e) => return Response::error(400, E_MALFORMED, format!("bad intent_hash: {e}")),
         };
@@ -642,7 +642,7 @@ impl Gateway {
         }
         // 0x 前缀宽容（与 /v1/receipts 同口径）。
         let hash_hex = hash_hex.strip_prefix("0x").unwrap_or(hash_hex);
-        let dh = match meridian_aggregator::wire::hex_to_bytes32(hash_hex) {
+        let dh = match mist_aggregator::wire::hex_to_bytes32(hash_hex) {
             Ok(dh) => dh,
             Err(e) => {
                 return Response::error(400, E_MALFORMED, format!("bad delegation_hash: {e}"))
@@ -675,7 +675,7 @@ impl Gateway {
         }
         // 0x 前缀宽容（与 /v1/receipts、/v1/nonce 同口径）。
         let hash_hex = hash_hex.strip_prefix("0x").unwrap_or(hash_hex);
-        let dh = match meridian_aggregator::wire::hex_to_bytes32(hash_hex) {
+        let dh = match mist_aggregator::wire::hex_to_bytes32(hash_hex) {
             Ok(dh) => dh,
             Err(e) => {
                 return Response::error(400, E_MALFORMED, format!("bad delegation_hash: {e}"))

@@ -16,13 +16,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use meridian_aggregator::receipt::{IntentEnvelope, Receipt};
-use meridian_aggregator::wire::{
+use mist_aggregator::receipt::{IntentEnvelope, Receipt};
+use mist_aggregator::wire::{
     AuthorizeRequest, AuthorizeResponse, GatewayError, IntentEnvelopeDto, NextNonceResponse,
     ReceiptDto, RevocationWitnessResponse,
 };
-use meridian_core::dsa::{AgentPubKey, SignedDelegation};
-use meridian_core::zk::RevocationWitness;
+use mist_core::dsa::{AgentPubKey, SignedDelegation};
+use mist_core::zk::RevocationWitness;
 
 use crate::error::{SdkError, TransportError};
 use crate::transport::Transport;
@@ -69,7 +69,7 @@ impl HttpTransport {
             .map_err(|_| TransportError::Disconnected)?;
         let mut reader = BufReader::new(stream);
 
-        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: meridian\r\nConnection: close\r\nAuthorization: Bearer {}\r\n", self.bearer);
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: mist\r\nConnection: close\r\nAuthorization: Bearer {}\r\n", self.bearer);
         if let Some(b) = body {
             req.push_str(&format!(
                 "Content-Type: application/json\r\nContent-Length: {}\r\n",

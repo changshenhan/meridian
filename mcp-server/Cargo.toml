@@ -1,14 +1,14 @@
 [package]
-name = "meridian-mcp"
+name = "mist-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Meridian S-13 MCP 正式版：authorize/pay/balance/attest/verify_receipt/revocation_witness，薄 keyless 层包真实聚合器内核（stdin/stdout MCP server）"
+description = "Mist S-13 MCP 正式版：authorize/pay/balance/attest/verify_receipt/revocation_witness，薄 keyless 层包真实聚合器内核（stdin/stdout MCP server）"
 
 [dependencies]
-meridian-core = { workspace = true }
-meridian-aggregator = { workspace = true }
+mist-core = { workspace = true }
+mist-aggregator = { workspace = true }
 # rmcp = 官方 Rust MCP SDK（modelcontextprotocol/rust-sdk）。3.x API：
 #   `#[tool_router]` + `#[tool(description=...)]` + `Parameters(Request)` + `ServerHandler`。
 # server 特性含 stdio / async-rw transport + schemars（工具 JSON Schema 自动生成）。
@@ -28,6 +28,6 @@ anyhow = "1"
 # CI 集成测试用 rmcp client（与 server 同版本，特性统一）。生产构建不含 client。
 rmcp = { version = "3.1", features = ["client"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
-# S-52 门控 noir e2e（MERIDIAN_MCP_NOIR_E2E=1）：客户端侧真电路证明（NoirProver）。
+# S-52 门控 noir e2e（MIST_MCP_NOIR_E2E=1）：客户端侧真电路证明（NoirProver）。
 # 仅 dev-dependency——生产 MCP 服务器不产证明（keyless，§6.16）。
-meridian-sdk = { workspace = true }
+mist-sdk = { workspace = true }

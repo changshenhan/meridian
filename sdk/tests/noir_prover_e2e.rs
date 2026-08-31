@@ -6,23 +6,23 @@
 //! 这是 §4.6 残余②「电路消费交叉锚」的实证：电路吃**聚合器出的撤销路径**重算根并与
 //! 公共输入 `revocation_root` 对账，全链真 ZK。
 //!
-//! 门控：`MERIDIAN_ZK_PROVER_E2E=1` 才跑（verify.sh 步 9c，紧随 9b；CI noir job
+//! 门控：`MIST_ZK_PROVER_E2E=1` 才跑（verify.sh 步 9c，紧随 9b；CI noir job
 //! 同款）。工件依赖第 9 步 formal_zk 产出的 `circuits/target/spend_authorization.json`
 //! （bb 字节码）与 `circuits/target/vk`；缺失则显式打印跳过原因（不静默成功）。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use meridian_aggregator::bb::{BbBackend, BbVerifier};
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::revocation::RevocationSet;
-use meridian_aggregator::wal::Wal;
-use meridian_core::attestation::agent_commit;
-use meridian_core::error::Error;
-use meridian_core::zk::{SpendProofRequest, SpendProver, SpendVerifier};
-use meridian_sdk::identity::{create_delegation, AgentWallet, DelegationLimits};
-use meridian_sdk::prover::NoirProver;
-use meridian_sdk::{InProcessAggregator, PayParams, SdkClient};
+use mist_aggregator::bb::{BbBackend, BbVerifier};
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::revocation::RevocationSet;
+use mist_aggregator::wal::Wal;
+use mist_core::attestation::agent_commit;
+use mist_core::error::Error;
+use mist_core::zk::{SpendProofRequest, SpendProver, SpendVerifier};
+use mist_sdk::identity::{create_delegation, AgentWallet, DelegationLimits};
+use mist_sdk::prover::NoirProver;
+use mist_sdk::{InProcessAggregator, PayParams, SdkClient};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -52,8 +52,8 @@ fn artifact(root: &Path, rel: &str, why: &str) -> Option<Vec<u8>> {
 
 #[test]
 fn noir_prover_e2e_real_proof_via_aggregator_revocation() {
-    if std::env::var("MERIDIAN_ZK_PROVER_E2E").as_deref() != Ok("1") {
-        println!("SKIP: MERIDIAN_ZK_PROVER_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
+    if std::env::var("MIST_ZK_PROVER_E2E").as_deref() != Ok("1") {
+        println!("SKIP: MIST_ZK_PROVER_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
         return;
     }
     // 临时 witness 文件路径级共享（见 PROVE_LOCK 注释）——跨测试串行。
@@ -81,7 +81,7 @@ fn noir_prover_e2e_real_proof_via_aggregator_revocation() {
 
     // ——— SDK 委托 + 意图（真实授权上下文，非手搓 fixture）———
     let wallet = AgentWallet::from_seed([0xA5u8; 32]);
-    let owner_key = meridian_core::dsa::owner_signing_key_from_bytes([0x0Fu8; 32]);
+    let owner_key = mist_core::dsa::owner_signing_key_from_bytes([0x0Fu8; 32]);
     let limits = DelegationLimits {
         max_per_spend: 5_000,
         rate_window_secs: 60,
@@ -92,7 +92,7 @@ fn noir_prover_e2e_real_proof_via_aggregator_revocation() {
         expires_at: 1_900_000_000,
     };
     let sd = create_delegation(&owner_key, [0x0Bu8; 20], 1, &limits).expect("delegation");
-    let dh = meridian_core::dsa::delegation_hash(&sd.delegation);
+    let dh = mist_core::dsa::delegation_hash(&sd.delegation);
     let (intent, _agent_sig) = wallet.create_intent(
         sd.delegation.agent,
         dh,
@@ -157,7 +157,7 @@ fn noir_prover_e2e_real_proof_via_aggregator_revocation() {
     let mut tampered = proof.proof.clone();
     let last = tampered.len() - 1;
     tampered[last] ^= 0xff;
-    let bad = meridian_core::zk::SpendProof {
+    let bad = mist_core::zk::SpendProof {
         proof: tampered,
         public_inputs: proof.public_inputs.clone(),
     };
@@ -166,7 +166,7 @@ fn noir_prover_e2e_real_proof_via_aggregator_revocation() {
     // ——— 负向二：公共输入与证明绑定不一致（金额 +1）→ E_PROOF ———
     let mut wrong_pi = proof.public_inputs.clone();
     wrong_pi.amount += 1;
-    let bad_pi = meridian_core::zk::SpendProof {
+    let bad_pi = mist_core::zk::SpendProof {
         proof: proof.proof,
         public_inputs: wrong_pi,
     };
@@ -180,7 +180,7 @@ fn noir_prover_fails_closed_without_revocation_witness() {
     // 工具链可得时也成立：path 长度闸在 prove 入口先于一切重操作。
     let root = repo_root();
     let wallet = AgentWallet::from_seed([0xA6u8; 32]);
-    let owner_key = meridian_core::dsa::owner_signing_key_from_bytes([0x10u8; 32]);
+    let owner_key = mist_core::dsa::owner_signing_key_from_bytes([0x10u8; 32]);
     let limits = DelegationLimits {
         max_per_spend: 1_000,
         rate_window_secs: 60,
@@ -191,7 +191,7 @@ fn noir_prover_fails_closed_without_revocation_witness() {
         expires_at: u64::MAX,
     };
     let sd = create_delegation(&owner_key, [0x0Bu8; 20], 1, &limits).expect("delegation");
-    let dh = meridian_core::dsa::delegation_hash(&sd.delegation);
+    let dh = mist_core::dsa::delegation_hash(&sd.delegation);
     let (intent, _sig) = wallet.create_intent(
         sd.delegation.agent,
         dh,
@@ -207,7 +207,7 @@ fn noir_prover_fails_closed_without_revocation_witness() {
         intent: &intent,
         agent_key: &wallet.agent_key,
         attestation_secret: [0x42u8; 32],
-        revocation: meridian_core::zk::RevocationWitness {
+        revocation: mist_core::zk::RevocationWitness {
             root: [0u8; 32],
             path: Vec::new(), // 占位口径
         },
@@ -228,8 +228,8 @@ fn noir_prover_fails_closed_without_revocation_witness() {
 
 #[test]
 fn sdk_pay_full_path_with_noir_prover_and_attested_identity() {
-    if std::env::var("MERIDIAN_ZK_PROVER_E2E").as_deref() != Ok("1") {
-        println!("SKIP: MERIDIAN_ZK_PROVER_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
+    if std::env::var("MIST_ZK_PROVER_E2E").as_deref() != Ok("1") {
+        println!("SKIP: MIST_ZK_PROVER_E2E=1 未设（prove 侧重操作，不进默认 cargo test）");
         return;
     }
     let _prove_serial = prove_guard();
@@ -256,7 +256,7 @@ fn sdk_pay_full_path_with_noir_prover_and_attested_identity() {
 
     // ——— 进程内聚合器：BbVerifier（§6.13）+ 撤销根绑定闸（§6.2，S-44）———
     let wal_path =
-        std::env::temp_dir().join(format!("meridian-sdk-noir-pay-{}.wal", std::process::id()));
+        std::env::temp_dir().join(format!("mist-sdk-noir-pay-{}.wal", std::process::id()));
     let _ = std::fs::remove_file(&wal_path);
     let wal = Wal::open(&wal_path, 1_000).expect("open wal");
     let verifier = BbVerifier::from_parts(vk, backend, root.join("target/bb-sdk-pay-e2e"));
@@ -275,7 +275,7 @@ fn sdk_pay_full_path_with_noir_prover_and_attested_identity() {
 
     // ——— SDK 自洽装配（S-46）：同一 NoirProver 兼作 prove 后端与 attestation keyring———
     let wallet = AgentWallet::from_seed([0xB7u8; 32]);
-    let owner_key = meridian_core::dsa::owner_signing_key_from_bytes([0x11u8; 32]);
+    let owner_key = mist_core::dsa::owner_signing_key_from_bytes([0x11u8; 32]);
     let limits = DelegationLimits {
         max_per_spend: 5_000,
         rate_window_secs: 60,
@@ -338,7 +338,7 @@ fn sdk_pay_full_path_with_noir_prover_and_attested_identity() {
     // 单一来源由构造保证，不再依赖调用方手工对齐。
     let standalone = NoirProver::from_repo_root(&root).expect("工具链");
     let sd = create_delegation(&owner_key, [0x0Bu8; 20], 9, &limits).expect("delegation");
-    let sdh = meridian_core::dsa::delegation_hash(&sd.delegation);
+    let sdh = mist_core::dsa::delegation_hash(&sd.delegation);
     let (intent, _sig) = wallet.create_intent(
         sd.delegation.agent,
         sdh,

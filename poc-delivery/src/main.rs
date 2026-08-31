@@ -12,9 +12,9 @@
 
 use std::net::SocketAddr;
 
-use meridian_poc_delivery::certs;
-use meridian_poc_delivery::proof::{run_delivery_proof, DELIVERY_BODY, DELIVERY_TOKEN};
-use meridian_poc_delivery::server;
+use mist_poc_delivery::certs;
+use mist_poc_delivery::proof::{run_delivery_proof, DELIVERY_BODY, DELIVERY_TOKEN};
+use mist_poc_delivery::server;
 
 fn main() -> anyhow::Result<()> {
     // 依赖图里 rustls 同时启了 aws-lc-rs（tlsn）与 ring，显式选 aws-lc-rs 作默认
@@ -40,7 +40,7 @@ async fn run() -> anyhow::Result<()> {
     let (_server, port) = server::spawn(&certs, 0).await?;
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
 
-    println!("=== Meridian PoC ③ 交付证明（TLSNotary 2-party MPC-TLS）===\n");
+    println!("=== Mist PoC ③ 交付证明（TLSNotary 2-party MPC-TLS）===\n");
     println!("交付端点  : https://{}/deliver", certs::DELIVERY_DOMAIN);
     println!("交付令牌  : {DELIVERY_TOKEN}（对 verifier 隐藏）");
     println!("交付载荷  : {DELIVERY_BODY}\n");

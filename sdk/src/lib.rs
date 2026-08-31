@@ -1,4 +1,4 @@
-//! Meridian agent SDK（S-12）。
+//! Mist agent SDK（S-12）。
 //!
 //! 独立 agent 进程集成层：封装 core 密码学原语 + 聚合器摄取管线，暴露三个高层操作——
 //! [`SdkClient::authorize`]（注册委托）、[`SdkClient::pay`]（幂等支付）、
@@ -9,7 +9,7 @@
 //!
 //! - 每笔逻辑支付取**固定 nonce**，整个重试周期不复用、不推进；只有聚合器返回**定局**
 //!   （accepted 或永久拒绝）后，下一笔才拿新 nonce（[`NonceManager`]）。
-//! - 仅传输错误（[`SdkError::Transport`]）触发重试；聚合器的业务拒绝（[`SdkError::Meridian`]）
+//! - 仅传输错误（[`SdkError::Transport`]）触发重试；聚合器的业务拒绝（[`SdkError::Mist`]）
 //!   永不重试。
 //! - **聚合器侧幂等**（S-12 配合改动，`aggregator` 的 nonce 记录）：同一 intent（同 nonce +
 //!   同 `intent_hash`）的重发返回先前结果——accepted → 原 seq，拒绝 → 原原因。因此断线重发
@@ -42,12 +42,12 @@ pub mod x402;
 
 pub use error::{SdkError, TransportError};
 pub use identity::{owner_did, AgentWallet, DelegationLimits};
-pub use meridian_aggregator::receipt::Receipt;
+pub use mist_aggregator::receipt::Receipt;
 pub use pay::{NonceManager, PayParams, PayReceipt, RetryPolicy};
 pub use transport::{DropFirstTransport, InProcessAggregator, ResponseLossTransport, Transport};
 pub use transport_http::HttpTransport;
 pub use x402::{
-    base64url_encode, category_from_resource, Eip3009Extra, Fetch, HttpFetch, MeridianPayload,
+    base64url_encode, category_from_resource, Eip3009Extra, Fetch, HttpFetch, MistPayload,
     PaymentPayload, PaymentRequired, PaymentRequirements, ResourceRequest, ResourceResponse,
     X402Client, X402Outcome, X402Proof,
 };
@@ -56,9 +56,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use meridian_core::attestation::AttestationPubKey;
-use meridian_core::dsa::{Did, SignedDelegation};
-use meridian_core::zk::{RevocationWitness, SpendProver};
+use mist_core::attestation::AttestationPubKey;
+use mist_core::dsa::{Did, SignedDelegation};
+use mist_core::zk::{RevocationWitness, SpendProver};
 
 use crate::attest::AttestationCredential;
 use crate::authorize::AuthorizeReceipt;
@@ -234,9 +234,7 @@ impl SdkClient {
                 return Ok(*pk);
             }
         }
-        let pk = keyring
-            .attestation_pubkey(secret)
-            .map_err(SdkError::Meridian)?;
+        let pk = keyring.attestation_pubkey(secret).map_err(SdkError::Mist)?;
         *self.attested_pk.write().expect("attested poisoned") = Some((secret, pk));
         Ok(pk)
     }

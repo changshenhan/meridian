@@ -7,9 +7,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use meridian_aggregator::binding::{BindingGate, OperatorBinding};
-use meridian_core::error::Error;
-use meridian_gateway::binding::JsonRpcBinding;
+use mist_aggregator::binding::{BindingGate, OperatorBinding};
+use mist_core::error::Error;
+use mist_gateway::binding::JsonRpcBinding;
 
 const SELF: [u8; 20] = [0xAA; 20];
 const OTHER: [u8; 20] = [0xBB; 20];

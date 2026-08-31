@@ -1,7 +1,7 @@
 //! EIP-3009 兼容桥（S-32，TECH_SPEC §6.10，docs/x402-adapter.md §4 缺口 3）。
 //!
 //! 存量 x402 client 只会说标准 `exact` scheme（签 EIP-3009 `transferWithAuthorization`），
-//! 不会说 `meridian-v1`。桥 = facilitator 侧把标准 payload **验签后转投 Meridian 摄取**，
+//! 不会说 `mist-v1`。桥 = facilitator 侧把标准 payload **验签后转投 Mist 摄取**，
 //! merchant 侧零感知（验证面仍是"查网关回执"，S-30c 不变）。
 //!
 //! # 流程（[`Eip3009Bridge::ingest`]）
@@ -11,7 +11,7 @@
 //! 2. EIP-712 验签（ecrecover，链下密码学）：恢复地址 == `from`，否则拒。
 //! 3. 重放闸：`(from, eip3009 nonce) -> intent_hash`，同 payload 重放不再摄取。S-33 起
 //!    可持久化（[`Eip3009Bridge::open`]：append-only 日志 + 启动重建，[`crate::replay`]）。
-//! 4. 转投 Meridian 摄取（垫付模型）：facilitator 以自身委托（惰性首用注册）走
+//! 4. 转投 Mist 摄取（垫付模型）：facilitator 以自身委托（惰性首用注册）走
 //!    [`SdkClient::pay`]——预算 / 速率 / 撤销 / ZK 证明闸口全部保留，桥不旁路任何
 //!    协议层检查。
 //!
@@ -19,7 +19,7 @@
 //!
 //! EIP-3009 的链上执行不在本件（不调 `transferWithAuthorization`）——client 到运营商
 //! 的清算是运营商侧账务（`memo` 指纹 + 原始 payload 留档）；被消费的是运营商自己的
-//! Meridian 预算（垫付），client 信用风险由白标合同承担，不是协议层担保。重放闸：
+//! Mist 预算（垫付），client 信用风险由白标合同承担，不是协议层担保。重放闸：
 //! [`Eip3009Bridge::new`] 仍为进程内存态（v0 兼容）；[`Eip3009Bridge::open`] 启用持久化，
 //! 残余边界（落盘失败窗口 / 日志线性增长）见 [`crate::replay`] 与 TECH_SPEC §6.10。
 //! EIP-712 domain 由配置显式给出，v1 不做域自动发现。
@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
 use crate::replay::{JournalState, ReplayJournal};
-use meridian_sdk::x402::{category_from_resource, X402_VERSION};
-use meridian_sdk::{AgentWallet, HttpTransport, PayParams, SdkClient, SdkError};
+use mist_sdk::x402::{category_from_resource, X402_VERSION};
+use mist_sdk::{AgentWallet, HttpTransport, PayParams, SdkClient, SdkError};
 
 /// x402 标准 `exact` scheme 名（EIP-3009 载荷）。
 pub const EXACT_SCHEME: &str = "exact";
@@ -125,7 +125,7 @@ pub enum BridgeError {
     Binding(String),
     /// EIP-712 验签失败（恢复地址 != from / 坏 v）。
     BadSignature(String),
-    /// Meridian 摄取失败：业务拒绝（402）或网关不可达（503 fail-closed）。
+    /// Mist 摄取失败：业务拒绝（402）或网关不可达（503 fail-closed）。
     Ingest(SdkError),
     /// 重放闸日志落盘失败（S-33）→ 503 fail-closed（运维故障不归罪 client；
     /// 内存表已登记，client 重试命中重放闸不重复摄取）。
@@ -147,7 +147,7 @@ impl BridgeError {
             BridgeError::BadFormat(m) => format!("bad exact payload: {m}"),
             BridgeError::Binding(m) => format!("binding mismatch: {m}"),
             BridgeError::BadSignature(m) => format!("EIP-3009 signature invalid: {m}"),
-            BridgeError::Ingest(e) => format!("meridian ingest failed: {e}"),
+            BridgeError::Ingest(e) => format!("mist ingest failed: {e}"),
             BridgeError::Journal(m) => format!("replay journal write failed: {m}"),
         }
     }
@@ -186,10 +186,10 @@ pub struct BridgeConfig {
     /// 运营商 owner 种子（secp256k1，签委托）。
     pub owner_seed: [u8; 32],
     /// 垫付委托限额（预算 / 速率 / 类别白名单照常生效）。
-    pub limits: meridian_sdk::DelegationLimits,
+    pub limits: mist_sdk::DelegationLimits,
     /// 真 prover 装配（S-47）：`None` = 占位 prover（缺省，口径逐字节不变）；
     /// `Some` = `SdkClient::with_noir`（§6.14 同源装配）。与 §6.13
-    /// `MERIDIAN_VERIFY_BACKEND` 缺省 `format` 同口径：生产默认不动。
+    /// `MIST_VERIFY_BACKEND` 缺省 `format` 同口径：生产默认不动。
     pub noir: Option<NoirAssembly>,
 }
 
@@ -288,7 +288,7 @@ impl Eip3009Bridge {
         self.journal.is_some()
     }
 
-    /// 完整桥路径：绑定校验 → EIP-712 验签 → 重放闸 → 转投 Meridian 摄取。
+    /// 完整桥路径：绑定校验 → EIP-712 验签 → 重放闸 → 转投 Mist 摄取。
     ///
     /// 返回意图哈希（摄取成功或重放命中）——调用方凭它走 S-30c 的网关回执查询。
     pub fn ingest(
@@ -361,7 +361,7 @@ impl Eip3009Bridge {
         {
             return Ok(*ih);
         }
-        // 5. 转投 Meridian 摄取（垫付模型；全量 DSA 闸口照常生效）。传输失败经
+        // 5. 转投 Mist 摄取（垫付模型；全量 DSA 闸口照常生效）。传输失败经
         //    BridgeError::Ingest(Transport) 上抛 → 调用方 503 fail-closed。
         let memo = eip3009_memo(auth, &sig65);
         let expires_at = auth
@@ -430,9 +430,9 @@ fn register_operator(cfg: &BridgeConfig) -> Result<BridgeClient, SdkError> {
     let client = match &cfg.noir {
         Some(a) => {
             // 工具链不可得 = `E_PROVER`（fail-closed，绝不降级回占位证明，§6.14 口径）；
-            // 经 `Meridian` 变体透传错误码（永不重试），不吞成 Local 文案。
-            let prover = meridian_sdk::prover::NoirProver::from_repo_root(&a.root)
-                .map_err(SdkError::Meridian)?;
+            // 经 `Mist` 变体透传错误码（永不重试），不吞成 Local 文案。
+            let prover =
+                mist_sdk::prover::NoirProver::from_repo_root(&a.root).map_err(SdkError::Mist)?;
             SdkClient::with_noir(wallet, Box::new(transport), prover, a.attestation_secret)
         }
         None => SdkClient::new(wallet, Box::new(transport)),
@@ -764,7 +764,7 @@ mod tests {
     fn open_rebuilds_replay_gate_from_journal_and_counts_bad_lines() {
         // S-33：预置日志（1 好行 + 1 坏行）→ open 重建闸表（坏行跳过计数，不阻断）。
         let p = std::env::temp_dir().join(format!(
-            "meridian-fac-bridge-open-{}-{}.jsonl",
+            "mist-fac-bridge-open-{}-{}.jsonl",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -804,7 +804,7 @@ mod tests {
             domain: domain(),
             agent_seed: [0xAA; 32],
             owner_seed: [0xBB; 32],
-            limits: meridian_sdk::DelegationLimits {
+            limits: mist_sdk::DelegationLimits {
                 max_per_spend: 100_000,
                 rate_window_secs: 60,
                 rate_max_per_window: 100_000,

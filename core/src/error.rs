@@ -1,4 +1,4 @@
-//! Meridian 错误码（TECH_SPEC §11）。
+//! Mist 错误码（TECH_SPEC §11）。
 
 use std::fmt;
 

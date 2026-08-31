@@ -2,15 +2,15 @@
 //!
 //! 用法：
 //! ```text
-//! cargo run --release -p meridian-bench --bin agg_sim                       # 全量验收报告
-//! cargo run --release -p meridian-bench --bin agg_sim -- --check 100000     # B5 验收（≥100k/s）
-//! cargo run --release -p meridian-bench --bin agg_sim -- --check-alloc      # B8 零分配断言
-//! cargo run --release -p meridian-bench --bin agg_sim -- --check-determinism  # B11 确定性断言
-//! cargo run --release -p meridian-bench --bin agg_sim -- --json             # JSON 报告
-//! cargo run --release -p meridian-bench --bin agg_sim -- --gen-fixture      # 重写 s10_fixture.bin
+//! cargo run --release -p mist-bench --bin agg_sim                       # 全量验收报告
+//! cargo run --release -p mist-bench --bin agg_sim -- --check 100000     # B5 验收（≥100k/s）
+//! cargo run --release -p mist-bench --bin agg_sim -- --check-alloc      # B8 零分配断言
+//! cargo run --release -p mist-bench --bin agg_sim -- --check-determinism  # B11 确定性断言
+//! cargo run --release -p mist-bench --bin agg_sim -- --json             # JSON 报告
+//! cargo run --release -p mist-bench --bin agg_sim -- --gen-fixture      # 重写 s10_fixture.bin
 //! ```
 //!
-//! 口径：**生产内核**（`meridian-aggregator`）全管线——验签快路径 → `SpendVerifier`（本阶段
+//! 口径：**生产内核**（`mist-aggregator`）全管线——验签快路径 → `SpendVerifier`（本阶段
 //! `FormatVerifier`，TEMPORARY，与 PoC ② 同口径；诚实边界见 §8.2 注记）→ 预算 → 入窗 →
 //! commitment lattice → 净额。固定输入集快照锁在 `bench/data/s10_fixture.bin`
 //! （params + 批次规范哈希；加载时重生成校验，漂移即报错）。
@@ -22,14 +22,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::lattice;
-use meridian_aggregator::proof::FormatVerifier;
-use meridian_aggregator::wal::Wal;
-use meridian_bench::agg_fixture::{
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::lattice;
+use mist_aggregator::proof::FormatVerifier;
+use mist_aggregator::wal::Wal;
+use mist_bench::agg_fixture::{
     fixture_bytes, load_fixture, AgentFixture, KernelBatch, KernelFixtureParams, MASTER_SEED,
 };
-use meridian_bench::{b7_measure, section_allocs, NoAllocGuard};
+use mist_bench::{b7_measure, section_allocs, NoAllocGuard};
 use rayon::ThreadPool;
 
 // ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ fn b10_batch(
     batch: &KernelBatch,
 ) -> (
     Vec<AgentFixture>,
-    Vec<meridian_aggregator::receipt::IntentEnvelope>,
+    Vec<mist_aggregator::receipt::IntentEnvelope>,
 ) {
     let n_agents = B10_N / DEFAULT_PER_AGENT;
     assert_eq!(n_agents * DEFAULT_PER_AGENT, B10_N);
@@ -91,7 +91,7 @@ fn b11_batch(
     batch: &KernelBatch,
 ) -> (
     Vec<AgentFixture>,
-    Vec<meridian_aggregator::receipt::IntentEnvelope>,
+    Vec<mist_aggregator::receipt::IntentEnvelope>,
 ) {
     let n_agents = B11_N / DEFAULT_PER_AGENT;
     assert_eq!(n_agents * DEFAULT_PER_AGENT, B11_N);
@@ -118,7 +118,7 @@ fn bench_cfg(epoch_capacity: usize, nonce_capacity: usize) -> IngestConfig {
 
 fn tmp_wal(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("meridian-s10d-{tag}-{}.wal", std::process::id()));
+    p.push(format!("mist-s10d-{tag}-{}.wal", std::process::id()));
     let _ = std::fs::remove_file(&p);
     p
 }
@@ -151,10 +151,7 @@ fn new_agg(
 }
 
 /// 封当前窗（时钟拨到 created_at + 60，满足"到时未满也封"）并返回全部已封 epoch。
-fn seal_all(
-    agg: &Aggregator,
-    clock: &Arc<AtomicU64>,
-) -> Vec<meridian_aggregator::ingest::SealedEpoch> {
+fn seal_all(agg: &Aggregator, clock: &Arc<AtomicU64>) -> Vec<mist_aggregator::ingest::SealedEpoch> {
     clock.store(DEFAULT_NOW + 60, Ordering::Relaxed);
     agg.seal_expired(clock.load(Ordering::Relaxed), 10)
 }

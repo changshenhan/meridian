@@ -19,7 +19,7 @@
 //!      `settle_epoch` → `commit(债券)` → `settle(Σnet)` → 过窗 → 逐收款人 `claim`。
 //!
 //! 依赖：forge build 产物（contracts/out/）+ anvil（foundry）+ nargo/bb 工具链
-//! （NoirProver 三层探测，原生或 WSL 兜底）。门控 `MERIDIAN_NOIR_DEMO=1`（verify.sh
+//! （NoirProver 三层探测，原生或 WSL 兜底）。门控 `MIST_NOIR_DEMO=1`（verify.sh
 //! 步 9e）。CI 不跑（noir job 无 anvil、solidity job 无 nargo/bb，§6.15 诚实边界）。
 
 use std::sync::Arc;
@@ -30,13 +30,13 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 
-use meridian_aggregator::bb::{BbBackend, BbVerifier};
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::wal::Wal;
-use meridian_core::error::Error;
-use meridian_sdk::identity::{create_delegation, AgentWallet, DelegationLimits};
-use meridian_sdk::prover::NoirProver;
-use meridian_sdk::{InProcessAggregator, PayParams, SdkClient, SdkError};
+use mist_aggregator::bb::{BbBackend, BbVerifier};
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::wal::Wal;
+use mist_core::error::Error;
+use mist_sdk::identity::{create_delegation, AgentWallet, DelegationLimits};
+use mist_sdk::prover::NoirProver;
+use mist_sdk::{InProcessAggregator, PayParams, SdkClient, SdkError};
 
 use contract_smoke::common::*;
 
@@ -47,8 +47,8 @@ const ATTEST_SECRET_SEED: [u8; 4] = [0xEF, 0xBE, 0xAD, 0xDE];
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::var("MERIDIAN_NOIR_DEMO").as_deref() != Ok("1") {
-        println!("SKIP: MERIDIAN_NOIR_DEMO=1 未设（真电路证明重操作，verify.sh 步 9e 显式开启）");
+    if std::env::var("MIST_NOIR_DEMO").as_deref() != Ok("1") {
+        println!("SKIP: MIST_NOIR_DEMO=1 未设（真电路证明重操作，verify.sh 步 9e 显式开启）");
         return Ok(());
     }
     let mut anvil = spawn_anvil()?;
@@ -107,7 +107,7 @@ async fn run_noir_demo() -> Result<()> {
 
     // ---- 聚合器：BbVerifier + 撤销根绑定闸（S-48：真后端 ⇒ 构造期强制配对）----
     let wal_path =
-        std::env::temp_dir().join(format!("meridian-noir-demo-{}.wal", std::process::id()));
+        std::env::temp_dir().join(format!("mist-noir-demo-{}.wal", std::process::id()));
     let _ = std::fs::remove_file(&wal_path);
     let wal = Wal::open(&wal_path, 1_000).expect("open wal");
     let verifier = BbVerifier::from_parts(vk, backend, root.join("target/bb-demo-noir"));
@@ -152,20 +152,20 @@ async fn run_noir_demo() -> Result<()> {
         .anvil_set_balance(owner_signer.address(), U256::from(ONE_ETH * 100))
         .await
         .context("anvil_setBalance(owner)")?;
-    let owner_key = meridian_core::dsa::owner_signing_key_from_bytes(OWNER_KEY_BYTES);
+    let owner_key = mist_core::dsa::owner_signing_key_from_bytes(OWNER_KEY_BYTES);
     let receipt = client
         .authorize(&owner_key, agent, &limits)
         .expect("authorize");
     // 同一 (owner, agent, nonce=1, limits) 确定性重建 → 同 dh（SDK 内部即同款构造）。
     let sd = create_delegation(&owner_key, agent, receipt.nonce, &limits).expect("delegation");
     assert_eq!(
-        meridian_core::dsa::delegation_hash(&sd.delegation),
+        mist_core::dsa::delegation_hash(&sd.delegation),
         receipt.delegation_hash,
         "重建委托必须与 SDK authorize 的委托同 dh"
     );
     dsa_c
         .registerDelegation(
-            Bytes::from(meridian_core::dsa::delegation_abi(&sd.delegation)),
+            Bytes::from(mist_core::dsa::delegation_abi(&sd.delegation)),
             Bytes::from(sd.signature.0),
         )
         .send()
@@ -177,7 +177,7 @@ async fn run_noir_demo() -> Result<()> {
             .isRegistered(B256::from(receipt.delegation_hash))
             .call()
             .await?,
-        "on-chain sha256(delegationABI) 必须等于 meridian-core delegation_hash"
+        "on-chain sha256(delegationABI) 必须等于 mist-core delegation_hash"
     );
     println!("OK NOIR-DEMO: 装配面 with_noir + BbVerifier(绑定闸开) + authorize + 链上 DSA 登记（dh 交叉核对一致）");
 
@@ -217,7 +217,7 @@ async fn run_noir_demo() -> Result<()> {
         expires_at: limits.expires_at,
     });
     match negative {
-        Err(SdkError::Meridian(Error::EProof)) => {}
+        Err(SdkError::Mist(Error::EProof)) => {}
         other => panic!("占位证明必须被 bb 全拒（E_PROOF），实际 {other:?}"),
     }
     assert_eq!(agg.accepted_count(), 0, "对照组拒绝不记账");

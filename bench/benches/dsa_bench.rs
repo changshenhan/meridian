@@ -1,7 +1,7 @@
 //! DSA 基准（TECH_SPEC §8.2 B1）：delegation 签名/验签、intent 签名/验签。
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use meridian_core::dsa::{self, AgentSigningKey, Delegation, RateLimit, SpendIntent};
+use mist_core::dsa::{self, AgentSigningKey, Delegation, RateLimit, SpendIntent};
 
 fn sample_delegation() -> Delegation {
     Delegation {

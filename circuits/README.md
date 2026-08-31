@@ -55,7 +55,7 @@ S-02 的 Ed25519（NodeId）**保持传输层身份，不改已验收代码**。
 | attestation key | BabyJubJub | 对 `encode_field(intent_hash)` 签 EdDSA（S-09：签名对象 = intent_hash 31B LE 编码，不再是裸 message） | **电路内** `eddsa_verify` |
 
 绑定协议：注册时 `sign_binding(Ed25519_sk, jubjub_pk)`，签名对象 =
-`b"MERIDIAN-BINDING-v1\0" || pub_x_le || pub_y_le`；`agent_commit = sha256(pub_x_le || pub_y_le)`。
+`b"MIST-BINDING-v1\0" || pub_x_le || pub_y_le`；`agent_commit = sha256(pub_x_le || pub_y_le)`。
 绑定验证在**电路外做一次**（`core/src/attestation.rs`），电路只解 `agent_commit` 承诺。
 详见 `core/src/attestation.rs` 头注释与测试。
 

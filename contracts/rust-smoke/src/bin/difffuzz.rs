@@ -14,11 +14,11 @@
 
 use std::path::PathBuf;
 
-use meridian_aggregator::lattice::{abi_encode_net, netting_root, NetLine};
-use meridian_aggregator::merkle::{
+use mist_aggregator::lattice::{abi_encode_net, netting_root, NetLine};
+use mist_aggregator::merkle::{
     acceptance_leaf, inclusion_proof, leaf as merkle_leaf, merkle_root, EMPTY_LEAF,
 };
-use meridian_core::dsa::{
+use mist_core::dsa::{
     delegation_abi, delegation_hash, intent_hash, Delegation, RateLimit, SpendIntent,
 };
 use serde_json::{json, Value};

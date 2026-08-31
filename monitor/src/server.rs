@@ -33,7 +33,7 @@ impl<R: Reporter + ?Sized> Reporter for Box<R> {
 /// 阻塞服务：绑定 `addr`，逐连接处理 `/healthz`、`/metrics`，其余 404。
 pub fn serve(addr: &str, reporter: impl Reporter + Send + Sync + 'static) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    eprintln!("meridian-monitor: http://{addr}  (/metrics /healthz)");
+    eprintln!("mist-monitor: http://{addr}  (/metrics /healthz)");
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         // 请求头很小；读超时防恶意慢连接占线程。
@@ -81,8 +81,8 @@ fn route(request: &str, report: &Report) -> (&'static str, &'static str, String)
 mod tests {
     use super::*;
     use crate::health::evaluate;
-    use meridian_aggregator::health::HealthSnapshot;
-    use meridian_aggregator::hist::LatencySnapshot;
+    use mist_aggregator::health::HealthSnapshot;
+    use mist_aggregator::hist::LatencySnapshot;
 
     fn ok_report() -> Report {
         let s = HealthSnapshot {
@@ -102,7 +102,7 @@ mod tests {
         };
         Report {
             health: evaluate(&s, 42),
-            metrics: "meridian_accepted_total 42\n".to_string(),
+            metrics: "mist_accepted_total 42\n".to_string(),
         }
     }
 
@@ -128,7 +128,7 @@ mod tests {
         let (status, ct, body) = route("GET /metrics HTTP/1.1", &ok_report());
         assert_eq!(status, "200 OK");
         assert!(ct.contains("text/plain"));
-        assert_eq!(body, "meridian_accepted_total 42\n");
+        assert_eq!(body, "mist_accepted_total 42\n");
     }
 
     #[test]

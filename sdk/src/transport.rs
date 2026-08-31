@@ -12,11 +12,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use meridian_aggregator::ingest::{Aggregator, IngestConfig};
-use meridian_aggregator::receipt::{IntentEnvelope, Receipt};
-use meridian_aggregator::wal::Wal;
-use meridian_core::dsa::{AgentPubKey, SignedDelegation};
-use meridian_core::zk::{RevocationWitness, SpendVerifier};
+use mist_aggregator::ingest::{Aggregator, IngestConfig};
+use mist_aggregator::receipt::{IntentEnvelope, Receipt};
+use mist_aggregator::wal::Wal;
+use mist_core::dsa::{AgentPubKey, SignedDelegation};
+use mist_core::zk::{RevocationWitness, SpendVerifier};
 
 use crate::error::{SdkError, TransportError};
 

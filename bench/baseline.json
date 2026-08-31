@@ -1,5 +1,5 @@
 {
-  "suite": "meridian-bench",
+  "suite": "mist-bench",
   "commit": "local",
   "machine": "windows x86_64",
   "metrics": {

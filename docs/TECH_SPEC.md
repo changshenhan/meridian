@@ -1,8 +1,8 @@
-# MERIDIAN — 技术规格书
+# Mist — 技术规格书
 ## L2 DSA 授权原语 + 结算聚合器 · v1.0（Phase 0 定稿版）
 
 > 本规格是**绑定文档**：团队照此写代码。任何偏差须先改本文件、写明理由，再改代码。
-> 对应蓝图：《Meridian_架构蓝图.md》 §3 L2/L3、§6.5 性能信条、§10 行动清单。
+> 对应蓝图：《Mist_架构蓝图.md》 §3 L2/L3、§6.5 性能信条、§10 行动清单。
 > 状态：**Phase 0 定稿（S-08c）**。性能预算表已回填 PoC 实测（§8.2 标注）；
 > 未实测项仍为目标，以 `bench/` 实际测量为准，测量后回填并修订。
 
@@ -40,7 +40,7 @@
 ## 3. 工作区布局（monorepo）
 
 ```
-meridian/
+mist/
   spec/            # 本文件 + 各层规格
   core/            # Rust 核心引擎（lib）
     src/dsa.rs        # Delegation 模型 + 签名验证
@@ -173,7 +173,7 @@ pub trait SpendVerifier {
 }
 ```
 
-> **已实现（S-10，`meridian-aggregator::proof::FormatVerifier`）**：TEMPORARY 后端口径——
+> **已实现（S-10，`mist-aggregator::proof::FormatVerifier`）**：TEMPORARY 后端口径——
 > proof 非空 + `public_inputs` 与 intent 逐字段一致，返回值为登记 ground truth（§9）。
 > S-09 实测真 ZK 单验证 7.62ms → 进 critical path 物理上到不了 100k/s（§5.4 分阶段）；
 > 真实 in-process bb wrapper 是路线图单独交付物（Phase 2），插此接口即可，B5 口径不变。
@@ -513,7 +513,7 @@ pub trait Ingest {
   「path 与 root 自洽」，root 本身可由 prover 自选——绑定闸把公共输入锚到聚合器真实
   出现过的撤销状态，装饰性 ZK（拿空根伪造非成员陈述）收口。**配置开关**
   `IngestConfig::enforce_revocation_root`，缺省 `false`（占位 prover 口径不动：占位
-  witness 的根无语义，默认装配行为逐字节不变——与 §6.13 `MERIDIAN_VERIFY_BACKEND`
+  witness 的根无语义，默认装配行为逐字节不变——与 §6.13 `MIST_VERIFY_BACKEND`
   缺省 `format`、§6.14 缺省 `PlaceholderProver` 同一口径：生产默认不动，真后端显式
   开启）；装配真验证后端（§6.13 `BbVerifier`）时必须同步置 `true`（bb 模式 + 绑定闸
   = 全链真 ZK 的完整形态）。**S-48 起该配对升级为构造保证**：`SpendVerifier::
@@ -645,7 +645,7 @@ pub trait Ingest {
 
 ### 6.6 SDK 集成层（S-12）
 
-独立 agent 进程集成层（`sdk/` crate，`meridian-sdk`）：封装 core 密码学原语 + 聚合器
+独立 agent 进程集成层（`sdk/` crate，`mist-sdk`）：封装 core 密码学原语 + 聚合器
 摄取管线，暴露三个高层操作——`authorize()`（注册委托）/ `pay()`（幂等支付）/
 `attest()`（双钥绑定凭据）。错误码经 `Error::as_code` 透传，供 agent 把拒绝原因原样
 转达上层策略。
@@ -657,7 +657,7 @@ pub trait Ingest {
    ——0 起使每张委托的**首笔支付在真 prover 下必然 `E_PROVER`**（占位 prover 不消费
    nonce、聚合器不要求连续，缺口只在全链路暴露）。聚合器只禁复用（§6.2），1 起与
    已消耗集零冲突。
-2. **仅传输错误**（`SdkError::Transport`）触发重试；聚合器的业务拒绝（`SdkError::Meridian`，
+2. **仅传输错误**（`SdkError::Transport`）触发重试；聚合器的业务拒绝（`SdkError::Mist`，
    错误码透传）**永不重试**。
 3. 聚合器侧幂等（§6.2 幂等重发闸口）兜底重发：断线重发返回先前结果 → 不会把同一笔意图
    记两次（双花），也绝不会把一笔被拒绝的意图透传成成功。
@@ -681,7 +681,7 @@ pub trait Ingest {
 ### 6.7 网络 ingest API（S-29，多租户网关）
 
 S-12 留的传输接缝兑现：外部 agent/数据市场经网络接入聚合器（S-16 集成谈判的硬前置）。
-crate：`meridian-gateway`（`gateway/`）+ `aggregator::wire`（wire DTO 单一来源）+
+crate：`mist-gateway`（`gateway/`）+ `aggregator::wire`（wire DTO 单一来源）+
 `sdk::transport_http::HttpTransport`（agent 侧客户端）。
 
 **形态决策（记录在案）**：std-only 手写 HTTP/1.1 线程网关，**不引入 tokio/axum**——
@@ -930,9 +930,9 @@ S-15 部署清单项）；无指标端点（monitor `server.rs` 独立刮取）�
 
 ### 6.8 x402 适配层 · 客户端（S-30b，docs/x402-adapter.md §2.1）
 
-站位：Meridian 是 **x402 的结算后端**（卖水），不是再造付费协议。本节 = agent 侧
+站位：Mist 是 **x402 的结算后端**（卖水），不是再造付费协议。本节 = agent 侧
 fetch 拦截：标准 x402 资源服务器回 `402` 后，把 `paymentRequirements`（scheme
-`meridian-v1`）映射成 [`SdkClient::pay`] 意图，支付后带 `X-PAYMENT` 头重放请求。
+`mist-v1`）映射成 [`SdkClient::pay`] 意图，支付后带 `X-PAYMENT` 头重放请求。
 crate：`sdk::x402`（std-only，与 crate 其余部分同同步口径）。
 
 **线格式（对齐 x402 v1 惯例；自定义 scheme 起步，上游注册路径跟进后标准化）**：
@@ -940,16 +940,16 @@ crate：`sdk::x402`（std-only，与 crate 其余部分同同步口径）。
 - 402 响应体（消费侧字段，camelCase、金额恒字符串）：`{"x402Version": 1,
   "accepts": [{"scheme", "network", "maxAmountRequired": "<原子单位字符串>",
   "resource": "<URL>", "description", "payTo": "<0x 20B>", "maxTimeoutSeconds",
-  "asset"}]}`。v1 只消费 `scheme == "meridian-v1"` 的条目（多条取首条）；无则
+  "asset"}]}`。v1 只消费 `scheme == "mist-v1"` 的条目（多条取首条）；无则
   `SdkError::Local`（不伪装成其它 scheme 的 client）。
 - `X-PAYMENT` 头（base64url 无 padding 的 JSON，`{"x402Version", "scheme":
-  "meridian-v1", "network", "resource", "payload": {"intentHash": "<0x 32B>",
+  "mist-v1", "network", "resource", "payload": {"intentHash": "<0x 32B>",
   "seq", "spendNonce"}}`）。merchant 验证 = 对网关查 `GET /v1/receipts/{intentHash}`
   （§6.7 S-30a），accepted 即放行——**信封不内嵌**（离线验签是 S-30c facilitator 缝）。
 
 **字段映射（x402 → SpendIntent，docs/x402-adapter.md §3）**：
 
-| x402 字段 | Meridian 字段 | 语义 |
+| x402 字段 | Mist 字段 | 语义 |
 |---|---|---|
 | `payTo` | `intent.recipient` | 0x 20B EVM 地址直通 |
 | `maxAmountRequired` | `intent.amount` | USDC 6 decimals 原子单位直通（字符串解析） |
@@ -974,10 +974,10 @@ v1 不消费（epoch 结算语义下 merchant 对账走网关查询，facilitato
 
 ### 6.9 x402 适配层 · merchant 参考实现（S-30c，docs/x402-adapter.md §2.1 server 侧）
 
-crate `meridian-facilitator`（`facilitator/`）。x402 缺口清单的 merchant 验证面参考
-实现：**受保护资源服务器**如何接 `meridian-v1` 支付——验证逻辑全部落在"对 Meridian
+crate `mist-facilitator`（`facilitator/`）。x402 缺口清单的 merchant 验证面参考
+实现：**受保护资源服务器**如何接 `mist-v1` 支付——验证逻辑全部落在"对 Mist
 网关查回执"，零密码学依赖（S-30a 的查询接口即验证接口）。S-32 起该 crate 另含可选的
-EIP-3009 兼容桥（含 ecrecover，见 §6.10）；本节的"零密码学"指 `meridian-v1` 路径。
+EIP-3009 兼容桥（含 ecrecover，见 §6.10）；本节的"零密码学"指 `mist-v1` 路径。
 
 **形态决策**：std-only 手写 HTTP/1.1（§6.7 同先例，thread-per-connection、单请求
 close 模式）；axum/tokio 虽允许（merchant 侧不在内核热路径）但不必要——参考实现的
@@ -986,7 +986,7 @@ close 模式）；axum/tokio 虽允许（merchant 侧不在内核热路径）但
 **分发逻辑（`Facilitator::handle` 纯分发，单测不经 socket）**：
 
 - `GET /healthz` → `200`；其它路径 = 单一受保护资源（v1）。
-- 无 `X-PAYMENT` → `402` + paymentRequirements JSON（`scheme: meridian-v1`，
+- 无 `X-PAYMENT` → `402` + paymentRequirements JSON（`scheme: mist-v1`，
   wire 类型复用 `sdk::x402` 的 `PaymentRequired`/`PaymentRequirements` Serialize）。
 - 带 `X-PAYMENT` → base64url 解码（`sdk::x402::base64url_decode`，宽容 padding）→
   `PaymentPayload` 解析 → 校验 `scheme` / `network` / `resource` 与配置一致 →
@@ -1007,8 +1007,8 @@ close 模式）；axum/tokio 虽允许（merchant 侧不在内核热路径）但
 ### 6.10 x402 适配层 · EIP-3009 兼容桥（S-32，docs/x402-adapter.md §4 缺口 3）
 
 **问题**：存量 x402 client 只会说标准 `exact` scheme（签 EIP-3009
-`transferWithAuthorization`），不会说 `meridian-v1`。桥 = facilitator 侧把标准
-payload **验签后转投 Meridian 摄取**，merchant 侧零感知（仍是"查网关回执"单一
+`transferWithAuthorization`），不会说 `mist-v1`。桥 = facilitator 侧把标准
+payload **验签后转投 Mist 摄取**，merchant 侧零感知（仍是"查网关回执"单一
 验证面，§6.9 不变）。
 
 **形态**：`facilitator/src/eip3009.rs`（模块 `Eip3009Bridge`）。新增依赖
@@ -1017,7 +1017,7 @@ payload **验签后转投 Meridian 摄取**，merchant 侧零感知（仍是"查
 
 **402 体（双 scheme）**：`accepts[]` 增第二条 `scheme: "exact"` 条目，
 `PaymentRequirements` 增可选 `extra: {name, version}`（serde default + skip——
-EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段不动。
+EIP-3009 域参数，x402 exact 惯例）；`mist-v1` 条目与其余字段不动。
 
 **桥接流程（`X-PAYMENT` scheme == `"exact"` 时）**：
 
@@ -1032,7 +1032,7 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
    `chainId` / `verifyingContract` 来自配置）+ `TransferWithAuthorization`
    typehash → keccak256 → k256 `recover_from_prehash`（v ∈ {0,1,27,28} 宽容）→
    恢复地址（`keccak256(pubkey)[12..32]`）== `from`，否则 402。
-4. **转投 Meridian 摄取（垫付模型）**：facilitator 以自身身份（`AgentWallet` +
+4. **转投 Mist 摄取（垫付模型）**：facilitator 以自身身份（`AgentWallet` +
    owner key，均来自配置种子）经 `SdkClient::authorize` 注册一张委托（限额来自
    配置，惰性首用注册），随后 `SdkClient::pay` 桥接意图：`recipient = to`、
    `amount = value`、`category = sha256(host + path)`（§6.8 同映射）、
@@ -1047,9 +1047,9 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
    prover，缺省口径逐字节不变；`Some(NoirAssembly { root, attestation_secret })` =
    `NoirProver::from_repo_root(root)` + `SdkClient::with_noir`，§6.14 同源装配——垫付
    client 的 prove 后端与 attestation keyring 同一实例同一 secret）。缺省占位与
-   §6.13 `MERIDIAN_VERIFY_BACKEND` 缺省 `format`、§6.14 缺省 `PlaceholderProver`
-   同口径：生产默认不动，真后端显式开启。bin 侧 `MERIDIAN_BRIDGE_NOIR=1` +
-   `MERIDIAN_BRIDGE_NOIR_ROOT`（缺省 `.`）+ `MERIDIAN_BRIDGE_ATTEST_SECRET`
+   §6.13 `MIST_VERIFY_BACKEND` 缺省 `format`、§6.14 缺省 `PlaceholderProver`
+   同口径：生产默认不动，真后端显式开启。bin 侧 `MIST_BRIDGE_NOIR=1` +
+   `MIST_BRIDGE_NOIR_ROOT`（缺省 `.`）+ `MIST_BRIDGE_ATTEST_SECRET`
    （0x 32B hex，启用时必填——熵由调用方供给，SDK 不生成随机熵，§6.14 诚实边界 2）；
    启动期检查 root 下 `gen-witness/` 与 `circuits/` 存在（fail-fast，配置错误启动即
    暴露，同缺种子 panic 口径），工具链探测仍惰性（首次 `pay()` 时
@@ -1063,8 +1063,8 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
 
 - **EIP-3009 的链上执行不在本件**（不调 `transferWithAuthorization`）——client
   → 运营商的清算是运营商侧账务（`memo` 指纹 + 原始 payload 留档），merchant
-  收到的是 Meridian 净额。桥只做"验签 + 摄取"，不碰资产。
-- **垫付模型**：被消费的是运营商自己的 Meridian 预算——client 信用风险由白标
+  收到的是 Mist 净额。桥只做"验签 + 摄取"，不碰资产。
+- **垫付模型**：被消费的是运营商自己的 Mist 预算——client 信用风险由白标
   合同承担（§4.2 受理凭证同口径），不是协议层担保。
 - **重放闸持久化（S-33，2026-08-30）**：S-32 的重放闸是进程内存态（重启丢失后同一
   EIP-3009 payload 可能再次摄取，双花的是运营商自身预算）。S-33 收口：`facilitator/src/replay.rs`
@@ -1074,7 +1074,7 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
   坏行（崩溃撕裂 / 损坏）跳过并计数（`skipped_journal_lines()` 可观测，不阻断重启）。
   日志写失败 → `BridgeError::Journal` → **503 fail-closed**（`E_REPLAY_JOURNAL`，运维故障
   不归罪 client；内存表已登记，client 重试命中重放闸不重复摄取）。
-  bin 经 `MERIDIAN_BRIDGE_REPLAY_JOURNAL` 启用（缺省仍进程内存态，v0 兼容）。
+  bin 经 `MIST_BRIDGE_REPLAY_JOURNAL` 启用（缺省仍进程内存态，v0 兼容）。
   **诚实边界（残余）**：① 落盘失败时意图**已摄取**而登记不可持久化——响应 503 但本进程
   内存闸已挡重放，跨进程重复摄取的概率限于磁盘故障窗口；② 日志随桥接笔数线性增长
   （EIP-3009 `nonce` 每笔天然唯一，无重复键可压实；参考实现不设轮转/归档，运维侧按需处理）。
@@ -1082,7 +1082,7 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
   `"2"` / chainId 8453 / `0x8335…2913`），v1 不做域自动发现（`eip712Domain`
   扩展随上游演进）。
 - EIP-3009 `nonce` 不查 USDC 合约状态（不提交链上，无需）；`value` 以 u64 直通
-  Meridian `Amount`（超上限即拒，见 2）。
+  Mist `Amount`（超上限即拒，见 2）。
 
 **验收**：模块单测（EIP-712 digest 构造 / ecrecover 往返 / 坏 v / 冒充 from /
 `to` / `value` 不符 / 时间窗 / 超额）+ `handle` 纯分发单测（exact 路径绑定与
@@ -1090,11 +1090,11 @@ EIP-3009 域参数，x402 exact 惯例）；`meridian-v1` 条目与其余字段�
 重放同 payload → 200 且不再摄取；伪造签名 / `to` 不符 / 过期 → 402）。
 **S-33 增量**：`replay.rs` 单测（append/重载往返、坏行跳过计数、缺文件建空）+
 `Eip3009Bridge::open` 重建单测（预置日志 → 闸表命中 / 坏行计数）+ 真 socket e2e
-（facilitator 带 `MERIDIAN_BRIDGE_REPLAY_JOURNAL` 摄取 1 笔 → **销毁重建**（同日志路径）
+（facilitator 带 `MIST_BRIDGE_REPLAY_JOURNAL` 摄取 1 笔 → **销毁重建**（同日志路径）
 → 同 payload 重放 200 且 `accepted_count` 不变（重启后重放闸仍命中）；新 nonce 正常摄取
 （闸不误挡））。
 **S-47 增量**：`BridgeConfig.noir` 装配单测（缺省 `None` 口径逐字节不变 / noir 装配
-`config()` 投影）+ 门控 e2e（`MERIDIAN_ZK_PROVER_E2E=1`，与 §6.14 9c 同门同工件）：
+`config()` 投影）+ 门控 e2e（`MIST_ZK_PROVER_E2E=1`，与 §6.14 9c 同门同工件）：
 真 BbVerifier 网关（`enforce_revocation_root = true`）+ noir 装配桥摄取 1 笔 →
 真电路证明经 `with_noir` 垫付 client 产出并被聚合器密码学接受（占位证明在 bb 模式下
 必被全拒，§6.13——e2e 通过本身即证装配生效），重放同 payload 落重放闸不再摄取。
@@ -1125,9 +1125,9 @@ S-15 立「不在热路径埋点」的口径时把 p99 挂账为「后续按需�
 - `sum_us` 用 u64 微秒整数累加（亚微秒部分归桶 0 不进和）——`_sum` 是下界口径。
 
 **导出（`monitor/src/metrics.rs`）**：Prometheus histogram 家族
-`meridian_submit_duration_seconds_bucket{le=...}`（32 个有限 `le` 升序 +
+`mist_submit_duration_seconds_bucket{le=...}`（32 个有限 `le` 升序 +
 `+Inf`，累计语义）/ `_sum` / `_count`（`# TYPE ... histogram`），外加预计算的
-`meridian_submit_duration_p99_seconds` gauge（Grafana 直用；精确分位数请在
+`mist_submit_duration_p99_seconds` gauge（Grafana 直用；精确分位数请在
 Grafana 侧对 `_bucket` 跑 `histogram_quantile`）。`le` 值以秒记（`2^i μs = 2^(i-6) s`）。
 
 **性能账（B5/B6/B8 复测口径）**：埋点代价 = 每次 `submit` 两次 `Instant::now()` +
@@ -1136,7 +1136,7 @@ Grafana 侧对 `_bucket` 跑 `histogram_quantile`）。`le` 值以秒记（`2^i 
 ### 6.12 多实例集群指标聚合（S-39，ops.md §6 挂账项收口）
 
 S-15 起 monitor 只盯一个 WAL；§1 拓扑的「聚合器实例（多实例，热备）+ WAL 副本」部署形态
-缺一个聚合视图。本节兑现：`meridian-monitor --wal <path>` **可重复传**（N ≥ 1），单进程
+缺一个聚合视图。本节兑现：`mist-monitor --wal <path>` **可重复传**（N ≥ 1），单进程
 逐副本 `restore_from_wal`，一个 `/metrics` + `/healthz` 端点服务整个副本组。
 
 **口径决策（记录在案）**：本件聚合的语义是**热备副本组**——N 个 WAL 是同一逻辑账本的
@@ -1153,21 +1153,21 @@ S-15 起 monitor 只盯一个 WAL；§1 拓扑的「聚合器实例（多实例�
   `(accepted_count, revoked_len, revocation_root)` 三元组逐一相等（账本推进 + 撤销承诺
   都收敛），否则 degraded。**无「可调滞后阈值」**——相等即滞后 0，容忍「落后 N 笔」会把
   账本分歧常态化（fail-closed）；异步副本复制（跨机）部署的滞后告警走
-  `meridian_cluster_replica_lag` gauge 阈值（§8.3 口径：告警阈值属运营配置，健康判定不放宽）。
+  `mist_cluster_replica_lag` gauge 阈值（§8.3 口径：告警阈值属运营配置，健康判定不放宽）。
 
 **指标（`monitor/src/cluster.rs::cluster_samples`，集群 gauge 不带 `instance` label）**：
 
 | 指标 | 口径 |
 |---|---|
-| `meridian_cluster_instances` | 被监控副本数（`--wal` 个数） |
-| `meridian_cluster_accepted_total` | 副本间 accepted_count **max**（热备组同一逻辑账本，最新推进副本；求和会双计） |
-| `meridian_cluster_replica_lag` | 副本间 accepted_count max−min（备份滞后笔数，0 = 收敛） |
-| `meridian_cluster_pending_sealed` | 副本间最差结算滞后（max，取最差副本） |
+| `mist_cluster_instances` | 被监控副本数（`--wal` 个数） |
+| `mist_cluster_accepted_total` | 副本间 accepted_count **max**（热备组同一逻辑账本，最新推进副本；求和会双计） |
+| `mist_cluster_replica_lag` | 副本间 accepted_count max−min（备份滞后笔数，0 = 收敛） |
+| `mist_cluster_pending_sealed` | 副本间最差结算滞后（max，取最差副本） |
 
 **实例标签（诚实边界）**：N > 1 时每副本样本的 `instance` label = **WAL 文件名（stem）**
-——快照里的 `instance_id` 是 `meridian-<monitor 进程 pid>`（§4.1 口径），同一 monitor 进程
+——快照里的 `instance_id` 是 `mist-<monitor 进程 pid>`（§4.1 口径），同一 monitor 进程
 恢复 N 个副本会同值，Prometheus 序列会撞。N = 1 时保持 `instance = <instance_id>` 既有
-行为（Grafana 面板 `label_values(meridian_instance_info, instance)` 不变）。多副本模式要求
+行为（Grafana 面板 `label_values(mist_instance_info, instance)` 不变）。多副本模式要求
 各 WAL 文件名互异（启动即报错退出，不猜）。
 
 **实现（`monitor/src/bin/main.rs`）**：`ReplicaScrape`（每副本聚合器 + 独立 WAL Intent
@@ -1212,12 +1212,12 @@ S-10 起摄取路径验证证明用 `FormatVerifier`（TEMPORARY，proof 非空�
 （运营可见），**绝不静默降级回格式校验**（静默降级 = 安全事故）。
 
 **后端解析（三层，探测逻辑与 §8.3 verify.sh 第 9 步同款）**：① Windows 原生 bb
-（`MERIDIAN_BB_BIN` 覆盖路径）→ ② WSL2 兜底（`MERIDIAN_WSL_DISTRO` 缺省 MeridianUbuntu，
+（`MIST_BB_BIN` 覆盖路径）→ ② WSL2 兜底（`MIST_WSL_DISTRO` 缺省 MeridianUbuntu，
 Windows 路径经 `/mnt/<盘>/` 转换后进 WSL 调 bb）→ ③ 皆无 → **构造期报错**（bin 启动即退，
 不落运行时半可用态）。
 
-**接线**：`meridian-gateway` 环境变量 `MERIDIAN_VERIFY_BACKEND=format|bb`（**缺省 format**，
-生产默认口径本件不动）+ `MERIDIAN_BB_VK`（vk 文件路径，bb 模式必填、无缺省）。bench / perf
+**接线**：`mist-gateway` 环境变量 `MIST_VERIFY_BACKEND=format|bb`（**缺省 format**，
+生产默认口径本件不动）+ `MIST_BB_VK`（vk 文件路径，bb 模式必填、无缺省）。bench / perf
 gate 口径不变（FormatVerifier，§8.2 吞吐基线不回填）。**装配配对闸（S-48）**：bb 模式下
 证明公共输入 `revocation_root` 有密码学语义，网关 bin 同步置
 `IngestConfig::enforce_revocation_root = true`（§6.2 绑定闸，S-40 本件当时漏配——bin 接线
@@ -1230,13 +1230,13 @@ gate 口径不变（FormatVerifier，§8.2 吞吐基线不回填）。**装配�
 fail-closed 错误码）+ e2e（`aggregator/tests/bb_verify_e2e.rs`）：从 `circuits/Prover.toml`
 **手工重建**公共输入（第三实现，不读 bb 的 public_inputs 文件——防止序列化器抄自己的答案），
 配 `circuits/target/{proof,vk}` 真工件跑四案——真证明接受 / 篡改 proof 拒 / 篡改 pi 拒 /
-pi 与信封不一致拒。e2e 由 `MERIDIAN_BB_E2E=1` 门控：verify.sh 第 9 步 formal_zk 产出新鲜
+pi 与信封不一致拒。e2e 由 `MIST_BB_E2E=1` 门控：verify.sh 第 9 步 formal_zk 产出新鲜
 工件后第三 run 拉起；CI noir job formal 之后同款（ubuntu 原生 bb，走 Windows 原生分支语义）。
 
 **诚实边界**：
 
 1. **只收口验证侧，prove 侧 S-43 收口（§6.14）**：SDK 生产路径的 proof 仍来自
-   `PlaceholderProver`（格式占位）——`MERIDIAN_VERIFY_BACKEND=bb` 开启后这些 proof
+   `PlaceholderProver`（格式占位）——`MIST_VERIFY_BACKEND=bb` 开启后这些 proof
    **会被全拒**（fail-closed 的正确行为，不是 bug）；真 prover（agent 侧 S-09 电路 prove）
    实现 core `SpendProver`（`NoirProver`，§6.14），**默认装配仍为占位后端**（两侧真后端都
    经显式配置开启才算全链真 ZK）。e2e 用 CLI 管线真产物实证密码学通路。
@@ -1254,7 +1254,7 @@ pi 与信封不一致拒。e2e 由 `MERIDIAN_BB_E2E=1` 门控：verify.sh 第 9 
 
 ### 6.14 真 prover（S-43，agent 侧 `NoirProver`，prove 侧 TEMPORARY 缝收口）
 
-§6.13 诚实边界 1 兑现：SDK 侧真电路证明生成。`meridian-sdk::prover::NoirProver` 实现
+§6.13 诚实边界 1 兑现：SDK 侧真电路证明生成。`mist-sdk::prover::NoirProver` 实现
 core `SpendProver`，六步链路——Rust 只做纯字节逻辑与进程编排，**一切曲线数学（BJJ 标量乘、
 Poseidon）留在 Noir**（S-05 教训守住）。
 
@@ -1303,8 +1303,8 @@ Poseidon）留在 Noir**（S-05 教训守住）。
    比对 → `SpendProof`。
 
 **工程口径**：prove 全程进程级互斥（`Mutex`）——`ProverSDK.toml` 落在包目录，并发证明
-串行化（证明是重操作，可接受）；工具链解析复用 §6.13 三层探测语义（`MERIDIAN_BB_BIN` /
-`MERIDIAN_NARGO_BIN` → PATH → WSL2 兜底 `MERIDIAN_WSL_DISTRO`，Windows 路径经 `/mnt/<盘>/`
+串行化（证明是重操作，可接受）；工具链解析复用 §6.13 三层探测语义（`MIST_BB_BIN` /
+`MIST_NARGO_BIN` → PATH → WSL2 兜底 `MIST_WSL_DISTRO`，Windows 路径经 `/mnt/<盘>/`
 转换），皆不可得 `E_PROVER`。
 
 **keygen（S-46，attestation 同源，诚实边界 2 收口）**：`NoirProver::attestation_pubkey(secret)`
@@ -1322,12 +1322,12 @@ Noir**（S-05 教训守住）。装配：`SdkClient::with_noir(wallet, transport
 的 `agent_commit` 与 `pay()` 证明公共输入 `agent_commit` **同一 secret 单一来源**，
 「由调用方保证」的接缝关闭（e2e 实证相等）。`attest(&pk)` 显式口径保留（离线 / 外部
 注册流，如 mcp-server）。**CLI 消费（S-47）**：facilitator EIP-3009 桥垫付 client
-经 `BridgeConfig.noir`（bin `MERIDIAN_BRIDGE_NOIR=1`）接入同一装配——S-46 装配面
+经 `BridgeConfig.noir`（bin `MIST_BRIDGE_NOIR=1`）接入同一装配——S-46 装配面
 的首个二进制消费方（§6.10 第 4 步），`pay()` 的证明公共输入 `agent_commit` 与潜在
 `attest_identity()` 同 secret 单一来源由构造保证；缺省占位不变（口径同上）。
 
 **验收测试**：单测（scalar golden + 边界、十进制互转、Prover.toml 组装形状、路径重算根）
-+ e2e（`sdk/tests/noir_prover_e2e.rs`，`MERIDIAN_ZK_PROVER_E2E=1` 门控）：真实场景
++ e2e（`sdk/tests/noir_prover_e2e.rs`，`MIST_ZK_PROVER_E2E=1` 门控）：真实场景
 （SDK 建委托/意图 + 聚合器 `RevocationSet` 含真实撤销条目 → `non_membership_witness`）→
 `NoirProver.prove` → `BbVerifier.verify` **密码学接受**（prove × verify 两侧真后端首次
 闭环）；负向：篡改 proof 拒 / 篡改公共输入拒。**S-46 同源全链**（同文件同门控）：
@@ -1341,7 +1341,7 @@ Noir**（S-05 教训守住）。装配：`SdkClient::with_noir(wallet, transport
 **诚实边界**：
 
 1. **SDK 默认 prover 不切换**：`SdkClient::new` 仍装配 `PlaceholderProver`，`NoirProver`
-   经 `SdkClient::with_prover` 显式接入（与 §6.13 `MERIDIAN_VERIFY_BACKEND` 缺省 format
+   经 `SdkClient::with_prover` 显式接入（与 §6.13 `MIST_VERIFY_BACKEND` 缺省 format
    同口径——生产默认不动，两侧真后端都开才算全链真 ZK）。每笔证明 = 三次子进程
    （oracle execute + 电路 execute + bb prove，B2 ~0.43s 量级），成本口径见 §5.5；
    100μs/笔 目标仍归递归聚合（§5.4 Phase 2）。
@@ -1376,7 +1376,7 @@ Noir**（S-05 教训守住）。装配：`SdkClient::with_noir(wallet, transport
 §6.13/§6.14 的装配面（SDK `with_noir`、网关 bb、桥 noir 装配）此前的实证都在 **crate e2e
 测试**里；demo/smoke 层（`contracts/rust-smoke` 的 Anvil 端到端）仍只有占位 ZK 缝
 （`m1_demo` A 段）。本件补 demo 层真 ZK 装配示例：`contracts/rust-smoke/src/bin/noir_demo.rs`
-（独立 workspace 新 bin，`MERIDIAN_NOIR_DEMO=1` 门控，verify.sh 步 9e）——**真电路证明 →
+（独立 workspace 新 bin，`MIST_NOIR_DEMO=1` 门控，verify.sh 步 9e）——**真电路证明 →
 真验证后端 + 撤销根绑定闸 → 链上净额结算，撤销根三方同源**的 M1 形态首次走通：
 
 1. **装配面（§6.14 全套，demo 即可运行的装配答案）**：`SdkClient::with_noir(wallet,
@@ -1385,7 +1385,7 @@ Noir**（S-05 教训守住）。装配：`SdkClient::with_noir(wallet, transport
    §6.13/§6.2/§6.14 同口径；S-48 构造期配对闸在此生效）。
 2. **授权上下文**：`client.authorize()`（S-46 NonceManager 1 起口径）→ `create_delegation`
    同参数重建同 dh（assert 相等）→ 链上 `DSA.registerDelegation`，`isRegistered(dh)`
-   断言 **sha256(delegationABI) == meridian-core delegation_hash**（m1_demo 同款交叉实现
+   断言 **sha256(delegationABI) == mist-core delegation_hash**（m1_demo 同款交叉实现
    契约，S-11d）。
 3. **撤销根三方同源断言（本件核心）**：聚合器 `revoke(另一委托)`（撤销集非空，绑定闸
    接受集含真实状态根）→ `pay()` 现取 witness（S-45）→ 证明公共输入 `revocation_root`
@@ -1425,7 +1425,7 @@ verify.sh 专属），本地参考机全量实证。
    （§6.7：客户端提交信封、服务器验证记账），MCP 层从「自证自验的占位闭环」升级为
    「验证面真 ZK + 证明来源外置」。
 
-**线格式（`meridian.pay` 入参新增 optional `proof` 对象）**：
+**线格式（`mist.pay` 入参新增 optional `proof` 对象）**：
 
 ```json
 { "proof_hex": "<bb UltraHonk 证明字节，hex>",
@@ -1439,19 +1439,19 @@ verify.sh 专属），本地参考机全量实证。
 `revocation_root`（客户端所锚定的撤销状态）、`now`（证明时刻）。缺省 `proof` 缺席 =
 服务器占位证明（`build_proof`，占位口径**逐字节不变**）——向后兼容，存量框架无感。
 
-**装配面（`meridian-mcp` bin，网关 bin 同款）**：`MERIDIAN_VERIFY_BACKEND`（缺省
+**装配面（`mist-mcp` bin，网关 bin 同款）**：`MIST_VERIFY_BACKEND`（缺省
 `format` 口径不变；`bb` → `BbVerifier::from_env`，工具链不可得**启动即退** fail-closed）
 + S-48 构造期配对闸（`requires_revocation_root_binding()` ⇒ `enforce_revocation_root =
 true`）。bb 模式下占位证明 / 派生错位 / 篡改任一公共输入 = 密码学拒 `E_PROOF`。
 
-**新工具 `meridian.revocation_witness`（第 6 个工具）**：客户端构建真证明所需的**唯一
+**新工具 `mist.revocation_witness`（第 6 个工具）**：客户端构建真证明所需的**唯一
 服务器侧事实**——S-45 网关 `GET /v1/revocation-witness/{dh}` 的 MCP 面（`root` 64hex +
 `path` 256×32B 扁平 hex = 16384 字符，MCP 面首次大载荷）；已撤销 → `E_REVOKED`
 （§11 同码）。没有它，MCP 客户端拿不到非成员路径，真证明无从谈起。
 
 **测试**：`mcp_flow` +3（直通证明被验证器**真实消费**——`RejectAllVerifier` 对照组
 `E_PROOF`，服务器绝不偷偷换成自己的占位；缺省口径占位不变；witness 工具正/负向）+
-门控 e2e `MERIDIAN_MCP_NOIR_E2E=1`（`mcp-server/tests/mcp_noir_e2e.rs`：客户端侧
+门控 e2e `MIST_MCP_NOIR_E2E=1`（`mcp-server/tests/mcp_noir_e2e.rs`：客户端侧
 `NoirProver` 真电路证明 → MCP `pay` 工具 → `BbVerifier` + 撤销根绑定闸聚合器接受；
 对照组：同一聚合器上占位 `pay` 必拒 `E_PROOF`）。verify.sh **9f** + CI noir job 同款。
 
@@ -1462,7 +1462,7 @@ MCP 面单笔载荷 ~20KB（吞吐口径不适用于 MCP 面）；WAL 不落证�
 固定 116B payload，§10），直通不影响 WAL 格式与恢复语义。
 
 **框架 demo 面（S-53，候选⑨收口）**：`demos/` 三框架脚本（LangChain / AutoGen /
-ElizaOS，S-13b 同一闭环）在 `authorize` 之后加入 `meridian.revocation_witness` 步——
+ElizaOS，S-13b 同一闭环）在 `authorize` 之后加入 `mist.revocation_witness` 步——
 回执形状自检（`root` 64 hex + `path` 256×32B 扁平 = 16384 hex 字符 + 回执
 `delegation_hash` 与本地重算逐字节一致），三个框架逐字节同口径。诚实边界：`pay` 的
 optional `proof` 直通**不在框架脚本演示范围**——真电路证明需要 nargo/bb 工具链（§5.3），
@@ -1754,8 +1754,8 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
   S-59 fanout 客户端同款形态；serde_json 编解码），读 `DSA.operatorOf(bytes32)`——
   calldata = `selector + 32B dh`，返回 32B ABI 编码取低 20B。RPC error / 短返回 /
   非 32B 返回一律 Err（fail-closed 上抛成 `E_BIND_BACKEND`）。
-- bin 装配 fail-fast：`MERIDIAN_RPC_URL` + `MERIDIAN_DSA_ADDRESS` +
-  `MERIDIAN_SELF_OPERATOR` **三者同给同不给**——只给其一启动即退（半装配 = 闸语义
+- bin 装配 fail-fast：`MIST_RPC_URL` + `MIST_DSA_ADDRESS` +
+  `MIST_SELF_OPERATOR` **三者同给同不给**——只给其一启动即退（半装配 = 闸语义
   不明的静默降级面）。url 只收 `http://host:port`（std-only 无 TLS，§6.7 口径）；
   地址收 `0x` + 20B hex。启动日志 `operator binding: on(<addr>)|off`。
 - **诚实边界**：绑定的实时性 = RPC 节点的事实（读的是最新已确认状态，无最终性/
@@ -1940,7 +1940,7 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 
 - **部署顺序**（构造参数依赖链）：DSA(无参) → RevocationRegistry(DSA) →
   OperatorRegistry(registrar = operator) → `appendSchedule`（初始调度，金额取
-  `MERIDIAN_BOND` / `MERIDIAN_CHALLENGE_BOND`，缺省 1 ETH / 0.1 ETH）→
+  `MIST_BOND` / `MIST_CHALLENGE_BOND`，缺省 1 ETH / 0.1 ETH）→
   BatchSettler(operator, asset, challengeBond ← `currentSchedule()` 读数) →
   `registerOperator(settler)`。
 - **顺带修复 deploy.rs 潜伏缺陷**：S-50 把 BatchSettler 构造改为三参后，`deploy.rs` 仍传
@@ -1992,7 +1992,7 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 2. **在押债券不走「事件差」。** voided epoch 的债券金额不在任何事件里
    （`ChallengeSucceeded` 只带 epochId/challenger/kind），`Σcommit − Σclaimed − Σvoided_bond`
    的第三项不可得，事件差是**结构性高估**——不做。合同余额是链上事实，暴露
-   `meridian_operator_contract_balance_wei`，help 注明构成（在押债券 + 未领取结算资金 +
+   `mist_operator_contract_balance_wei`，help 注明构成（在押债券 + 未领取结算资金 +
    未领取挑战者押金退款 / 结算留存），不做「净债券」的假装精确。事件侧同时暴露
    `bond_committed_wei`（Σ `Commit.bondedAmount`，债券承诺累计上界）与
    `bond_claimed_wei`（Σ `Claimed.amount`，运营者已领取额）两个互补口径。
@@ -2003,7 +2003,7 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
    零值序列（「无数据」≠「零罚没」，零值序列会被刮取告警误读成清白证明）。两参同给同不给，
    半装配启动即退（§6.19.3 同款）。单实例单 settler：分片模型无全局账本视图，monitor 只能
    按运营者分别聚合（§6.17.4），多运营者 = 多 monitor 实例。
-5. **读失败 fail-visible，绝不清零。** 抓取 Err → `meridian_operator_chain_read_ok 0`，
+5. **读失败 fail-visible，绝不清零。** 抓取 Err → `mist_operator_chain_read_ok 0`，
    保留上一次成功快照继续渲染（把指标清零会被误读为「罚没归零」= 洗白方向的假信号）；
    从未成功过 → 只渲染 `chain_read_ok 0`，无其他声誉序列。链上读面失败**不**拉低
    `/healthz`（healthz 是账本健康面 §6.12；两者告警分离，ops.md 告警表单列一行）。
@@ -2018,14 +2018,14 @@ P2-1/P2-5 无合约改动，不触碰冻结面。
 
 | 指标 | 来源 | 说明 |
 |---|---|---|
-| `meridian_operator_epochs_committed_total` | `Commit` 事件计数 | 已提交 epoch 数（含后被 voided 的） |
-| `meridian_operator_epochs_settled_total` | `Settled` 事件计数 | 已结算 epoch 数 |
-| `meridian_operator_slash_total` | `ChallengeSucceeded` 计数 | 罚没次数（= voided epoch 数） |
-| `meridian_operator_slash_kind_total{kind}` | `ChallengeSucceeded` 按 kind | 罚没 kind 分解 |
-| `meridian_operator_bond_committed_wei` | Σ `Commit.bondedAmount` | 债券承诺累计（在押上界） |
-| `meridian_operator_bond_claimed_wei` | Σ `Claimed.amount` | 运营者已领取额 |
-| `meridian_operator_contract_balance_wei` | `eth_getBalance` | 合约余额（构成见定夺 2） |
-| `meridian_operator_chain_read_ok` | 抓取健康 | 1 = 本轮抓取成功 / 0 = 失败（保留旧值） |
+| `mist_operator_epochs_committed_total` | `Commit` 事件计数 | 已提交 epoch 数（含后被 voided 的） |
+| `mist_operator_epochs_settled_total` | `Settled` 事件计数 | 已结算 epoch 数 |
+| `mist_operator_slash_total` | `ChallengeSucceeded` 计数 | 罚没次数（= voided epoch 数） |
+| `mist_operator_slash_kind_total{kind}` | `ChallengeSucceeded` 按 kind | 罚没 kind 分解 |
+| `mist_operator_bond_committed_wei` | Σ `Commit.bondedAmount` | 债券承诺累计（在押上界） |
+| `mist_operator_bond_claimed_wei` | Σ `Claimed.amount` | 运营者已领取额 |
+| `mist_operator_contract_balance_wei` | `eth_getBalance` | 合约余额（构成见定夺 2） |
+| `mist_operator_chain_read_ok` | 抓取健康 | 1 = 本轮抓取成功 / 0 = 失败（保留旧值） |
 
 全部 gauge（crate 既有口径：计数语义由刮取器按增量处理，不加 counter 语义误导）。
 wei 值经 f64 渲染，> 2^53 按浮点舍入（help 注明）。
@@ -2219,7 +2219,7 @@ P2-1 演练（§6.18）三幕已产出真实链上事件（3 commit / 3 settle /
    serde default + `skip_serializing_if`——缺省 None 时序列化逐字节不变）。字段
    `rpc_url` + `registry_address`（20B hex，必填）+ `poll_interval_ms`（缺省 15000，
    显式给 0 拒——轮询间隔 0 = 打死 RPC）。不用 env：观察面是部署拓扑配置（与
-   `revocation_peers` 同面）；不复用绑定闸 `MERIDIAN_RPC_URL`：绑定闸「三同给同不给」
+   `revocation_peers` 同面）；不复用绑定闸 `MIST_RPC_URL`：绑定闸「三同给同不给」
    的半装配语义与观察面装配无关，纠缠只会制造「配了绑定忘了 watch」的静默漏配。
    url 只收 `http://host:port`（std-only 无 TLS，§6.7 口径）。
 7. **日志解析防线：topic0 + 日志地址双重校验**。topic0 = `keccak("Revoked(bytes32,address)")`
@@ -2401,7 +2401,7 @@ kind1/2/3 的欺诈证明**不关心谁 commit，只关心承诺根 / 净额与�
    运营者今天就能提交错误根，模型容忍它发生，靠挑战窗口 + 罚没收口。BFT 的卖点（密码学
    预防分叉）买的是本仓已经用别的方式买到的东西（错误内容人人可零信任复算、可罚），而
    它的成本（3f+1、视图更换、正确性论证量级——决策 A 理由 1）是纯增量。
-2. **确定性账本把「验证」成本打到零**。BFT 需要预防的恶意提案，在 Meridian 里可被任何
+2. **确定性账本把「验证」成本打到零**。BFT 需要预防的恶意提案，在 Mist 里可被任何
    副本零信任复算拒绝——当检测免费时，预防的边际价值就是检测的价值。乐观形态 = 提案 →
    各写者 apply + 复算 → 达标者签名 → 阈值聚合 QC → commit。作恶门槛从今天单运营者模型
    的「1 方拜占庭即可」抬到「quorum 拜占庭」，**不是回退**。
@@ -2496,7 +2496,7 @@ kind1/2/3 的欺诈证明**不关心谁 commit，只关心承诺根 / 净额与�
    （重放面仅计数用，如实标注）。重复投递的意图由 `try_commit` 的 S-12 幂等性天然吸收
    （返回既有 seq，不重复扣预算、不重复分配 seq）。
 5. **`state_digest()` = 副本收敛检查的可执行形态**：sha256（域分隔符
-   `MERIDIAN-APPLY-DIGEST-V1`）over **全键排序**的规范序列化——注册表（dh 升序 +
+   `MIST-APPLY-DIGEST-V1`）over **全键排序**的规范序列化——注册表（dh 升序 +
    `delegation_hash(delegation)` 作内容指纹 + agent_pub）、分片账本（dh 升序 →
    budget 四域 + nonce 升序 → (nonce, intent_hash, 裁决码 `Error::as_code()`)）、
    seq 计数、撤销集（dh 升序）、撤销根接受集（升序）、意图索引（ih 升序）、当前窗
@@ -2691,7 +2691,7 @@ contract BatchSettler {
 **关键契约（S-06 交叉实现）**：`registerDelegation` 在链上重算
 `delegation_hash = sha256(delegationABI)`，owner 解析自 ABI 字节区间 `[26:46]`
 （`"DSAv1\0"` 前缀 + agent + owner，canonical 编码见 `core/src/dsa.rs`）。
-链下 meridian-core 的 `delegation_hash` 必须与之一致（Rust `sha2` ↔ Solidity
+链下 mist-core 的 `delegation_hash` 必须与之一致（Rust `sha2` ↔ Solidity
 `sha256` 预编译，双向验收）。owner 签名强制低位 s（`s > n/2` → `revert HighS`）。
 
 - 部署底座：Base（主网 Phase 2 起）；测试：Anvil 本地链 + Base Sepolia。
@@ -2784,7 +2784,7 @@ contract BatchSettler {
 ### 8.3 可复现与验证门禁
 
 - **主门禁 = 本地流水线**：`scripts/verify.sh`（fmt → clippy `-D warnings` → `cargo test
-  --workspace` → bench 编译 → perf gate（`cargo run --release -p meridian-bench --bin
+  --workspace` → bench 编译 → perf gate（`cargo run --release -p mist-bench --bin
   gate -- --fail-over 15`，抓灾难性回归）→ `agg_sim --check-alloc`（B8 零分配）/
   `--check-determinism`（B11））。挂 `.githooks/pre-push` 钩子（注册：
   `git config core.hooksPath .githooks`），**推送前必须全绿**；紧急放行
@@ -2811,7 +2811,7 @@ contract BatchSettler {
   `termion` 仅 unix，见 §5.3）改为**三层探测**：① Windows 原生（保留，实际不可得）；
   ② **WSL2 兜底**——`wsl.exe` 可用且发行版内有 nargo/bb 时，借 `/mnt/<盘>` 路径在 WSL
   内跑同一对脚本（发行版默认 `MeridianUbuntu`，root（工具装在 `/root/.nargo/bin`、
-  `/root/.bb`），可用 `MERIDIAN_WSL_DISTRO` 环境变量覆盖）；③ 两者皆无才 `[SKIP]`。
+  `/root/.bb`），可用 `MIST_WSL_DISTRO` 环境变量覆盖）；③ 两者皆无才 `[SKIP]`。
   S-36 起本机 WSL2 已具备工具链（§5.1），**ZK 门禁由此真正进入本地 pre-push**——电路
   回归不再只靠 CI 第二道网兜底。边界诚实口径：WSL 兜底跑的是与 CI 相同的脚本与锁定
   版本，但宿主是本机（32 核），§5.4 的计时基线在本地参考机跑出（与 CI 2 核数值差异
@@ -2874,7 +2874,7 @@ contract BatchSettler {
 
 ```json
 {
-  "suite": "meridian-bench",
+  "suite": "mist-bench",
   "commit": "<git sha>",
   "machine": {"cpu": "...", "cores": 32, "ram_gb": 64, "os": "...", "simd": ["avx2","adx","bmi2"]},
   "metrics": {
@@ -2979,7 +2979,7 @@ contract BatchSettler {
 | 蓝图阶段 | 本 spec 对应 |
 |---|---|
 | Phase 0（研究/标准） | §4-§7 契约冻结 + 三个 PoC **全绿**（见下"Phase 0 实证清单"） |
-| Phase 1（参考实现） | §4-§8 全部实现 + 里程碑 M1 + 开源仓库 `meridian-commerce` |
+| Phase 1（参考实现） | §4-§8 全部实现 + 里程碑 M1 + 开源仓库 `mist-commerce` |
 | Phase 2（聚合器运营） | 生产化：多运营者、债券经济、Base 主网部署、递归聚合 |
 
 ### Phase 0 实证清单（S-08c 合闸时点）
@@ -2994,6 +2994,18 @@ contract BatchSettler {
 
 ## 14. 活文档说明
 
+- **2026-09-01 全面改版 Meridian→Mist（S-71，老板拍板"那就全面改版。叫做Mist就行"）**：
+  全仓更名——crate 名（mist-core / mist-aggregator / mist-sdk / mist-gateway /
+  mist-facilitator / mist-monitor / mist-mcp / mist-bench 等）、env 变量（MERIDIAN_*→MIST_*）、
+  Prometheus 指标前缀（mist_*）、x402 scheme（meridian-v1→mist-v1）、域分隔符
+  （MERIDIAN-APPLY-DIGEST-V1→MIST-APPLY-DIGEST-V1）、bin 名、4 个文件名、GitHub repo
+  （changshenhan/meridian→changshenhan/mist）。**逐字保留项**：`MeridianUbuntu`（本机 WSL2
+  发行版名——环境事实，非品牌）；4 处种子魔数 `0x4D_45_52_49_44_49_41_4E`（hex 恰拼
+  "MERIDIAN"——历史巧合，改值即作废 golden fixture / 差分向量 / 基准输入）；`DSAv1\0`
+  哈希前缀（协议标识，与品牌无关）；链上四合约地址（不含项目名，零影响）；
+  `docs/audit/slither-2026-08-31.md` 点时历史报告不改。**state_digest golden 重锚**：域
+  分隔符随更名改值，digest 值按 §6.26.1 定夺 6（digest 不是协议常量，口径变更必改值）回填
+  golden 测试 `0c6c5849518e3845…`。
 - **性能预算表（§8.2）是活的**：每个数字以 `bench/` 实测为准回填；偏差须在本文件记录原因与修订线。
 - **本规格绑定 Phase 0/1**；任何接口签名变更走 PR 评审，先改 spec 后改码。
 - 下一位要开工的模块：**聚合器内核**（S-10，WAL / commitment lattice / 崩溃恢复）。

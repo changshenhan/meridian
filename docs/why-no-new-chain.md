@@ -1,6 +1,6 @@
 # Why Machine Commerce Does Not Need a New Chain
 
-**A position paper from the Meridian project** · 2026-08-16
+**A position paper from the Mist project** · 2026-08-16
 
 > Companion to the [whitepaper](WHITEPAPER.md). Short version: agents don't need a new
 > settlement network; they need a protocol for *authorization, budget, and delivery proof*
@@ -80,7 +80,7 @@ The aggregator does what machines are good at — *deterministic state at high s
 
 ## 6. When a new chain (layer) *is* right
 
-Not never. The Meridian plan reserves a dedicated L3 (Arbitrum Orbit) for a later phase, but
+Not never. The Mist plan reserves a dedicated L3 (Arbitrum Orbit) for a later phase, but
 gated on three conditions, all required:
 
 1. Aggregate agent volume exceeds what a single (or a few) aggregator instances can serve;
@@ -100,10 +100,10 @@ Machine commerce doesn't need a new chain. It needs:
 - a **settlement path** — on the L2 that already has USDC and liquidity.
 
 The chain-shaped solution is a solution in search of a problem that the economics already
-decline. Meridian builds the protocol and the implementation; Base settles it; agents get to
+decline. Mist builds the protocol and the implementation; Base settles it; agents get to
 transact. That's the entire thesis — and PoC ②'s 488k intents/s is the number that makes it
 credible.
 
 ---
 
-*Meridian · 2026-08-16 · Elastic-2.0*
+*Mist · 2026-08-16 · Elastic-2.0*

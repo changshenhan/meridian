@@ -1,15 +1,15 @@
-# Meridian 开发者文档站（S-14c）
+# Mist 开发者文档站（S-14c）
 
-Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互相花钱、互相信任。
+Mist 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互相花钱、互相信任。
 本文档站面向开发者，从"5 分钟跑通"到"三种角色各自怎么接"。
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│                     Meridian 集成全景                          │
+│                     Mist 集成全景                          │
 │                                                              │
 │  agent 进程        框架（LangChain/AutoGen/Eliza…）           │
 │  ┌─────────┐        ┌───────────────┐                        │
-│  │meridian-│  stdio │ meridian-mcp  │                        │
+│  │mist-│  stdio │ mist-mcp  │                        │
 │  │  sdk    │ ◄────► │  (6 工具,     │                        │
 │  └────▲────┘        │   无任何私钥)  │                        │
 │       │             └──────┬────────┘                        │
@@ -33,8 +33,8 @@ Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互
 
 | 你想…… | 你是 | 用 | 入口 |
 |---|---|---|---|
-| **替 owner 花钱** | agent 进程 | `meridian-sdk`（Rust） | [快速上手](quickstart.md) → [集成指南·agent](integration.md#作为-agent代理花钱) |
-| **给 agent 暴露支付能力** | agent 框架 | `meridian-mcp`（stdio） | [集成指南·框架](integration.md#作为-framework-给-agent-暴露-meridian) |
+| **替 owner 花钱** | agent 进程 | `mist-sdk`（Rust） | [快速上手](quickstart.md) → [集成指南·agent](integration.md#作为-agent代理花钱) |
+| **给 agent 暴露支付能力** | agent 框架 | `mist-mcp`（stdio） | [集成指南·框架](integration.md#作为-framework-给-agent-暴露-mist) |
 | **收钱的商家** | vendor / 数据·算力市场 | `verify_receipt` + `BatchSettler` | [集成指南·vendor](integration.md#作为-vendor-收款方) |
 
 ## 文档地图
@@ -61,7 +61,7 @@ Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互
   ~28k 笔/s 顺序提交全绿。每行代码按"要发表 benchmark"的要求写。
 - **诚实边界**：ZK 证明的**缺省**路径仍是**占位**（`FormatVerifier` 只查格式与一致性 /
   `PlaceholderProver`）——生产默认不动。真电路两侧已交付（S-40 `BbVerifier` /
-  S-43 `NoirProver`），经显式装配开启（网关 `MERIDIAN_VERIFY_BACKEND=bb` + SDK
+  S-43 `NoirProver`），经显式装配开启（网关 `MIST_VERIFY_BACKEND=bb` + SDK
   `SdkClient::with_noir` + `enforce_revocation_root`，TECH_SPEC §6.13/§6.14/§6.15；
   `contracts/rust-smoke/src/bin/noir_demo.rs` 是可运行的装配示例），上层 API 不变。
 - **验证者面（P2-1，S-61）**：写者与验证者分离已有最小实证——独立验证者吃「已接受意图
@@ -74,7 +74,7 @@ Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互
   独立绑定映射（owner 私钥一次性写入不可改绑，不进 delegation_hash preimage）+
   聚合器摄取绑定闸（绑他方 `E_OPERATOR` / 未绑定 fail-open / 读面不可得
   `E_BIND_BACKEND` fail-closed，读数永久缓存）+ 网关 JSON-RPC 读装配
-  （`MERIDIAN_RPC_URL` + `MERIDIAN_DSA_ADDRESS` + `MERIDIAN_SELF_OPERATOR` 三者同给
+  （`MIST_RPC_URL` + `MIST_DSA_ADDRESS` + `MIST_SELF_OPERATOR` 三者同给
   同不给，TECH_SPEC §6.19）。诚实边界：**存量未绑定委托 fail-open**（决策 B 有意取舍，
   owner 补绑收窄残余）；绑定合谋（owner 故意绑错分片）不在防御内；跨分片双花的密码学
   封堵挂 P2-3 事后欺诈 kind——绑定闸只挡「绑他方的后续意图」，不假装已封闭。
@@ -95,12 +95,12 @@ Meridian 是**机器商务的结算与信任铁轨**：让 AI Agent 之间能互
 ## 仓库结构
 
 ```
-core/          DSA 授权原语 + 预算账本（meridian-core）
-aggregator/    结算内核：ingest / commitment lattice / WAL / 净额（meridian-aggregator）
-sdk/           Agent 集成层：authorize / pay / attest + 幂等重试（meridian-sdk）
-mcp-server/    MCP stdio 服务器：6 工具、keyless、真 ZK 证明直通（meridian-mcp）
+core/          DSA 授权原语 + 预算账本（mist-core）
+aggregator/    结算内核：ingest / commitment lattice / WAL / 净额（mist-aggregator）
+sdk/           Agent 集成层：authorize / pay / attest + 幂等重试（mist-sdk）
+mcp-server/    MCP stdio 服务器：6 工具、keyless、真 ZK 证明直通（mist-mcp）
 monitor/       S-15 可观测性：/metrics Prometheus 文本 + /healthz 健康判定（std-only）
-bench/         基准基座 + 零分配/确定性门禁 + CI gate（meridian-bench）
+bench/         基准基座 + 零分配/确定性门禁 + CI gate（mist-bench）
 contracts/     Solidity：DSA / RevocationRegistry / BatchSettler + forge 测试 + rust-smoke
 circuits/      Noir ZK 电路（spend_authorization，intent_hash 绑定 + 撤销非成员）
 demos/         三框架演示闭环（LangChain / AutoGen / Eliza）+ 跨语言 hash 镜像

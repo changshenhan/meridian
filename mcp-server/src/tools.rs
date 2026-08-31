@@ -10,16 +10,14 @@
 //! rmcp 会把 Err 分支标成 `is_error=true`（MCP 客户端/agent 可见真失败）。
 
 use ed25519_dalek::Signature as AgentSignature;
-use meridian_core::attestation::AttestationPubKey;
-use meridian_core::dsa::{
-    AgentPubKey, Delegation, OwnerPubKey, RateLimit, Signature64, SpendIntent,
-};
-use meridian_core::zk::{SpendProof, SpendPublicInputs};
+use mist_core::attestation::AttestationPubKey;
+use mist_core::dsa::{AgentPubKey, Delegation, OwnerPubKey, RateLimit, Signature64, SpendIntent};
+use mist_core::zk::{SpendProof, SpendPublicInputs};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::ServerHandler;
 use rmcp::{tool, tool_handler, tool_router};
 
-use crate::MeridianServer;
+use crate::MistServer;
 
 /// hex 解码为定长数组（agent/owner DID 20B、hash 32B、签名 64B、SEC1 33B）。
 fn decode<const N: usize>(s: &str, what: &str) -> Result<[u8; N], String> {
@@ -42,7 +40,7 @@ fn ok_body<T: serde::Serialize>(receipt: &T) -> String {
     serde_json::to_string(receipt).expect("receipt serializes")
 }
 
-/// `meridian.authorize` 入参。
+/// `mist.authorize` 入参。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct AuthorizeRequest {
     /// agent DID（20 字节 hex）。
@@ -111,7 +109,7 @@ impl AuthorizeRequest {
     }
 }
 
-/// `meridian.pay` 可选的客户端直通证明（S-52，TECH_SPEC §6.16）。
+/// `mist.pay` 可选的客户端直通证明（S-52，TECH_SPEC §6.16）。
 ///
 /// keyless 保形（D3）：`attestation_secret` 不上服务器，真证明由框架侧客户端产出
 /// （`NoirProver`，§6.14），作为**数据**随意图一起提交，服务器只验证。公共输入的共享
@@ -130,7 +128,7 @@ pub struct ProofRequest {
     pub now: u64,
 }
 
-/// `meridian.pay` 入参。
+/// `mist.pay` 入参。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct PayRequest {
     /// agent DID（20 字节 hex）。
@@ -196,7 +194,7 @@ impl PayRequest {
     }
 }
 
-/// `meridian.balance` 入参。
+/// `mist.balance` 入参。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct BalanceRequest {
     /// 目标委托的 delegation_hash（32 字节 hex）。
@@ -209,7 +207,7 @@ impl BalanceRequest {
     }
 }
 
-/// `meridian.attest` 入参。
+/// `mist.attest` 入参。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct AttestRequest {
     /// 目标委托的 delegation_hash（32 字节 hex）。
@@ -218,7 +216,7 @@ pub struct AttestRequest {
     pub pk_x: String,
     /// attestation 公钥 y 坐标（BabyJubJub，32 字节小端 hex）。
     pub pk_y: String,
-    /// agent Ed25519 对 `MERIDIAN-BINDING-v1\0 || x_le || y_le` 的绑定签名（64 字节 hex）。
+    /// agent Ed25519 对 `MIST-BINDING-v1\0 || x_le || y_le` 的绑定签名（64 字节 hex）。
     pub binding: String,
 }
 
@@ -234,7 +232,7 @@ impl AttestRequest {
     }
 }
 
-/// `meridian.verify_receipt` 入参。
+/// `mist.verify_receipt` 入参。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct VerifyReceiptRequest {
     /// 目标委托的 delegation_hash（32 字节 hex）。
@@ -255,7 +253,7 @@ impl VerifyReceiptRequest {
     }
 }
 
-/// `meridian.revocation_witness` 入参（S-52，§6.16）。
+/// `mist.revocation_witness` 入参（S-52，§6.16）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct WitnessRequest {
     /// 目标委托的 delegation_hash（32 字节 hex）。
@@ -274,7 +272,7 @@ impl WitnessRequest {
 /// 因此**不需要** struct 上的 `tool_router` 字段（MinimalServer 同款模式）。
 /// 两者必须在同一模块（`tool_router()` 是模块私有）。
 #[tool_router]
-impl MeridianServer {
+impl MistServer {
     /// 注册一张委托：校验 owner 对 delegation_hash 的 secp256k1 签名，
     /// 并把该委托绑定到 agent 传输身份公钥（Ed25519）。返回回执。
     #[tool(
@@ -361,11 +359,11 @@ impl MeridianServer {
 /// ServerHandler 实现由宏生成（get_info / list_tools / call_tool / get_tool）。
 /// 必须与 `#[tool_router]` 同模块：它生成的代码要访问模块私有的 `tool_router()` 构造器。
 #[tool_handler(
-    name = "meridian",
+    name = "mist",
     version = "0.2.0",
-    instructions = "Meridian DSA 正式版：authorize 注册委托、pay 预算内支付（可选 proof：客户端真 ZK 证明直通）、balance 查额度、attest 双钥绑定、revocation_witness 取撤销事实、verify_receipt 确认回执。"
+    instructions = "Mist DSA 正式版：authorize 注册委托、pay 预算内支付（可选 proof：客户端真 ZK 证明直通）、balance 查额度、attest 双钥绑定、revocation_witness 取撤销事实、verify_receipt 确认回执。"
 )]
-impl ServerHandler for MeridianServer {}
+impl ServerHandler for MistServer {}
 
 // ---- 编译期自检：确保工具类型可序列化为 JSON Schema 且可反序列化 -------------
 #[cfg(test)]
