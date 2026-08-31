@@ -107,6 +107,21 @@ impl RevocationSet {
         self.set.read().expect("revocations poisoned").is_empty()
     }
 
+    /// 撤销集快照（dh 升序）。`state_digest`（§6.26）的规范序列化输入——HashSet 迭代序
+    /// 不确定，必须排序后才可跨进程 / 跨副本比较。诊断面：`sparse_root()` 是密码学锚，
+    /// digest 用廉价的排序列表（不付 MSM 成本）。
+    pub fn sorted_revoked(&self) -> Vec<[u8; 32]> {
+        let mut out: Vec<[u8; 32]> = self
+            .set
+            .read()
+            .expect("revocations poisoned")
+            .iter()
+            .copied()
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// 当前集合的撤销树根（32B 大端 Field，电路 `revocation_root` 公共输入口径）。
     /// 空集 = 全空树根（深度 256 的确定性常量）。
     pub fn sparse_root(&self) -> [u8; 32] {

@@ -148,6 +148,22 @@ impl EpochWindow {
         self.inflight.fetch_sub(1, Ordering::Release);
     }
 
+    /// 只读快照：已接受（ACCEPTED）槽的条目，**按 seq 升序**。`state_digest`（§6.26）
+    /// 与诊断面的规范序列化输入。与 `seal()` 同一 Release/Acquire 读协议，但**不置
+    /// closed**（非密封）——PENDING / REJECTED 槽跳过；摄取进行中调用得到瞬时快照
+    /// （可能漏在途槽），digest 语义定义在静默态（§6.26.2）。
+    pub fn accepted_entries(&self) -> Vec<WindowEntry> {
+        let count = self.head.load(Ordering::SeqCst).min(self.slots.len());
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            if self.slots[i].state.load(Ordering::Acquire) == ACCEPTED {
+                out.push(unsafe { *self.slots[i].entry.get() });
+            }
+        }
+        out.sort_by_key(|e| e.seq);
+        out
+    }
+
     /// 密封：置 closed → 等 quiescence → 等全部决定 → 返回 accepted 条目（**按 seq 升序**）。
     /// 幂等（重复调用返回相同结果）；调用方应只调用一次。
     pub fn seal(&self) -> Vec<WindowEntry> {

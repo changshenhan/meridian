@@ -41,23 +41,21 @@ use meridian_core::dsa::{
 use meridian_core::error::Error;
 use meridian_core::ledger::{check_budget, BudgetState};
 use meridian_core::zk::SpendVerifier;
+use sha2::{Digest, Sha256};
 
+use crate::apply::{apply_log, state_digest};
 use crate::health::HealthSnapshot;
 use crate::hist::LatencyHistogram;
 use crate::lattice::{ChainPublisher, EpochResult, NoopPublisher};
 use crate::proof::check_public_inputs_consistent;
 use crate::receipt::{IntentEnvelope, Receipt};
 use crate::revocation::{NonMembershipWitness, RevocationSet};
-use crate::wal::{DecodedRecord, Wal};
+use crate::wal::Wal;
 use crate::window::{EpochWindow, WindowEntry};
 
 /// 意图索引条目：intent_hash → (recipient, amount, seq)。净额解析源（§6.3 步骤 D，
 /// resolve 闭包忽略 seq）；seq 供只读回执查询（S-30a `receipt()`）。
-type IntentRef = ([u8; 20], u64, u64);
-/// WAL 重放的已接受意图元组：
-/// (seq, intent_hash, delegation_hash, spend_nonce, amount, now, recipient, accepted_at)。
-/// `accepted_at` = 接受时刻锚（P2-3 §6.23，旧格式 WAL = 0 哨兵）。
-type ReplayIntent = (u64, [u8; 32], [u8; 32], u64, u64, u64, [u8; 20], u64);
+pub(crate) type IntentRef = ([u8; 20], u64, u64);
 
 /// 摄取配置。
 #[derive(Debug, Clone)]
@@ -160,6 +158,25 @@ impl DelegationRegistry {
 impl Default for DelegationRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl DelegationRegistry {
+    /// 规范序列化输入（§6.26 `state_digest`）：条目数 + dh 升序的
+    /// (dh, delegation_hash(委托本体), agent_pub)。委托内容指纹**复用 `delegation_hash`**
+    /// （S-57 锚定的规范编码）——不写第二套委托 ABI 序列化；dh 已是键，重复写入是
+    /// 内容漂移的金丝雀（键与内容哈希不一致 = 不变量破坏）。
+    pub(crate) fn digest_into(&self, h: &mut Sha256) {
+        let map = self.map.read().expect("registry poisoned");
+        let mut keys: Vec<[u8; 32]> = map.keys().copied().collect();
+        keys.sort_unstable();
+        h.update((keys.len() as u64).to_le_bytes());
+        for dh in keys {
+            let reg = &map[&dh];
+            h.update(dh);
+            h.update(delegation_hash(&reg.delegation));
+            h.update(reg.agent_pub.as_bytes());
+        }
     }
 }
 
@@ -332,6 +349,49 @@ impl ShardedState {
         map.get(dh)
             .map(|st| st.nonces.keys().max().map_or(0, |n| n + 1))
     }
+
+    /// 规范序列化输入（§6.26 `state_digest`）：条目数 + dh 升序的每委托
+    /// (budget 四域 + nonce 数 + nonce 升序的 (nonce, intent_hash, 裁决))。
+    /// 裁决域 = `A` + seq（Accepted）或 `R` + 规格码（Rejected，`Error::as_code`）。
+    /// 分片按索引序逐一锁定（并发下不交叉持锁），收集后整体按 dh 排序 → 全序确定。
+    pub(crate) fn digest_into(&self, h: &mut Sha256) {
+        /// 单委托快照：(dh, 预算, nonce 升序的 (nonce, 记录))。
+        type LedgerEntry = ([u8; 32], BudgetState, Vec<(u64, NonceState)>);
+        let mut entries: Vec<LedgerEntry> = Vec::new();
+        for shard in &self.shards {
+            let map = shard.lock().expect("shard poisoned");
+            for (dh, st) in map.iter() {
+                let mut nonces: Vec<(u64, NonceState)> =
+                    st.nonces.iter().map(|(n, r)| (*n, *r)).collect();
+                nonces.sort_unstable_by_key(|t| t.0);
+                entries.push((*dh, st.budget.clone(), nonces));
+            }
+        }
+        entries.sort_unstable_by_key(|e| e.0);
+        h.update((entries.len() as u64).to_le_bytes());
+        for (dh, budget, nonces) in entries {
+            h.update(dh);
+            h.update(budget.delegation_hash);
+            h.update(budget.spent_in_window.to_le_bytes());
+            h.update(budget.window_start.to_le_bytes());
+            h.update(budget.total_spent.to_le_bytes());
+            h.update((nonces.len() as u64).to_le_bytes());
+            for (nonce, rec) in nonces {
+                h.update(nonce.to_le_bytes());
+                h.update(rec.intent_hash);
+                match rec.outcome {
+                    NonceOutcome::Accepted { seq } => {
+                        h.update(b"A");
+                        h.update(seq.to_le_bytes());
+                    }
+                    NonceOutcome::Rejected(e) => {
+                        h.update(b"R");
+                        h.update(e.as_code().as_bytes());
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +419,8 @@ struct CurrentWindow {
 }
 
 /// 窗口管理器：当前窗口 + 密封队列。满/密封自动换新窗；时间到点由 lattice 驱动封。
-struct WindowManager {
+/// `pub(crate)`：RSM apply 面（§6.26 `apply.rs`）经引用束消费其恢复 / 快照接口。
+pub(crate) struct WindowManager {
     current: Mutex<CurrentWindow>,
     sealed: Mutex<Vec<SealedEpoch>>,
     next_epoch: AtomicU64,
@@ -367,7 +428,8 @@ struct WindowManager {
 }
 
 impl WindowManager {
-    fn new(capacity: usize, now: u64) -> Self {
+    /// `pub(crate)`：apply 面测试的裸副本（不经 Aggregator / WAL）直接装配（§6.26）。
+    pub(crate) fn new(capacity: usize, now: u64) -> Self {
         WindowManager {
             current: Mutex::new(CurrentWindow {
                 window: Arc::new(EpochWindow::new(capacity)),
@@ -451,7 +513,7 @@ impl WindowManager {
     /// 最后一个已密封 epoch 之后（避免恢复后 epoch_id 与已上链的重复 / 被拒）。
     /// `tail` 必须按 seq 升序、长度 ≤ 容量（一窗内；撕裂点在「WAL 追加」与「满窗即封」之间时
     /// 可达整窗）。当前窗口由 `build` 新建为空窗，直接填入即可。
-    fn restore_tail(&self, last_epoch_id: i64, tail: &[WindowEntry]) {
+    pub(crate) fn restore_tail(&self, last_epoch_id: i64, tail: &[WindowEntry]) {
         assert!(
             tail.len() <= self.capacity,
             "unsealed tail {} exceeds window capacity {}",
@@ -469,6 +531,17 @@ impl WindowManager {
             w.finalize(slot, e.seq, e.accepted_at, true);
         }
         // current.created_at = build 时的 now_fn()（本进程启动时刻）；时间密封以恢复点为界。
+    }
+
+    /// 未密封尾快照（当前窗已接受条目，seq 升序）。§6.26 `state_digest` 的窗口域——
+    /// 副本收敛检查须覆盖「已接受但未承诺」的尾（否则重放副本与在线副本在该域不可比）。
+    pub(crate) fn unsealed_tail(&self) -> Vec<WindowEntry> {
+        self.current().accepted_entries()
+    }
+
+    /// 下一个 epoch 编号（恢复侧由 `restore_tail` 续接到已密封序列之后）。
+    pub(crate) fn next_epoch_id(&self) -> u64 {
+        self.next_epoch.load(Ordering::Relaxed)
     }
 }
 
@@ -653,6 +726,30 @@ impl Aggregator {
         self
     }
 
+    /// RSM apply 面的账本部件引用束（§6.26，crate 内可见）：`apply_log` / `state_digest`
+    /// 的输入。private 字段不出本模块即可装配——apply 面不引入新的字段可见性。
+    pub(crate) fn ledger_parts(&self) -> crate::apply::LedgerParts<'_> {
+        crate::apply::LedgerParts {
+            cfg: &self.cfg,
+            registry: &self.registry,
+            state: &self.state,
+            windows: &self.windows,
+            revocations: &self.revocations,
+            revocation_roots: &self.revocation_roots,
+            intents: &self.intents,
+            seq: &self.seq,
+        }
+    }
+
+    /// 账本状态指纹（§6.26）：副本收敛检查的可执行形态（RSM：日志一致 ⇒ 状态一致，
+    /// S-39 三元组比对在 L3-3 的升级点）。**诊断面不是判定面**——无密码学承诺（任何人
+    /// 可在自己副本上重算），不能替代 §6.5 的承诺根 / 出证闸；digest 口径跨版本可漂移
+    /// （口径变更须同步所有副本消费者，golden 锚定的是同版本内跨进程 / 跨投递序稳定）。
+    /// 不含会话面（rejected / latency / started_at / instance_id / verifier / WAL 路径）。
+    pub fn state_digest(&self) -> [u8; 32] {
+        state_digest(&self.ledger_parts())
+    }
+
     /// 撤销状态根集合种子（S-44）：空根（账本 genesis 状态，任何账本都真实出现过）+
     /// 当刻根（WAL 重放路径由 `restore_from_wal` 在撤销集重建后补种；S-49 起中间状态根
     /// 另由 `RevokeRoot` 记录重放续接）。仅在绑定闸开启时维护——闸关闭 = 占位口径，
@@ -688,118 +785,20 @@ impl Aggregator {
         }
         let agg = Self::build(cfg.clone(), verifier, wal, now_fn, None, 0);
 
-        // 1a. 撤销集重放（S-11）：Revoke 记录 → 撤销集（幂等；与注册表重建顺序无关）。
-        for rec in &records {
-            if let DecodedRecord::Revoke { delegation_hash } = rec {
-                agg.revocations.insert(*delegation_hash);
-            }
-        }
-        // 1a'. 撤销状态根集合续接（S-49，§4.6 残余③）：`RevokeRoot` 记录直接进接受集
-        // （零重算——根在 revoke 时本已算过并落盘）。WAL 缺根记录的撤销（旧格式 WAL /
-        // 闸关闭期）其历史根不追溯，回退 {空根, 当刻根} 口径——在途证明以 E_REV_ROOT
-        // 拒（拒绝是安全方向，诚实边界）。
-        if agg.cfg.enforce_revocation_root {
-            let mut roots = agg
-                .revocation_roots
-                .write()
-                .expect("revocation roots poisoned");
-            for rec in &records {
-                if let DecodedRecord::RevokeRoot { revocation_root } = rec {
-                    roots.insert(*revocation_root);
-                }
-            }
-        }
-        // 1a''. 空根 + 重放后当刻根补种（S-44）。
+        // 归一化 apply（L3-0，§6.26）：撤销集 / 撤销根接受集 / 注册表 / 意图（按 seq 升序
+        // 记账）/ 未密封尾窗口重建 + epoch 编号续接，全部进 `apply_log`——重放语义逐字节
+        // 不变（§6.26.1 定夺 3），与在线路径共享 `try_commit` 记账核；既有 S-10c / S-11 /
+        // S-49 恢复测试组为回归锚。
+        let report = apply_log(&agg.ledger_parts(), &records)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        debug_assert_eq!(
+            report.verdicts.len(),
+            records.len(),
+            "每条日志条目恰好产出一个裁决（§6.26.1 定夺 4）"
+        );
+        // 空根 + 重放后当刻根补种（S-44）：撤销集重建后补种当刻根（构造期 `build` 已用空
+        // 撤销集补种过一次，此处幂等重种只新增「重放终点根」）。
         agg.seed_revocation_roots();
-        // 1. 注册表 + provision。
-        for rec in &records {
-            if let DecodedRecord::Register(sd, agent_pub_bytes) = rec {
-                let agent_pub =
-                    AgentPubKey::from_bytes(agent_pub_bytes).map_err(std::io::Error::other)?;
-                let dh = delegation_hash(&sd.delegation);
-                agg.registry.register(
-                    dh,
-                    RegisteredDelegation {
-                        delegation: sd.delegation.clone(),
-                        agent_pub,
-                    },
-                );
-                agg.state.provision(&dh, cfg.nonce_capacity_per_delegation);
-            }
-        }
-        // 2. 已密封边界：最后一个 EpochSeal 的**累计**接受数 = 已承诺/已结算意图的上界。
-        //    seq >= 该值 的意图是「未密封尾」——已接受、已落 WAL、但还没进任何 epoch 承诺，
-        //    恢复后必须重建进当前窗口（S-10c，否则这些意图永远不会被净额结算）。
-        let mut sealed_accepted_count: u64 = 0;
-        let mut last_epoch_id: i64 = -1;
-        for rec in &records {
-            if let DecodedRecord::EpochSeal {
-                epoch_id,
-                accepted_count,
-                ..
-            } = rec
-            {
-                last_epoch_id = last_epoch_id.max(*epoch_id as i64);
-                sealed_accepted_count = sealed_accepted_count.max(*accepted_count);
-            }
-        }
-        // 3. 意图按 seq 排序重放（重建 nonce 集 + 账本 + seq + 意图索引）。
-        let mut intents: Vec<ReplayIntent> = Vec::new();
-        for rec in &records {
-            if let DecodedRecord::Intent {
-                seq,
-                intent_hash,
-                delegation_hash,
-                spend_nonce,
-                amount,
-                now,
-                recipient,
-                accepted_at,
-            } = rec
-            {
-                intents.push((
-                    *seq,
-                    *intent_hash,
-                    *delegation_hash,
-                    *spend_nonce,
-                    *amount,
-                    *now,
-                    *recipient,
-                    *accepted_at,
-                ));
-            }
-        }
-        intents.sort_by_key(|t| t.0);
-        // 未密封尾（按 seq 升序，已排序）：重建当前窗口用。
-        let tail: Vec<WindowEntry> = intents
-            .iter()
-            .filter(|t| t.0 >= sealed_accepted_count)
-            .map(|(seq, ih, _, _, _, _, _, accepted_at)| WindowEntry {
-                seq: *seq,
-                intent_hash: *ih,
-                accepted_at: *accepted_at,
-            })
-            .collect();
-        for (seq, ih, dh, spend_nonce, amount, now, recipient, _accepted_at) in intents {
-            let reg = agg.registry.lookup(&dh).ok_or_else(|| {
-                std::io::Error::other("WAL replay: intent for unregistered delegation")
-            })?;
-            let got = agg
-                .state
-                .try_commit(&dh, &reg.delegation, ih, spend_nonce, amount, now, &agg.seq)
-                .map_err(std::io::Error::other)?;
-            debug_assert_eq!(got, seq, "replay seq must match WAL seq");
-            // 意图索引只收未密封意图：已提交的（seq < 边界）由 EpochSeal/Netting 覆盖，
-            // 恢复后不再引用，不入索引避免驻留泄漏。
-            if seq >= sealed_accepted_count {
-                agg.intents
-                    .lock()
-                    .expect("intents poisoned")
-                    .insert(ih, (recipient, amount, seq));
-            }
-        }
-        // 4. 重建未密封窗口 + epoch 编号接到已密封序列之后。
-        agg.windows.restore_tail(last_epoch_id, &tail);
         Ok((agg, truncated))
     }
 
@@ -1197,6 +1196,7 @@ mod tests {
 
     use crate::bb::{BbBackend, BbVerifier};
     use crate::proof::FormatVerifier;
+    use crate::wal::DecodedRecord;
     use proptest::prelude::*;
 
     /// 装配面配对闸（S-48）测试替身：可声明「依赖撤销根公共输入」。
@@ -3244,6 +3244,93 @@ mod tests {
         let now = clock.load(Ordering::Relaxed);
         let r = agg.submit(&make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 10, 1, now));
         assert!(r.accepted, "无闸装配：绑定面不参与判定");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // L3-0（§6.26）：RSM 主张「账本状态 = 日志的确定性函数」的可执行验证——
+    // 同一批事实走在线摄取与 WAL 重放两条路，state_digest 必须逐字节一致。
+    // -----------------------------------------------------------------------
+
+    /// 撤销根绑定闸开启（真根随 revoke 落盘）+ 注册 / 意图 / 撤销交错 + 未密封尾，
+    /// 在线实例与 restore_from_wal 实例的账本状态逐字节一致。
+    #[test]
+    fn online_ingest_and_replay_converge_to_same_state_digest() {
+        let clock = Arc::new(AtomicU64::new(1_700_000_000));
+        let path = tmp_path("apply-digest");
+        let now = clock.load(Ordering::Relaxed);
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let mut cfg = test_cfg();
+        cfg.enforce_revocation_root = true; // 撤销根接受集进 digest（S-49 面）
+        let (dh_pair, online_digest);
+        {
+            let c = Arc::clone(&clock);
+            let wal = Wal::open(&path, 100_000).unwrap();
+            let agg = Aggregator::with_clock(
+                cfg.clone(),
+                Box::new(FormatVerifier),
+                wal,
+                Box::new(move || c.load(Ordering::Relaxed)),
+            );
+            let (dh_a, _) = register_default(&agg, [0x01; 20]);
+            let (dh_b, _) = register_default(&agg, [0x02; 20]);
+            dh_pair = (dh_a, dh_b);
+            // A 两笔（撤销前）→ revoke A → B 三笔（交错 recipient / 金额 / nonce）。
+            // 闸开启：信封证明根必须锚定当刻真根（S-44 测试同款 `with_revocation_root`）。
+            let env = make_env(dh_a, [1u8; 20], &agent_key, [0x11; 20], 10, 1, now);
+            assert!(
+                agg.submit(&with_revocation_root(&env, agg.revocation_root()))
+                    .accepted
+            );
+            let env = make_env(dh_a, [1u8; 20], &agent_key, [0x12; 20], 20, 2, now);
+            assert!(
+                agg.submit(&with_revocation_root(&env, agg.revocation_root()))
+                    .accepted
+            );
+            agg.revoke(dh_a);
+            for (i, recip) in [0x21u8, 0x22, 0x23].into_iter().enumerate() {
+                let env = make_env(
+                    dh_b,
+                    [2u8; 20],
+                    &agent_key,
+                    [recip; 20],
+                    5 + i as u64,
+                    i as u64 + 1,
+                    now,
+                );
+                assert!(
+                    agg.submit(&with_revocation_root(&env, agg.revocation_root()))
+                        .accepted
+                );
+            }
+            assert_eq!(agg.accepted_count(), 5);
+            agg.flush_wal().unwrap();
+            online_digest = agg.state_digest();
+        } // 崩溃：只剩 WAL
+
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            cfg,
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+        // RSM 主张的可执行验证：同一批事实，在线摄取与 WAL 重放两条路 → 账本状态
+        // 逐字节一致（§6.26.1 定夺 3；digest 不含会话面，崩溃不可见）。
+        assert_eq!(
+            hex::encode(online_digest),
+            hex::encode(agg2.state_digest()),
+            "在线摄取与 WAL 重放：状态逐字节一致"
+        );
+        // digest 之外的语义锚（撤销面 / 账本 / 未密封尾）。
+        let (dh_a, dh_b) = dh_pair;
+        assert!(agg2.is_revoked(&dh_a));
+        assert_eq!(agg2.revoked_len(), 1);
+        assert_eq!(agg2.accepted_count(), 5);
+        assert_eq!(agg2.total_spent(&dh_b), Some(5 + 6 + 7));
+        assert_eq!(agg2.total_spent(&dh_a), Some(30));
         let _ = std::fs::remove_file(&path);
     }
 }
