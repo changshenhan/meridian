@@ -46,6 +46,11 @@ Mainnet rehearsal (epoch 0, BatchSettler #2): commit escrows an operator-chosen 
 challenge window runs before claim and `releaseBond` return the funds — commit tx
 [`0x2ed64056…66a8`](https://basescan.org/tx/0x2ed64056e57dfee9c818c5e3f7015994f837cdbb9b74b38733b7b91de7c166a8),
 settle tx [`0x621045df…1434`](https://basescan.org/tx/0x621045dfd358d5ccfcb9d1138b43d389beb26a6e86d4c133aaac88cd961b1434).
+**The full life cycle closed on 2026-09-02**: the window passed with zero challenges,
+claim tx [`0x189e72c8…20f3e0`](https://basescan.org/tx/0x189e72c8a7a8ce4ef005cb3a03c2e1ddd1feb78e7f12ce01158aab76bd20f3e0)
+paid the 1,000-wei net 74 s after unlock, and `releaseBond` tx
+[`0x33b51686…e0afe1`](https://basescan.org/tx/0x33b51686b3adcb21aa9323502badd0a0105c3fa3c452d249846ad767f3e0afe1)
+returned the bond in full — the settler contract is drained.
 The bond is escrowed, not burned: honest settlement returns it in full via `releaseBond`
 (`BatchSettler.sol:405`). The contracts are open source and permissionless — anyone can
 deploy their own `BatchSettler` and self-register as operator.
@@ -100,8 +105,9 @@ poc-delivery/  delivery proof via TLSNotary MPC-TLS (separate workspace)
 
 ## Honest status
 
-* Contracts are live and exercised on mainnet; the full claim/`releaseBond` leg of the
-  epoch-0 rehearsal completes after the 6-hour challenge window.
+* Contracts are live and exercised on mainnet; the epoch-0 rehearsal ran its full
+  life cycle end to end (commit → settle → 6 h window → claim → `releaseBond`, bond
+  returned, contract drained).
 * Internally audited (slither + a 130-test invariant/fuzz suite); an external audit is
   planned — no audit tag has been issued yet.
 * ZK path: Noir circuits with real Barretenberg proving in CI; the production prover
