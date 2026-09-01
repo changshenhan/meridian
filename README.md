@@ -74,6 +74,10 @@ Developer docs: [`docs/developers/quickstart.md`](docs/developers/quickstart.md)
 (5-minute walkthrough) and [`docs/developers/integration.md`](docs/developers/integration.md)
 (agent / framework / vendor).
 
+Measured-engineering pieces live in [`docs/articles/`](docs/articles/README.md): the
+x402 gas ledger, a Barretenberg msgpack reverse-engineering, the pricing one-pager,
+and the position paper [why machine commerce does not need a new chain](docs/why-no-new-chain.md).
+
 ## Repository layout
 
 ```
