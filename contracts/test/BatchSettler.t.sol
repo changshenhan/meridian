@@ -39,6 +39,10 @@ contract ToggleOperator {
         settler.withdrawRefund(epochId);
     }
 
+    function releaseBond(uint256 epochId) external {
+        settler.releaseBond(epochId);
+    }
+
     receive() external payable {
         require(accept, "operator refuses eth");
     }
@@ -951,6 +955,123 @@ contract BatchSettlerTest is Test, ChallengeTestHelper {
         );
         vm.expectRevert(abi.encodeWithSelector(BatchSettler.NothingToRefund.selector, EPOCH));
         bs.withdrawRefund(EPOCH);
+    }
+
+    // ------------------------------------------------------------------ releaseBond（S-77 债券 happy-path 退回）
+
+    /// 窗口无损过后运营者拉回债券：余额 +BOND、bondedAmount 清零、BondReleased 事件。
+    function test_release_bond_after_window_returns_to_operator() public {
+        bs.commit{value: BOND}(
+            EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT
+        );
+        _settleWith(_net()); // [A1:100, A2:200]
+        vm.warp(block.timestamp + bs.CHALLENGE_WINDOW() + 1);
+
+        uint256 before = address(this).balance;
+        vm.expectEmit();
+        emit BatchSettler.BondReleased(EPOCH, BOND);
+        bs.releaseBond(EPOCH);
+        assertEq(address(this).balance, before + BOND);
+        (,,,,, uint256 bondedAmount,,,) = _epochView(EPOCH);
+        assertEq(bondedAmount, 0);
+    }
+
+    /// 窗口内债券仍是欺诈证明的活抵押：release revert（ChallengeWindowOpen）。
+    function test_release_bond_before_window_reverts() public {
+        bs.commit{value: BOND}(
+            EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT
+        );
+        _settleWith(_net());
+        vm.expectRevert(BatchSettler.ChallengeWindowOpen.selector);
+        bs.releaseBond(EPOCH);
+    }
+
+    /// 未 settle：无窗口锚点，release revert（与 claim 同款 EpochUnknown）。
+    function test_release_bond_requires_settled() public {
+        bs.commit{value: BOND}(
+            EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT
+        );
+        vm.expectRevert(abi.encodeWithSelector(BatchSettler.EpochUnknown.selector, EPOCH));
+        bs.releaseBond(EPOCH);
+    }
+
+    /// 二次 release：bondedAmount 已清零 → NothingToRelease。
+    function test_release_bond_double_reverts() public {
+        bs.commit{value: BOND}(
+            EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT
+        );
+        _settleWith(_net());
+        vm.warp(block.timestamp + bs.CHALLENGE_WINDOW() + 1);
+        bs.releaseBond(EPOCH);
+        vm.expectRevert(abi.encodeWithSelector(BatchSettler.NothingToRelease.selector, EPOCH));
+        bs.releaseBond(EPOCH);
+    }
+
+    /// 仅 operator。
+    function test_release_bond_requires_operator() public {
+        vm.prank(address(0xBEEF));
+        vm.expectRevert(BatchSettler.NotOperator.selector);
+        bs.releaseBond(EPOCH);
+    }
+
+    /// voided epoch（债券已罚没给挑战者、状态位 voided）：release revert EpochVoided。
+    function test_release_bond_rejects_voided_epoch() public {
+        bytes32 dh = keccak256("delegation-1");
+        IntentFields[] memory intents = new IntentFields[](1);
+        intents[0] = _intent(1, address(0xB1), 100, dh);
+        uint64[] memory seqs = new uint64[](1);
+        seqs[0] = 1;
+        (bytes32 root, ProofBundle[] memory proofs) = _commitIntents(intents, seqs);
+        bs.commit{value: BOND}(EPOCH, root, REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT);
+
+        // 欺诈结算（漏掉 B1）→ challenge 成功 → voided。
+        BatchSettler.NetInstruction[] memory net = new BatchSettler.NetInstruction[](1);
+        net[0] = BatchSettler.NetInstruction({recipient: address(0xB9), amount: 0});
+        _settleWith(net);
+
+        BatchSettler.IntentProof[] memory ips = new BatchSettler.IntentProof[](1);
+        ips[0] = toIntentProof(intents[0], proofs[0]);
+        vm.prank(CHALLENGER);
+        bs.challenge{value: challengeBond}(
+            EPOCH, BatchSettler.FraudProof({kind: 1, targetNetIndex: 0, intents: ips})
+        );
+        vm.warp(block.timestamp + bs.CHALLENGE_WINDOW() + 1);
+        vm.expectRevert(abi.encodeWithSelector(BatchSettler.EpochVoided.selector, EPOCH));
+        bs.releaseBond(EPOCH);
+    }
+
+    /// S-77 覆盖收口：release 的 ETH push 失败（运营者合约拒收）→ require 整笔回滚：
+    /// bondedAmount 记账不丢（CEI 清零随回滚复位）、债券留在合约，解除拒收后同一笔
+    /// 重试成功（withdrawRefund 重试语义同款，test_withdraw_refund_push_failure_is_retryable 先例）。
+    function test_release_bond_push_failure_is_retryable() public {
+        ToggleOperator op = new ToggleOperator();
+        BatchSettler target = deploySettler(address(op), address(0), CHALLENGE_BOND);
+        op.bind(target);
+        op.setAccept(false); // 运营者拒收 ETH
+
+        op.commit{value: BOND}(
+            EPOCH, keccak256("epoch-1"), REVOCATION_ROOT, ACCEPTANCE_ROOT, SEALED_AT
+        );
+        op.settle(EPOCH, _emptyNet(), keccak256(abi.encode(_emptyNet())));
+        vm.warp(block.timestamp + target.CHALLENGE_WINDOW() + 1);
+
+        vm.expectRevert("bond release failed");
+        op.releaseBond(EPOCH);
+        // 整笔回滚：记账与余额原位。
+        (,,,,, uint256 bonded,,,) = _epochViewOn(target, EPOCH);
+        assertEq(bonded, BOND, "bond accounting intact after failed release");
+        assertEq(address(target).balance, BOND, "bond retained in contract");
+        assertEq(address(op).balance, 0, "nothing pushed to refusing operator");
+
+        // 解除拒收 → 同一笔重试成功。
+        op.setAccept(true);
+        vm.expectEmit();
+        emit BatchSettler.BondReleased(EPOCH, BOND);
+        op.releaseBond(EPOCH);
+        (,,,,, uint256 bondedAfter,,,) = _epochViewOn(target, EPOCH);
+        assertEq(bondedAfter, 0, "bond zeroed on successful release");
+        assertEq(address(target).balance, 0, "contract drained");
+        assertEq(address(op).balance, BOND, "operator received bond on retry");
     }
 
     // ------------------------------------------------------------------ shared fixtures

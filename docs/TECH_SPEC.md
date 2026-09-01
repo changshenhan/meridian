@@ -561,7 +561,7 @@ pub trait Ingest {
 3. 挑战窗口（6h）：任何人可提交欺诈证明（§6.5）；挑战成功 → epoch `voided`；
 4. `claim`：窗口过后收款人**逐条**领取原生 ETH。挑战与 claim 严格时间分离 → 挑战成功时
    无任何 claim 已付，退款干净。
-5. `releaseBond`（S-76 债券 lifecycle 收口，主网真跑前主会话自审发现）：窗口无损过后
+5. `releaseBond`（S-77 债券 lifecycle 收口，主网真跑前主会话自审发现）：窗口无损过后
    运营者拉回该 epoch 债券（`BondReleased` 事件）。前置 = `settled` ∧ ¬`voided` ∧
    `block.timestamp > settledAt + CHALLENGE_WINDOW` ∧ `bondedAmount > 0`；债券恒原生
    ETH（S-28），无 token 分支。**修复前缺陷**：`bondedAmount` 仅两条出路（challenge
@@ -580,8 +580,8 @@ pub trait Ingest {
 | 撤销根最新 | 用过时撤销根放行已撤销委托 | 债券罚没 |
 | 挑战者押金（`challenge` 随笔 `msg.value`，原生 ETH，S-38） | 欺诈证明被驳回（押金入场后任何实质验证失败） | 押金全额销毁（`address(0)`，任何一方不可取回）；epoch 状态不变、仍可再挑战 |
 
-**债券生命周期（S-76 收口）**：债券金额 = `commit` 时运营者自选 `msg.value`（**协议无
-最低值检查**；`1 ether` 是测试常量与建议规模，非协议要求——S-76 前文档曾误作协议事实）。
+**债券生命周期（S-77 收口）**：债券金额 = `commit` 时运营者自选 `msg.value`（**协议无
+最低值检查**；`1 ether` 是测试常量与建议规模，非协议要求——S-77 前文档曾误作协议事实）。
 路径：欺诈成立 → 罚没判给挑战者；窗口无损过 → `releaseBond` 拉回（§6.4 第 5 步）；
 commit 后不 settle → 锁死（惩罚）。
 
@@ -1655,7 +1655,7 @@ Rust 侧 `m1_demo`/`noir_demo` 有完整演练但自带合成意图，不消费�
    Register/Intent 记录（重启缝隙从「被 flush 缺口掩盖」变「必现」）；demo 语义 =
    一轮完整会话的账本，清盘保证每轮从零开始、确定性复跑。**边界诚实**：这是 demo
    面 scratch 语义，不是账本进程的清盘面——生产 WAL 只增，清盘权不在任何消费方；
-   「bin 启动重放 + 内存委托表重建」是独立缝（S-77 候选，见下诚实边界）。
+   「bin 启动重放 + 内存委托表重建」是独立缝（S-78 候选，见下诚实边界）。
 
 9. **重放侧未密封尾按意图身份 `(seq, intent_hash)` 去重（实施期发现，真实事故驱动）**
    ——定夺 ⑧ 落地后的首轮端到端验证即复现：mcp_probe 对同一 WAL 目录连跑三次（不复
@@ -1670,11 +1670,28 @@ Rust 侧 `m1_demo`/`noir_demo` 有完整演练但自带合成意图，不消费�
    组内最小 `accepted_at` = 首次接受时刻，接受树锚原始事实）。裁决史不变（仍每条目一
    裁决）；`permuted_and_duplicated_delivery_converges` property test 语义不变（其重复
    投递是字节级副本，新旧键下都收敛）。**边界诚实**：ⓐ 这修的是「重复 WAL 不得双付」
-   的防御纵深——病根是无重放写入端能产出重复记录（S-77 候选，恢复面接上即根除）；
+   的防御纵深——病根是无重放写入端能产出重复记录（S-78 候选，恢复面接上即根除）；
    ⓑ 同 nonce 跨意图的重复记录（无重放进程各自花同一 nonce 但 memo 不同）重放时
-   `try_commit` 报 `E_NONCE` → 恢复整体 fail-closed（不静默择一），仍由 S-77 根治；
+   `try_commit` 报 `E_NONCE` → 恢复整体 fail-closed（不静默择一），仍由 S-78 根治；
    ⓒ probe 自此启动时清点并复位目标 WAL 目录（定夺 ⑧ 同款语义，参考客户端对
    caller 目录的 scratch 约定），门禁与复跑不再天然产出病态 WAL。
+
+**债券 happy-path 退回 `releaseBond`（S-77，2026-09-01，主网真跑前主会话自审发现）**：
+主网真跑一笔结算的预算核算中发现 `bondedAmount` 全函数集仅两条出路（challenge 成功
+判给挑战者 / 永久滞留合约）——happy path 无退回路径，spec 口径（§6.5「震慑作用」、
+宣发③「locked and at risk」）与合约不符：理性运营者均衡是债券 → 0（反正拿不回），
+§6.5 乐观安全模型静默失效；不变量①无「已退债券」项反而把滞留固化为预期行为，fuzz
+全绿不可见（教训：**守恒式"绿"≠生命周期完备，动作面覆盖不可省**）。修复 = §6.4
+第 5 步 `releaseBond`（settled ∧ ¬voided ∧ 窗口过 ∧ bondedAmount>0 → CEI 退债 +
+`BondReleased`；窗口后 challenge 已被 `ChallengeWindowClosed` 前置挡下，与罚没无
+竞态）+ 单元 6+1 用例（push 失败可重试 = withdrawRefund 重试语义同款，ToggleOperator
+拒收面补 `require(ok)` 失败边——覆盖门禁 79/81 红到绿）+ invariant handler 动作面
+（ghost 净扣）。forge 130→137 全绿；
+slither 复扫 17 结果，新增 3 条全落既有已知设计类（reentrancy-events / timestamp /
+low-level-calls，与 withdrawRefund 同性质：push 语义 + 事件仅观测面 + 时间戳量级差
+3 个数量级），**零新类别**、arbitrary-send-eth 未命中（仅向 immutable `operator`
+发送）。债券金额口径同步勘正：协议无最低值检查，`1 ether` 是测试常量与建议规模
+非协议要求（§6.5）。S-76 文本中的 S-77 候选指针（bin 启动重放恢复缝）顺延为 S-78。
 
 ### 6.17 Phase 2 多运营者治理（设计轮，P2-0，2026-08-31）
 

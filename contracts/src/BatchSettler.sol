@@ -9,7 +9,8 @@ import {RevocationRegistry} from "./RevocationRegistry.sol";
 /// @title BatchSettler —— 乐观批量结算（TECH_SPEC §6.4-6.5, §7）
 /// @notice 结算节奏（§6.3）：运营者把 epoch 承诺根上链（commit，质押债券）→ 确定性重排后
 ///         提交净额指令（settle，nettingRoot 锚定，同笔携带结算资金）→ 挑战窗口内任何人可
-///         对 commit≠settle 发起欺诈证明（challenge）→ 窗口过后收款人逐条领取（claim）。
+///         对 commit≠settle 发起欺诈证明（challenge）→ 窗口过后收款人逐条领取（claim），
+///         无损运营者拉回债券（releaseBond）。
 /// @dev S-11 生产化（MASTER_PLAN S-11）：
 ///      · commit/settle 仅 operator —— 无守卫时任何人可拿自洽 net[] 结算已提交 epoch →
 ///        挑战成功 → 运营者债券被罚没（griefing，无对手方获利）。
@@ -111,6 +112,8 @@ contract BatchSettler {
     event ChallengeSucceeded(uint256 indexed epochId, address indexed challenger, uint8 kind);
     /// 审计加固：结算资金 push 退款失败后的运营者拉取（withdrawRefund）。
     event RefundWithdrawn(uint256 indexed epochId, uint256 amount);
+    /// 债券 happy-path 退回（releaseBond）：窗口无损过后运营者拉回债券。
+    event BondReleased(uint256 indexed epochId, uint256 amount);
     /// S-38：欺诈证明被驳回（押金没收销毁，epoch 状态不变）。reason 见 RejectReason。
     event ChallengeRejected(uint256 indexed epochId, address indexed challenger, uint8 reason);
     event Claimed(uint256 indexed epochId, address indexed recipient, uint256 amount);
@@ -151,6 +154,8 @@ contract BatchSettler {
     // 审计加固：结算资金拉取兜底（挑战成功时退款 push 失败的留存量，仅 voided epoch 可取）。
     error EpochNotVoided(uint256 epochId);
     error NothingToRefund(uint256 epochId);
+    /// 债券已退（releaseBond 二次调用 / voided epoch 债券已罚没）。
+    error NothingToRelease(uint256 epochId);
     // P2-3 §6.23.1 定夺 7：kind3/kind4 守卫要读 DSA（boundAt/operatorOf）与
     // RevocationRegistry（revokedAt）的事件时刻锚——缺依赖 = 守卫静默失效面伪装，构造期拒。
     error ZeroAnchor();
@@ -386,6 +391,30 @@ contract BatchSettler {
             if (!IERC20(asset).transfer(operator, refund)) revert TokenTransferFailed();
         }
         emit RefundWithdrawn(epochId, refund);
+    }
+
+    /// 债券退回（happy path 收口）：挑战窗口无损过后，运营者拉回该 epoch 债券。
+    /// 前置与 claim 同款窗口判定：已 settle、未 voided、窗口已过——窗口内债券仍是
+    /// 欺诈证明的活抵押，提前抽走等于拆 §6.5 乐观安全模型；voided epoch 的债券已在
+    /// challenge 成功时清零判给挑战者。 bondedAmount == 0（已退 / 已罚没）revert。
+    /// commit 后长期不 settle 的 epoch 债券同样无退回路径：对"承诺了却不结算"的运营者，
+    /// 债券锁死即惩罚，不开"承诺随时可抽"的后门。
+    /// 债券恒原生 ETH（S-28：惩罚质押与结算资产分离），无 token 分支。CEI：先清零再外呼。
+    /// 竞态闭合：challenge 仅在窗口内可入（`ChallengeWindowClosed`），窗口过后的本函数
+    /// 与 challenge 无交叠窗口，债券不存在"退回与罚没赛跑"。
+    function releaseBond(uint256 epochId) external onlyOperator {
+        Epoch storage ep = epochsById[epochId];
+        if (!ep.settled) revert EpochUnknown(epochId);
+        if (ep.voided) revert EpochVoided(epochId);
+        if (block.timestamp <= uint256(ep.settledAt) + CHALLENGE_WINDOW) {
+            revert ChallengeWindowOpen();
+        }
+        uint256 bond = ep.bondedAmount;
+        if (bond == 0) revert NothingToRelease(epochId);
+        ep.bondedAmount = 0;
+        (bool ok,) = payable(operator).call{value: bond}("");
+        require(ok, "bond release failed");
+        emit BondReleased(epochId, bond);
     }
 
     /// 欺诈证明实质验证（S-38：不再 revert，失败返回原因码；None = 欺诈成立）。判定逻辑与

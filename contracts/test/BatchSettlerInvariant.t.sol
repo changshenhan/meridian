@@ -9,9 +9,12 @@ import {ChallengeTestHelper} from "./ChallengeTestHelper.sol";
 ///
 /// Handler 扮演随机化运营者/挑战者：commit 顺序 epoch（随机 1-4 条意图）→ settle
 /// （诚实 / 漏单 / 低付三种模式）→ 窗口内挑战（真欺诈证明 / 垃圾挑战）→ warp 过窗
-/// 后 claim。锁死三条全局不变量：
-///   ① 资金守恒：合约 ETH 余额 == ΣbondedAmount + ΣsettlementFunded - Σ已付 claim
-///     （handler 的 settle 恒按 Σnet 精确注资，债券/押金/退款/罚没全走 ghost 记账）。
+/// 后 claim → releaseBond 退债（S-77 happy path）。锁死三条全局不变量：
+///   ① 资金守恒：合约 ETH 余额 == ΣbondedAmount（ghost 净已释放）+ ΣsettlementFunded
+///     - Σ已付 claim（handler 的 settle 恒按 Σnet 精确注资，债券/押金/退款/罚没/退债
+///     全走 ghost 记账）。release 把债券同时移出 storage 与合约余额，守恒式对
+///     退债路径自动闭合——修复前 release 面不存在，本不变量无法暴露滞留缺陷，
+///     故另需动作面覆盖（S-77 教训：守恒式"绿"≠生命周期完备）。
 ///   ② 状态机单调：settled ⇒ committed；challenged ⇒ voided（成功挑战二者同置，
 ///     驳回永不置位）；voided ⇒ challenged。
 ///   ③ voided 后 claim 必须拒绝（try/catch 行为断言，绕开 fail_on_revert）。
@@ -42,12 +45,13 @@ contract SettlerHandler is Test, ChallengeTestHelper {
     mapping(uint256 => uint256) internal fundedOf;
     mapping(uint256 => bool) internal settledEpoch;
     mapping(uint256 => bool) internal voidedEpoch;
+    mapping(uint256 => bool) internal releasedEpoch;
 
     uint256 public epochCount; // 顺序 epochId（0..count-1），不变量可枚举
     uint64 public seqCounter;
     bool public brokenVoidedClaim; // ③ 行为断言的破约旗
 
-    // ① 资金守恒 ghost 记账（与 storage 同步增减）。
+    // ① 资金守恒 ghost 记账（与 storage 同步增减）。ghostBondSum 为净额：release 后同步减。
     uint256 public ghostBondSum;
     uint256 public ghostFundedSum;
     uint256 public ghostClaimedSum;
@@ -196,6 +200,21 @@ contract SettlerHandler is Test, ChallengeTestHelper {
         ghostClaimedSum += line.amount;
     }
 
+    /// warp 过挑战窗后 release 债券（S-77 happy path 退回）：债券同时移出 storage 与
+    /// 合约余额 → ghost 净扣。已 release / voided 的 epoch 不重入。
+    function releaseBond(uint256 epochId) external {
+        if (epochId >= epochCount || !settledEpoch[epochId] || voidedEpoch[epochId]) return;
+        if (releasedEpoch[epochId]) return;
+        uint256 target = settledAtOf[epochId] + WINDOW + 1;
+        if (block.timestamp < target) {
+            vm.warp(target);
+        }
+        vm.prank(operator);
+        bs.releaseBond(epochId);
+        releasedEpoch[epochId] = true;
+        ghostBondSum -= BOND;
+    }
+
     /// ③ 行为断言：voided 后 claim 必须拒绝（try/catch 而非 expectRevert，
     /// 避免被 fail_on_revert=false 吞掉）。
     function claimVoidedMustRevert(uint256 epochId) external {
@@ -298,7 +317,7 @@ contract BatchSettlerInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// ① 资金守恒：余额 == Σbonded + Σfunded - Σ已付 claim。
+    /// ① 资金守恒：余额 == Σbonded（净已释放）+ Σfunded - Σ已付 claim。
     function invariant_solvency() public view {
         assertEq(
             address(handler.bs()).balance,
