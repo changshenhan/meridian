@@ -14,8 +14,10 @@ Mist 做"AI Agent 之间怎么互相花钱、互相信任"的标准 + 参考实�
 | DSA | [`0x0fF07b282C9c51720885F0a9B3bA8a6458b41385`](https://basescan.org/address/0x0fF07b282C9c51720885F0a9B3bA8a6458b41385) |
 | RevocationRegistry | [`0x6e5c690ee2e76Cf920BE22e2583A9B7d0390d79F`](https://basescan.org/address/0x6e5c690ee2e76Cf920BE22e2583A9B7d0390d79F) |
 | OperatorRegistry | [`0x278Fa3ff77d02b6caa981340Ca6f0CC5543bC57c`](https://basescan.org/address/0x278Fa3ff77d02b6caa981340Ca6f0CC5543bC57c) |
-| BatchSettler（初版） | [`0x247148601909395834e836CEa01B101D187E28a1`](https://basescan.org/address/0x247148601909395834e836CEa01B101D187E28a1) |
+| BatchSettler #1（已退役） | [`0x247148601909395834e836CEa01B101D187E28a1`](https://basescan.org/address/0x247148601909395834e836CEa01B101D187E28a1) |
 | BatchSettler #2（含 `releaseBond`） | [`0xa3397ce4fDE01810F8540A25363A88D5e57f4166`](https://basescan.org/address/0xa3397ce4fDE01810F8540A25363A88D5e57f4166) |
+
+#1 实例已退役（早于挑战路径退款修复与 `releaseBond`，勿对其结算），现役为 #2。
 
 S-79 主网真跑（epoch 0，BatchSettler #2）：commit 托管 0.0005 ETH 债券 → settle 净额 1000 wei（5 笔意图）→ 6 小时挑战窗 → claim/releaseBond。commit tx [`0x2ed64056e57dfee9c818c5e3f7015994f837cdbb9b74b38733b7b91de7c166a8`](https://basescan.org/tx/0x2ed64056e57dfee9c818c5e3f7015994f837cdbb9b74b38733b7b91de7c166a8)、settle tx [`0x621045dfd358d5ccfcb9d1138b43d389beb26a6e86d4c133aaac88cd961b1434`](https://basescan.org/tx/0x621045dfd358d5ccfcb9d1138b43d389beb26a6e86d4c133aaac88cd961b1434)。完整六笔部署 tx 与对账见 [docs/articles/02-x402-gas-ledger-en.md](docs/articles/02-x402-gas-ledger-en.md)。
 

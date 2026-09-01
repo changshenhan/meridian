@@ -35,8 +35,11 @@ Deployed and exercised against Base mainnet (chain_id 8453, native ETH mode):
 | DSA | [`0x0fF07b282C9c51720885F0a9B3bA8a6458b41385`](https://basescan.org/address/0x0fF07b282C9c51720885F0a9B3bA8a6458b41385) |
 | RevocationRegistry | [`0x6e5c690ee2e76Cf920BE22e2583A9B7d0390d79F`](https://basescan.org/address/0x6e5c690ee2e76Cf920BE22e2583A9B7d0390d79F) |
 | OperatorRegistry | [`0x278Fa3ff77d02b6caa981340Ca6f0CC5543bC57c`](https://basescan.org/address/0x278Fa3ff77d02b6caa981340Ca6f0CC5543bC57c) |
-| BatchSettler | [`0x247148601909395834e836CEa01B101D187E28a1`](https://basescan.org/address/0x247148601909395834e836CEa01B101D187E28a1) |
+| BatchSettler #1 *(retired)* | [`0x247148601909395834e836CEa01B101D187E28a1`](https://basescan.org/address/0x247148601909395834e836CEa01B101D187E28a1) |
 | BatchSettler #2 (`releaseBond`) | [`0xa3397ce4fDE01810F8540A25363A88D5e57f4166`](https://basescan.org/address/0xa3397ce4fDE01810F8540A25363A88D5e57f4166) |
+
+Instance #1 is retired — it predates the challenge-path refund fix and `releaseBond`;
+do not settle against it. Instance #2 is the live one.
 
 Mainnet rehearsal (epoch 0, BatchSettler #2): commit escrows an operator-chosen bond
 (0.0005 ETH), settle funds a 5-intent batch netting to 1000 wei, then a 6-hour
