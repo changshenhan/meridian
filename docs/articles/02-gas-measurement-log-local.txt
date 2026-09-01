@@ -1,0 +1,63 @@
+No files changed, compilation skipped
+
+Ran 10 tests for test/GasLedgerTmp.t.sol:GasLedgerTmp
+[PASS] test_challenge() (gas: 68014285)
+Logs:
+  LEDGER challenge K=1 N=1024 gas=86105
+  LEDGER challenge K=8 N=1024 gas=328002
+  LEDGER challenge K=32 N=1024 gas=1236963
+
+[PASS] test_challenge_d15() (gas: 651504875)
+Logs:
+  LEDGER challenge K=1 N=32768 gas=104203
+
+[PASS] test_challenge_d3() (gas: 541276)
+Logs:
+  LEDGER challenge K=1 N=8 gas=75721
+
+[PASS] test_challenge_flagship() (gas: 654155627)
+Logs:
+  LEDGER challenge K=32 N=32768 gas=1760135
+
+[PASS] test_claim() (gas: 584794)
+Logs:
+  LEDGER claim fresh-recipient gas=60835
+  LEDGER claim existing-recipient gas=33308
+
+[PASS] test_commit_constant() (gas: 493320)
+Logs:
+  LEDGER commit gas=147792
+  LEDGER commit gas=143277
+  LEDGER commit gas=143277
+
+[PASS] test_fork_usdc_eip3009() (gas: 4348)
+[PASS] test_settle_sweep() (gas: 26132293)
+Logs:
+  LEDGER settle R=1 gas=148693
+  LEDGER settle R=2 gas=191813
+  LEDGER settle R=4 gas=283062
+  LEDGER settle R=8 gas=465568
+  LEDGER settle R=16 gas=830610
+  LEDGER settle R=32 gas=1560808
+  LEDGER settle R=64 gas=3021656
+  LEDGER settle R=128 gas=5945146
+  LEDGER settle R=256 gas=11799266
+
+[PASS] test_setup_ops() (gas: 196015)
+Logs:
+  LEDGER registerDelegation gas=40807
+  LEDGER bindOperator gas=47648
+  LEDGER revoke gas=52216
+
+[PASS] test_usdc() (gas: 2340816)
+Logs:
+  LEDGER mockusdc transfer fresh-recipient gas=29966
+  LEDGER mockusdc transfer warm-recipient gas=4057
+  LEDGER mockusdc transferFrom (approved) gas=28276
+  LEDGER settle-usdc R=1 gas=167624
+  LEDGER settle-usdc R=32 gas=1558172
+  LEDGER claim-usdc gas=54269
+
+Suite result: ok. 10 passed; 0 failed; 0 skipped; finished in 2.23s (4.41s CPU time)
+
+Ran 1 test suite in 2.44s (2.23s CPU time): 10 tests passed, 0 failed, 0 skipped (10 total tests)

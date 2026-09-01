@@ -1,0 +1,32 @@
+Compiling 1 files with Solc 0.8.24
+Solc 0.8.24 finished in 26.75s
+Compiler run successful with warnings:
+Warning (2519): This declaration shadows an existing declaration.
+   --> test/GasLedgerTmp.t.sol:320:9:
+    |
+320 |         IUsdc usdc = IUsdc(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913);
+    |         ^^^^^^^^^^
+Note: The shadowed declaration is here:
+  --> test/GasLedgerTmp.t.sol:40:5:
+   |
+40 |     MockUSDC internal usdc;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+Warning (2018): Function state mutability can be restricted to pure
+  --> test/GasLedgerTmp.t.sol:68:5:
+   |
+68 |     function _sign(bytes32 hash) internal view returns (bytes memory) {
+   |     ^ (Relevant source part starts here and spans across multiple lines).
+
+
+Ran 1 test for test/GasLedgerTmp.t.sol:GasLedgerTmp
+[PASS] test_fork_usdc_eip3009() (gas: 393342)
+Logs:
+  LEDGER fork usdc transferWithAuthorization (execution) gas=66313
+  LEDGER fork usdc transferWithAuthorization (intrinsic calldata+base) gas=23740
+  LEDGER fork usdc transferWithAuthorization #2 (execution) gas=37365
+  LEDGER fork usdc plain transfer from whale (execution) gas=8638
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 1.06s (974.70ms CPU time)
+
+Ran 1 test suite in 1.13s (1.06s CPU time): 1 tests passed, 0 failed, 0 skipped (1 total tests)
