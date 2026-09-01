@@ -3225,7 +3225,7 @@ contract BatchSettler {
 - **2026-09-02 主网真跑全生命周期收官（S-79，claim+releaseBond 对账完成）**：epoch 0
   六笔 tx 链上闭合——deploy #2 `0x6a280219…` 1,921,390 / registerOperator `0xc51fb75b…`
   151,689 / commit `0x2ed64056…` 158,717 / settle(R=1) `0x621045df…` 164,013 / claim
-  `0x189e72c8…` 63,853 / releaseBond `0x33b51686…` 34,377 gas。settledAt=1788263587 →
+  `0x189e72c8…` 63,981 / releaseBond `0x33b51686…` 34,377 gas。settledAt=1788263587 →
   解锁 1788285187，**窗内零挑战**；claim 块时间戳 1788285261（解锁后 +74s）、releaseBond
   +4s；`BondReleased` data=5e14 全额、settler 合约余额=0（排干）、settlementFunded=1000
   全额 claim。**主网实测 vs anvil 锚点**：commit +10.8% / settle(R=1) +10.3% 系统性偏移
@@ -3238,7 +3238,7 @@ contract BatchSettler {
   无需重跑；根因 = `mainnet_settle.rs` 读面未全量过 `read_retry`（部署路径已包、
   release 后断言读漏包）——**挂账候选修复，待老板开任务书（不自行定号防撞号）**。
   对账单靠链上证据重建（`Claimed`/`BondReleased` 事件 + receipts + 合约 balance 直读）。
-  N=5/R=1 全生命周期 ≈84.4k gas/笔 vs 直连 61,105（+38%）：N<5.3 break-even 的预期内
+  N=5/R=1 全生命周期 ≈84.2k gas/笔 vs 直连 61,105（+38%）：N<5.3 break-even 的预期内
   ——真跑买的是生命周期不是经济性（05 文章诚实段）。
 - **2026-09-01 x402 v2 wire format 双协议支持（S-72，老板任务书"支持 x402 v2 协议，
   同时保持 v1 兼容"；编号沿用任务书——与 §6.12.1 的 S-72 monitor 收敛为不同任务，

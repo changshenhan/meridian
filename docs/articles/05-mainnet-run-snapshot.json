@@ -1,0 +1,21 @@
+{
+  "acceptance_root": "d9901ba21666f612e4d841707743b164aac7c9fdd7cfbd5dc6fdfececc47097b",
+  "bond_wei": "500000000000000",
+  "commitment_root": "92642e9782909aa2e8ce8dd7ccfbd157485c8f923a74ef73d4dcb1b92a420f5b",
+  "committed_at_unix": 1788263584,
+  "epoch_id": 0,
+  "net": [
+    {
+      "amount_wei": "1000",
+      "recipient": "be25c7f87128a66ec270abee3cfdf6a64e3e08a6"
+    }
+  ],
+  "netting_root": "c1ea99d2875bc0f6a6317f719122bedb38b0061727983aa3ee63637bcd2a5081",
+  "operator": "0xbe25c7f87128a66ec270abee3cfdf6a64e3e08a6",
+  "revocation_root": "19f94e515e40bf63756ea194d2a64dda55a255f3ea6c70dcf68f39f1765631ca",
+  "sealed_at": 1788263579,
+  "settler": "0xa3397ce4fde01810f8540a25363a88d5e57f4166",
+  "sum_net_wei": "1000",
+  "tx_commit": "0x2ed64056e57dfee9c818c5e3f7015994f837cdbb9b74b38733b7b91de7c166a8",
+  "tx_settle": "0x621045dfd358d5ccfcb9d1138b43d389beb26a6e86d4c133aaac88cd961b1434"
+}
