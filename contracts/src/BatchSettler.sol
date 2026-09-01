@@ -161,7 +161,8 @@ contract BatchSettler {
     /// 挑战窗口：settle 后 6 小时内可挑战（TECH_SPEC §6.5）。
     uint256 public constant CHALLENGE_WINDOW = 6 hours;
     /// 单次挑战最多携带的意图数（gas 上界：epoch_capacity=100k → 树深 17，每意图 ~19 次
-    /// sha256 预编译；32 意图 ≈ 500-600k gas，块内可行）。
+    /// sha256 预编译；32 意图实测 1,760,135 gas（树深 15 epoch，S-74 fork 实测），按树深 17
+    /// 外推 ≈1.97M，占 Base 块上限 400M 的 ~0.5%，块内可行）。
     uint256 public constant MAX_INTENTS_PER_CHALLENGE = 32;
     /// S-50 挑战押金（原生 ETH，与 asset 无关）：垃圾挑战的押金成本（此前只靠 gas，见
     /// TECH_SPEC §6.5）。部署期构造参数（immutable），逐部署按 gas 价格/债券规模定夺；
