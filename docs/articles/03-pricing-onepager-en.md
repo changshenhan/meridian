@@ -46,12 +46,16 @@ N=1,000/R=100 is ≈ 0.000041 ETH — USD: derive via §7 at publication time.
 is yet measured — each is **pending measurement**):
 
 * ZK proving compute per payment (off-chain; seconds of CPU, no gas).
-* Bond capital: 1 ETH operator bond + 0.1 ETH challenge bond, locked and at risk.
+* Bond capital: the operator bond is escrowed per epoch at an operator-chosen
+  amount (no protocol minimum — our mainnet rehearsal committed 0.0005 ETH), held
+  through the 6-hour challenge window, then returned in full via `releaseBond` on
+  honest settlement — at risk only if a fraud challenge succeeds. The unmeasured
+  driver is the opportunity cost of the escrow, not the principal.
 * Capital fronted at `settle{value: Σnet}` for up to the 6-hour challenge window
-  (`CHALLENGE_WINDOW = 6 hours`, `BatchSettler.sol:162`) — carried by the operator
+  (`CHALLENGE_WINDOW = 6 hours`, `BatchSettler.sol:167`) — carried by the operator
   (Mist) and priced inside the subscription, not passed through.
 * Fraud-response ops: a successful challenge costs ≈1.76–1.97 M gas (≈0.0000098 ETH) and
-  nets the challenger +1 ETH — i.e. insurance has a real premium line.
+  nets the challenger the operator's committed bond — i.e. insurance has a real premium line.
 
 ## 3. Launch pricing (three tiers)
 
@@ -80,7 +84,8 @@ The three pricing principles behind these numbers:
    worse, because 1,000 payments are 15–23% of a Base block, so volume hits block-space
    economics directly**. Mist's overage is a flat $0.0005/payment: ≈5.5% of the
    high-fee direct cost, and the customer's bill stops depending on network congestion.
-3. **Subscription carries the ops, not per-payment rent.** The 1 ETH bond, the
+3. **Subscription carries the ops, not per-payment rent.** The per-epoch bond
+   escrow (operator-chosen, returned in full on honest settlement), the
    settle-time fronting for the 6 h window, fraud response, RPC and proving
    infrastructure are all ours, priced inside the subscription. There is no separate
    "bond pass-through" line a customer has to reason about.
@@ -104,7 +109,7 @@ mainnet). So "why not self-host?" has to be answered with operations, not protoc
 | Self-host | Mist managed |
 |---|---|
 | Same measured gas floor (identical contracts) | same floor + markup |
-| Own bond capital (1 ETH) and fraud response | ours |
+| Own bond escrow (refunded on honest settlement) and fraud response | ours |
 | Own 6 h window monitoring, key ops, RPC ops | ours |
 | Aggregation limited to own traffic (R/N ratio = own) | **multi-merchant aggregation improves R/N** — the single biggest lever on the floor |
 | Proving compute on own hardware | ours |
@@ -169,5 +174,5 @@ USD(x gas) = x × baseFeeGwei × 1e-9 × (ETH/USD at publication, source snapsho
 
 Every number on this page: `02-x402-gas-ledger-en.md` (this series, article ②), with
 measurement commands, on-chain transaction hashes, and preserved logs. Repo citations:
-`contracts/src/BatchSettler.sol:162,227-243,250-283,286,290`; x402 upstream
+`contracts/src/BatchSettler.sol:167,232,255,291,405` (window / commit / settle / claim / releaseBond); x402 upstream
 `eip3009.ts:321-336` and `batch-settlement/README.md:3,5,47`.

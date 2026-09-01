@@ -57,12 +57,12 @@ optimistic settlement (`contracts/src/BatchSettler.sol`):
 3. Per epoch (batch): operator seals the batch off-chain and posts
    `commit` — the batch reaches the chain only as a 32-byte root (`commit` takes
    `epochId, commitmentRoot, revocationRoot, acceptanceRoot, sealedAt`, all fixed-size
-   scalars, `BatchSettler.sol:227-243`), so its cost cannot scale with batch size.
-4. `settle` posts the **net** amount per distinct recipient (`settle`, `BatchSettler.sol:250-283`;
-   the per-row loop is `ep.net.push(net[i])` at line 275).
-5. Six-hour challenge window (`CHALLENGE_WINDOW = 6 hours`, `BatchSettler.sol:162`;
-   `claim` refuses until `block.timestamp > settledAt + CHALLENGE_WINDOW`, line 290).
-6. Each recipient `claim`s its row (line 286).
+   scalars, `BatchSettler.sol:232-238`), so its cost cannot scale with batch size.
+4. `settle` posts the **net** amount per distinct recipient (`settle`, `BatchSettler.sol:255-288`;
+   the per-row loop is `ep.net.push(net[i])` at line 280).
+5. Six-hour challenge window (`CHALLENGE_WINDOW = 6 hours`, `BatchSettler.sol:167`;
+   `claim` refuses until `block.timestamp > settledAt + CHALLENGE_WINDOW`, line 295).
+6. Each recipient `claim`s its row (line 304).
 
 The whole gas question is: **what does step 4 of the direct path cost, and how does
 Mist's steps 3+4+6 amortize over a batch?**
@@ -151,7 +151,7 @@ pending** (measured locally; to be re-read on mainnet once real delegations exis
 ### 3.3 The Mist ledger — per-epoch settlement (L3)
 
 `commit` measured 147,792 (first, cold) then **143,277 / 143,277** — constant, and it
-*must* be: the function takes five fixed-size scalars (`BatchSettler.sol:227-243`).
+*must* be: the function takes five fixed-size scalars (`BatchSettler.sol:232-238`).
 
 `settle` swept over R net rows (distinct recipients, ETH mode):
 
@@ -169,14 +169,23 @@ pending** (measured locally; to be re-read on mainnet once real delegations exis
 
 That is the whole amortization story in one column: **fixed ≈ 103,000 + marginal
 ≈ 45,600–45,700 per row.** The marginal is the two storage slots a `NetInstruction`
-occupies (`ep.net.push`, line 275) plus the loop; the fixed part is the netting-root
-check (`nettingRoot != keccak256(abi.encode(net))`, line 257), `_sumNet` (line 258) and
-the funding transfer (lines 277-279).
+occupies (`ep.net.push`, line 280) plus the loop; the fixed part is the netting-root
+check (`nettingRoot != keccak256(abi.encode(net))`, line 263), `_sumNet` (line 264) and
+the funding check (lines 267-271).
 
 `claim` per row: **33,308** gas when the recipient account exists, **60,835** when it is
 fresh (the 27,527 delta is EIP-161: paying a brand-new account costs +25,000 to create
 it). USDC mode is the same shape: `settle`-usdc 167,624 (R=1) / 1,558,172 (R=32),
 `claim`-usdc 54,269.
+
+**Mainnet validation (S-79 run, 2026-09-01, Base).** The first real settlement epoch on
+the current in-service settler (`0xa3397ce4fDE01810F8540A25363A88D5e57f4166`) measured
+`commit` at **158,717** gas (tx `0x2ed64056…66a8`) and `settle` with R = 1 at
+**164,013** gas (tx `0x621045df…1434`) — **+10.8% / +10.3%** over the local anvil
+figures above. The offset is systematic (both functions shift together); we report it
+without attributing it — the two measurement contexts differ (local anvil node vs Base
+mainnet execution). The §4 model keeps the anvil-fitted coefficients and reads them as
+a lower bound; a uniform +11% on the floor changes no conclusion below.
 
 ### 3.4 The insurance premium — challenge gas
 
@@ -211,6 +220,11 @@ Challenge economics, measured on the deployment calldata: the schedule bond is
 (read back from `challengeBond()`). A successful challenger gets bond + operator bond in
 one call and nets **+1 ETH** for ≈1.76–1.97 M gas (~0.0000098 ETH at 0.005 gwei); the 0.1
 ETH challenge deposit itself comes back (net zero). A failed challenger burns 0.1 ETH.
+(Context note: those schedule constants are settler #1's — retired after the
+refund-path fix. On the current in-service settler #2 the operator bond is not a
+schedule constant: the operator escrows whatever it chooses per `commit` — no protocol
+minimum; our mainnet run escrowed 0.0005 ETH — and a successful challenger nets exactly
+that amount.)
 
 ---
 
@@ -226,7 +240,10 @@ per-epoch gas ≈ 246,000            (commit 143,277 + settle fixed ≈103,000)
 per-payment gas ≈ (246,000 + 78,958 × R) / N
 ```
 
-(With all-fresh recipients the row term becomes ≈106,485 instead of 78,958.)
+(With all-fresh recipients the row term becomes ≈106,485 instead of 78,958. Mainnet
+anchor from §3.3: measured commit + settle(R=1) on Base land ≈ +10–11% above these
+anvil figures — a systematic offset; read the coefficients as a lower bound. Conclusions
+below are unchanged.)
 
 Scenario table, N = 1,000 payments per epoch:
 
@@ -258,8 +275,8 @@ direct transfer does not need. Netting only pays when recipients repeat.
 | Per-recipient work | — | batched claim + separate settle sweep | `claim` 33.3k (or 60.8k fresh) |
 | Client pre-funding | none | **required** — deposit escrow once per channel, `depositMultiplier` default 5 (`batch-settlement/README.md:3,5,47`) | none |
 | Who fronts capital | nobody (atomic transfer) | the client | **the operator** at `settle{value: Σnet}`, recovered after the window |
-| Latency to finality | one block | one block for a claim | payment is ledgered instantly; funds claimable after 6 h (`CHALLENGE_WINDOW`, `BatchSettler.sol:162`) |
-| Trust model | facilitator honest per tx | channel escrow | optimistic: 6 h fraud window, 1 ETH bond at stake, anyone may challenge |
+| Latency to finality | one block | one block for a claim | payment is ledgered instantly; funds claimable after 6 h (`CHALLENGE_WINDOW`, `BatchSettler.sol:167`) |
+| Trust model | facilitator honest per tx | channel escrow | optimistic: 6 h fraud window, operator bond in escrow (operator-chosen amount, returned in full on honest settlement), anyone may challenge |
 | Client-side per-payment work | 1 EIP-712 signature (offline) | 1 voucher signature (offline) | 1 ZK proof (offline, no gas) |
 
 The three designs are three different answers to the same question — *who waits, and
@@ -283,7 +300,8 @@ on-chain work with a 6-hour optimistic window.
    the batch arrives as a 32-byte root; only the *net* scales, at ≈45.65k per row. Batch
    size N is a purely off-chain knob (ZK proving time), not a gas knob.
 4. **The optimistic window is the real price.** 6 hours of challenge latency, operator
-   capital fronted at settle, and 1 ETH of bond at stake. The insurance is cheap to buy
+   capital fronted at settle, and the operator bond escrowed for the window (returned in
+   full on honest settlement). The insurance is cheap to buy
    (zero on the happy path) and cheap to exercise (0.49% of a Base block even at the
    protocol cap).
 5. **USD figures are intentionally absent.** Everything above is in gas and ETH at a
