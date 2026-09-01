@@ -133,7 +133,7 @@ Two structural properties matter more than the constants:
   61–90 M gas, i.e. 15–23% of an entire 400M-gas Base block.
 * **The floor is not the transfer.** A bare USDC `transfer` costs 8,638 gas; the
   authorization layer (ecrecover + nonce slot + the 292-byte calldata) is what turns an
-  8.6k transfer into a 37–68k settlement. x402 pays that premium on every single payment.
+  8.6k transfer into a 37–66k settlement. x402 pays that premium on every single payment.
 
 ### 3.2 The Mist ledger — one-time L2 authorization plane
 
