@@ -19,7 +19,7 @@ from autogen_ext.tools.mcp import StdioServerParams, mcp_server_tools
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from mist_demo_common import run_closed_loop
+from mist_demo_common import fresh_wal_dir, run_closed_loop, run_onchain_settle
 
 # autogen 的 schema→pydantic 转换只认它自己的 FORMAT_MAPPING；rmcp/schemars 对
 # u64/u32/u8 字段标 `format: "uint64"` 等，autogen 不认识就抛
@@ -53,6 +53,8 @@ WAL_DIR = str(Path(__file__).resolve().parent / ".wal")
 
 
 async def main() -> None:
+    # S-76：demo WAL = 本轮 scratch 面，启动清盘（TECH_SPEC §6.16 定夺 ⑧）。
+    fresh_wal_dir()
     env = {"MIST_WAL_DIR": WAL_DIR}
     params = StdioServerParams(command=str(BIN), args=[], env=env)
 
@@ -91,6 +93,10 @@ async def main() -> None:
                 return not body.get("error"), body
 
             await run_closed_loop(call_tool, log=lambda s: print(f"  [autogen] {s}"))
+
+    # 第 7 步（S-76）：真链结算侧车——会话已关闭，WAL 已落盘（变更工具回执前 fsync，
+    # TECH_SPEC §6.16 定夺 ⑦）。独立于 MCP 会话：结算不消费 MCP 面。
+    run_onchain_settle(log=lambda s: print(f"  [autogen] {s}"))
 
 
 if __name__ == "__main__":

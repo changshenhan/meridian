@@ -14,8 +14,9 @@
 // 密码学：@noble/curves ed25519（RFC8032 确定性裸签，与 ed25519-dalek 逐字节一致）、
 // secp256k1（默认低 s，与 k256 normalize_s 一致）；哈希逐字节镜像 core/src/dsa.rs。
 
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { secp256k1 } from "@noble/curves/secp256k1";
@@ -214,6 +215,9 @@ async function runClosedLoop(callTool, log) {
 
 // ---- 入口 ----------------------------------------------------------------------
 async function main() {
+  // S-76：demo WAL = 本轮 scratch 面，启动清盘（TECH_SPEC §6.16 定夺 ⑧——mist-mcp
+  // 启动不重放旧 WAL，回执持久点使 WAL 真实落盘后复跑会在旧账本上追加重复记录）。
+  rmSync(WAL_DIR, { recursive: true, force: true });
   // 配置面：为真实 @elizaos/plugin-mcp 生成 character.json（绝对路径 stdio 配置）。
   const character = {
     name: "mist-buyer",
@@ -256,6 +260,32 @@ async function main() {
 
   await runClosedLoop(callTool, (s) => console.log(`  [eliza] ${s}`));
   await client.close();
+
+  // 第 7 步（S-76）：真链结算侧车——会话已关闭，WAL 已落盘（变更工具回执前 fsync，
+  // TECH_SPEC §6.16 定夺 ⑦）。独立于 MCP 会话：结算不消费 MCP 面。
+  // demo_settle 在 contracts/rust-smoke 独立 workspace（自带 target/），产物落
+  // contracts/rust-smoke/target/release/。
+  const settleBin = resolve(REPO, "contracts", "rust-smoke", "target", "release", "demo_settle.exe");
+  const wal = resolve(WAL_DIR, "mist.wal");
+  if (!existsSync(settleBin)) {
+    console.log(
+      "[7/7] 链上结算 跳过（demo_settle 未构建）：cd contracts/rust-smoke && " +
+        "cargo build --release --bin demo_settle（另需 foundry）",
+    );
+  } else {
+    if (!existsSync(wal)) throw new Error(`WAL 不存在: ${wal}（MCP 会话应已产出真账本）`);
+    console.log(`[7/7] 链上结算：demo_settle 消费 ${wal} → commit→settle→过挑战窗→claim`);
+    const proc = spawnSync(settleBin, ["--wal", wal], { encoding: "utf8" });
+    for (const line of (proc.stdout ?? "").split("\n")) {
+      if (line.trim()) console.log(`    ${line}`);
+    }
+    if (proc.status !== 0) {
+      throw new Error(
+        `demo_settle 失败（exit ${proc.status}）: ${(proc.stderr ?? "").trim()}`,
+      );
+    }
+    console.log("[7/7] 链上结算 OK  收款人余额增量 == 净额行（逐 wei 对账）");
+  }
 }
 
 main().then(

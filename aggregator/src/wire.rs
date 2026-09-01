@@ -248,6 +248,7 @@ mod tests {
             Error::ERevRoot,
             Error::EOperator,
             Error::EBindBackend,
+            Error::EWal,
         ] {
             assert_eq!(Error::from_code(e.as_code()), Some(e));
         }

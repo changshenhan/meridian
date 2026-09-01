@@ -16,7 +16,7 @@ from pathlib import Path
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 
-from mist_demo_common import run_closed_loop
+from mist_demo_common import fresh_wal_dir, run_closed_loop, run_onchain_settle
 
 REPO = Path(__file__).resolve().parent.parent
 BIN = REPO / "target" / "release" / "mist-mcp.exe"
@@ -24,6 +24,8 @@ WAL_DIR = str(Path(__file__).resolve().parent / ".wal")
 
 
 async def main() -> None:
+    # S-76：demo WAL = 本轮 scratch 面，启动清盘（TECH_SPEC §6.16 定夺 ⑧）。
+    fresh_wal_dir()
     config = {
         "mist": {
             "command": str(BIN),
@@ -66,6 +68,10 @@ async def main() -> None:
             return not body.get("error"), body
 
         await run_closed_loop(call_tool, log=lambda s: print(f"  [langchain] {s}"))
+
+    # 第 7 步（S-76）：真链结算侧车——会话已关闭，WAL 已落盘（变更工具回执前 fsync，
+    # TECH_SPEC §6.16 定夺 ⑦）。独立于 MCP 会话：结算不消费 MCP 面。
+    run_onchain_settle(log=lambda s: print(f"  [langchain] {s}"))
 
 
 if __name__ == "__main__":

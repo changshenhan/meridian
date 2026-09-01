@@ -141,6 +141,16 @@ impl AppState {
         }
     }
 
+    /// 回执持久点（S-76，TECH_SPEC §6.16 定夺 ⑦ / §8.1）：MCP 面变更工具
+    /// （authorize / pay）的回执离开本层前 WAL 必须 fsync 落盘——**回执 = 已持久化
+    /// 事实**。此前本面记录数远低于 `sync_every`（mcp bin 开 1_000）阈值且无停机
+    /// flush，进程退出即整本丢失；demo 真链结算侧车（`demo_settle`）消费的正是
+    /// 这份 WAL。失败 → `E_WAL`（fail-visible，绝不静默吞掉）；调用方重发走幂等
+    /// 路径补 flush。
+    fn persist(agg: &Aggregator) -> Result<(), Error> {
+        agg.flush_wal().map_err(|_| Error::EWal)
+    }
+
     /// 注册委托（mist.authorize）。
     ///
     /// 校验：owner 对 delegation_hash 的 secp256k1 签名；委托字段自洽
@@ -184,8 +194,12 @@ impl AppState {
             if existing.agent_pub.as_bytes() != agent_pub.as_bytes() {
                 return Err(Error::EAttestBind);
             }
-            // 已注册且同一 agent → 幂等返回（不再重复 register）。
-            return Ok(receipt_from(&existing.sd.delegation));
+            // 已注册且同一 agent → 幂等返回（不再重复 register）；flush 仍执行——
+            // 上一次「注册成功但回执前 flush 失败」的重发在此补上（fsync 幂等）。
+            let existing_delegation = existing.sd.delegation.clone();
+            drop(map);
+            Self::persist(&self.agg)?;
+            return Ok(receipt_from(&existing_delegation));
         }
 
         // 本地表缺省 → 查聚合器注册表（跨重启兜底；本步 WAL 只追加，两表本就在同步）。
@@ -207,7 +221,10 @@ impl AppState {
                 agent_pub: *agent_pub,
             },
         );
+        drop(map);
 
+        // 回执持久点（S-76，定夺 ⑦）：回执离开本层前 WAL 必须 fsync 落盘。
+        Self::persist(&self.agg)?;
         Ok(receipt_from(delegation))
     }
 
@@ -233,6 +250,8 @@ impl AppState {
         };
         let r = self.agg.submit(&env);
         if r.accepted {
+            // 回执持久点（S-76，定夺 ⑦）：accepted 回执 = 已持久化事实。
+            Self::persist(&self.agg)?;
             Ok(PayReceipt {
                 intent_hash: hex_hash(&r.intent_hash),
                 seq: r.seq,

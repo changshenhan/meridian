@@ -17,6 +17,10 @@
 """
 
 import hashlib
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import coincurve
 from coincurve.ecdsa import der_to_cdata, serialize_compact
@@ -266,3 +270,62 @@ async def run_closed_loop(call_tool, log=print) -> None:
     log(f"[6/6] vendor granted credits={data['credits_granted']}  rows={len(data['data'])}")
 
     log("闭环完成：agent 用 DSA 自动购买数据/API 额度 ✔")
+
+
+# ---- 第 7 步：真链结算侧车（S-76，TECH_SPEC §6.16） ----------------------------
+
+DEMO_WAL_DIR = Path(__file__).resolve().parent / ".wal"
+
+
+def fresh_wal_dir() -> None:
+    """demo WAL = 本轮 scratch 面，启动清盘保证确定性复跑（S-76 定夺 ⑧）。
+
+    mist-mcp 启动不重放旧 WAL（`restore_from_wal` 是显式入口，bin 未接）：S-76 起
+    变更工具回执前强制 fsync（定夺 ⑦），WAL 首次真实落盘——旧账本残留从「不可见」
+    变「必现」（复跑会在旧账本上追加重复 Register/Intent 记录）。demo 面以清盘收口；
+    生产账本进程的 WAL 管理不归 demo 面。
+    """
+    shutil.rmtree(DEMO_WAL_DIR, ignore_errors=True)
+
+
+def run_onchain_settle(log=print) -> None:
+    """第 7 步：运营者侧真链结算——BatchSettler commit→settle→过挑战窗→claim。
+
+    消费 MCP 会话产出的 WAL（demos/.wal/mist.wal）：demo_settle 拷贝快照后从快照
+    恢复账本、显式密封当前尾、净额结算上链并逐收款人对账（原 WAL 一字不动 → 幂等
+    重跑，TECH_SPEC §6.16 定夺 ①）。降级口径（同节定夺 ⑥）：二进制缺失 = 打印一行
+    构建指引后跳过（6 步闭环仍完整）；存在但失败 = loud fail。跑本步需 foundry
+    （anvil）在 PATH。独立于 MCP 会话——结算不消费 MCP 面，本函数是同步阻塞调用。
+    """
+    suffix = ".exe" if sys.platform == "win32" else ""
+    repo = Path(__file__).resolve().parent.parent
+    # demo_settle 在 contracts/rust-smoke 独立 workspace（自带 target/，不进主仓
+    # fmt/clippy/test 门禁），产物落 contracts/rust-smoke/target/release/。
+    settle_bin = (
+        repo / "contracts" / "rust-smoke" / "target" / "release" / f"demo_settle{suffix}"
+    )
+    if not settle_bin.is_file():
+        log(
+            "[7/7] 链上结算 跳过（demo_settle 未构建）："
+            "cd contracts/rust-smoke && cargo build --release --bin demo_settle（另需 foundry）"
+        )
+        return
+    wal = DEMO_WAL_DIR / "mist.wal"
+    if not wal.is_file():
+        raise AssertionError(f"WAL 不存在：{wal}（MCP 会话应已产出真账本）")
+    log(f"[7/7] 链上结算：demo_settle 消费 {wal} → commit→settle→过挑战窗→claim")
+    proc = subprocess.run(
+        [str(settle_bin), "--wal", str(wal)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    for line in (proc.stdout or "").splitlines():
+        if line.strip():
+            log(f"    {line}")
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"demo_settle 失败（exit {proc.returncode}）: {(proc.stderr or '').strip()}"
+        )
+    log("[7/7] 链上结算 OK  收款人余额增量 == 净额行（逐 wei 对账）")

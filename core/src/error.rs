@@ -37,6 +37,9 @@ pub enum Error {
     /// 运营者绑定读面不可得（S-62：RPC 失败 / 短返回，TECH_SPEC §6.19.2）——
     /// fail-closed，绝不按「未绑定」放行（与 E_VERIFY_BACKEND 同一纪律）。
     EBindBackend,
+    /// 账本回执持久化失败（S-76：MCP 面变更工具回执前 `flush_wal` 失败，TECH_SPEC
+    /// §6.16 / §8.1）——fail-visible，回执不落盘就不是已持久化事实，绝不静默吞掉。
+    EWal,
 }
 
 impl Error {
@@ -64,6 +67,7 @@ impl Error {
             Error::ERevRoot => "E_REV_ROOT",
             Error::EOperator => "E_OPERATOR",
             Error::EBindBackend => "E_BIND_BACKEND",
+            Error::EWal => "E_WAL",
         }
     }
 
@@ -91,6 +95,7 @@ impl Error {
             "E_REV_ROOT" => Error::ERevRoot,
             "E_OPERATOR" => Error::EOperator,
             "E_BIND_BACKEND" => Error::EBindBackend,
+            "E_WAL" => Error::EWal,
             _ => return None,
         })
     }

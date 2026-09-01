@@ -561,6 +561,15 @@ pub trait Ingest {
 3. 挑战窗口（6h）：任何人可提交欺诈证明（§6.5）；挑战成功 → epoch `voided`；
 4. `claim`：窗口过后收款人**逐条**领取原生 ETH。挑战与 claim 严格时间分离 → 挑战成功时
    无任何 claim 已付，退款干净。
+5. `releaseBond`（S-76 债券 lifecycle 收口，主网真跑前主会话自审发现）：窗口无损过后
+   运营者拉回该 epoch 债券（`BondReleased` 事件）。前置 = `settled` ∧ ¬`voided` ∧
+   `block.timestamp > settledAt + CHALLENGE_WINDOW` ∧ `bondedAmount > 0`；债券恒原生
+   ETH（S-28），无 token 分支。**修复前缺陷**：`bondedAmount` 仅两条出路（challenge
+   成功判给挑战者 / 永久滞留合约），happy path 无退回路径——理性运营者均衡是债券 → 0，
+   §6.5 震慑静默失效；不变量①（资金守恒）无"已退债券"项反而把滞留固化为预期行为，
+   fuzz 全绿不可见。窗口过后 `challenge` 已被 `ChallengeWindowClosed` 前置挡下，release
+   与罚没无竞态窗口。commit 后长期不 settle 的 epoch 债券同样无退回路径：对"承诺了却
+   不结算"的运营者，债券锁死即惩罚，不开"承诺随时可抽"的后门。
 
 ### 6.5 债券/惩罚（乐观安全模型）
 
@@ -570,6 +579,11 @@ pub trait Ingest {
 | 预算账本诚实 | 已撤销仍放行 / 超限记账 | 债券罚没 + 声誉分（Phase 2，设计轮定夺：只读派生不进判定面，§6.17 决策 E / 砖 P2-5） |
 | 撤销根最新 | 用过时撤销根放行已撤销委托 | 债券罚没 |
 | 挑战者押金（`challenge` 随笔 `msg.value`，原生 ETH，S-38） | 欺诈证明被驳回（押金入场后任何实质验证失败） | 押金全额销毁（`address(0)`，任何一方不可取回）；epoch 状态不变、仍可再挑战 |
+
+**债券生命周期（S-76 收口）**：债券金额 = `commit` 时运营者自选 `msg.value`（**协议无
+最低值检查**；`1 ether` 是测试常量与建议规模，非协议要求——S-76 前文档曾误作协议事实）。
+路径：欺诈成立 → 罚没判给挑战者；窗口无损过 → `releaseBond` 拉回（§6.4 第 5 步）；
+commit 后不 settle → 锁死（惩罚）。
 
 - **欺诈证明类型（S-11，sound + 有界）**：
   - **漏单（missing-recipient）**：出示一条明文 SpendIntent + `seq`/`leafIndex`/
@@ -1572,6 +1586,95 @@ ElizaOS，S-13b 同一闭环）在 `authorize` 之后加入 `mist.revocation_wit
 optional `proof` 直通**不在框架脚本演示范围**——真电路证明需要 nargo/bb 工具链（§5.3），
 Python/JS 脚本侧不可得，硬造即假演示；该路径由本节门控 e2e `mcp_noir_e2e` 实证，
 框架脚本演示的是 witness 事实面（真证明的前置事实来源）。
+
+**框架 demo 真链 settle 完整化（S-76，2026-09-01，任务书「完成后」条款点名砖）**：
+缺口本体——三框架闭环止步 mock vendor（凭 `verify_receipt` 回执授 API 积分），钱的
+最后一公里（BatchSettler commit → settle → 过挑战窗 → claim）在对外演示面整段缺失；
+Rust 侧 `m1_demo`/`noir_demo` 有完整演练但自带合成意图，不消费对外 demo 产出的账本。
+四件工件：
+
+1. `mcp-server/src/bin/mcp_probe.rs`（bin `mcp_probe`）——Rust 侧 MCP stdio 客户端
+   参考实现 + 冒烟探针：spawn 同 package 兄弟 bin `mist-mcp`（`current_exe()` 兄弟
+   定位 + `EXE_SUFFIX`），手写 newline-delimited JSON-RPC（initialize →
+   notifications/initialized → `tools/call`），fixture 与 `mist_demo_common.py`
+   逐字节同参（同 owner/agent 密钥与 DID/同金额——probe 产出的 WAL 与框架 demo 的
+   WAL 同形），断言与 demo 闭环同款（本地重算 `delegation_hash`/`intent_hash` ==
+   服务器回执）。
+2. `contracts/rust-smoke/src/bin/demo_settle.rs`（bin `demo_settle`）——运营者结算
+   侧车：`--wal <path>` → 拷贝 WAL 快照（定夺 ①）→ `restore_from_wal`
+   （`IngestConfig::default()` + FormatVerifier，重放不验证明）→ `seal_expired(now, 0)`
+   （定夺 ②）→ `settle_epoch` → spawn anvil → deploy DSA/RevocationRegistry/
+   BatchSettler（`m1_demo` 同构造参数）→ `commit(epochId, commitmentRoot,
+   revocationRoot, acceptanceRoot, sealedAt).value(BOND)` →
+   `settle(net, nettingRoot).value(Σnet)` → fast_forward 过挑战窗 → 逐收款人 claim
+   断言余额增量 == net 行金额（`m1_demo` E 段同款逐 wei 对账）。
+3. 三框架 demo 第 7 步：`mist_demo_common.run_onchain_settle()`（Python 两框架共享）
+   / `eliza_client.mjs` 同款——subprocess 调 release `demo_settle`，闭环保留 6 步
+   不动，第 7 步独立于 MCP 会话（结算不消费 MCP 面）、在会话关闭后调用；三框架
+   启动时清盘自有 WAL 目录（`fresh_wal_dir()` / `rmSync`，定夺 ⑧）。
+4. verify.sh 新步 **10b**：`cargo build -p mist-mcp --bins` → `mcp_probe <dir>` 产
+   真 WAL → `demo_settle --wal` 对真 WAL 结算断言。foundry 门控同 step 10（anvil
+   不可得 skip）；verify.sh 是本地门禁，CI 不跑（同 verifier_drill/registry_flow 口径）。
+
+九条定夺（记录在案；⑦⑧⑨ 为实施期发现，2026-09-01 回填；⑨ 由端到端首验的
+双付事故驱动）：
+
+1. **侧车是 WAL 快照消费者，不回写账本**——拷贝快照后从快照恢复，`settle_epoch` 落的
+   EpochSeal/Netting 记录进快照不进原 WAL。理由：ⓐ demo 第 7 步幂等重跑（回写原 WAL
+   则第二次 restore 见已密封尾 → 无可结算 → 演示碎）；ⓑ RSM 性质（§6.26）保证快照侧
+   与在线侧是同一 WAL 的同一确定性函数，密封/根/epoch_id 逐字节可比；ⓒ 结算状态的
+   所有权归账本进程，侧车不制造第二个写者。
+2. **密封语义 = `seal_expired(now, 0)`**：`epoch_secs=0` 即「运营者显式密封当前尾」，
+   不模拟时间窗轮询（`m1_demo` 传 60 是吞吐演示口径）；restore 后 `created_at` =
+   侧车启动时刻（ingest.rs `restore_tail` 注释），0 阈值使密封无条件发生。
+3. **probe 走真 MCP 协议不走进程内直调**——门禁覆盖「mist-mcp 二进制 → stdio
+   JSON-RPC → WAL 落盘」全链，与框架 demo 的消费面同一（三框架是同一协议的薄包装）；
+   手写 JSON-RPC 只用 std 依赖（协议面 = newline-delimited JSON-RPC 2.0，MCP 标准）。
+4. **侧车不做链上 `registerDelegation`**——WAL 注册面在验签后只存
+   `RegisteredDelegation{delegation, agent_pub}`，owner 签名即弃不可重建；且
+   commit/settle/claim 不消费 DSA 登记状态（BatchSettler 仅 kind4 挑战守卫读
+   `operatorOf`/`boundAt`）。链上登记交叉锚由 `m1_demo`/`noir_demo` 覆盖。
+5. **金额标度 = 账本 amount 与链上 wei 同一标度**（`m1_demo` E 段先例）：demo 一笔
+   142 → vendor 收 142 wei——单位演示，不是定价口径（定价见宣发③，[BOSS] 占位）。
+6. **demo 第 7 步降级口径**：`demo_settle` 二进制缺失 → 打印一行构建指引后跳过
+   （诚实降级，6 步闭环仍完整）；存在但失败 → loud fail——绝不静默吞错硬造全绿。
+   跑第 7 步需 foundry（anvil）在 PATH。
+7. **MCP 面回执持久点（实施期发现）**：动手前查证 mcp-server 此前**从未调用
+   `flush_wal`**——MCP 面记录数远低于 `sync_every`（mcp bin 开 1_000）阈值，缓冲
+   整本随进程退出丢失，`demo_settle` 要消费的 WAL 恒为空文件，本砖前提（真账本
+   落盘）不成立。定夺：ⓐ 变更工具（authorize / pay）的回执离开状态层前强制 fsync
+   （`AppState::persist`；幂等 re-ack 路径同样补 flush——上一次「注册成功但回执前
+   失败」的重发在此补上，fsync 幂等）；失败 → 新错误码 `E_WAL`（§11，fail-visible，
+   **回执 = 已持久化事实**，绝不静默吞掉）；ⓑ bin 停机路径（stdin EOF / Ctrl-C 后）
+   补 `flush_wal` 兜底其余路径。读面工具（balance / verify_receipt / witness /
+   attest）不落账本事实，不加。kill -9 / 断电丢未 fsync 尾巴仍属标准 WAL 语义
+   （§8.1）。
+8. **demo WAL = 本轮 scratch 面，启动清盘（不是账本档案）**：三框架脚本启动时清掉
+   `demos/.wal`。理由：mist-mcp 启动**不重放** WAL（`restore_from_wal` 是显式入口，
+   bin 未接），定夺 ⑦ 使 WAL 首次真实落盘后，复跑会在旧账本上追加重复
+   Register/Intent 记录（重启缝隙从「被 flush 缺口掩盖」变「必现」）；demo 语义 =
+   一轮完整会话的账本，清盘保证每轮从零开始、确定性复跑。**边界诚实**：这是 demo
+   面 scratch 语义，不是账本进程的清盘面——生产 WAL 只增，清盘权不在任何消费方；
+   「bin 启动重放 + 内存委托表重建」是独立缝（S-77 候选，见下诚实边界）。
+
+9. **重放侧未密封尾按意图身份 `(seq, intent_hash)` 去重（实施期发现，真实事故驱动）**
+   ——定夺 ⑧ 落地后的首轮端到端验证即复现：mcp_probe 对同一 WAL 目录连跑三次（不复
+   位），WAL 累积三条同 `intent_hash` 的 Intent 记录（每个无重放的新进程把同一逻辑
+   意图当新意图接受，各带自己的 `accepted_at`，seq 都从 0 起）。`restore_from_wal` 重
+   放该 WAL 时**账本与结算发散**：账本侧 `try_commit` 按 S-12 幂等吸收重复（total_spent
+   = 142、nonce 集一席），但未密封尾重建按**整条记录字节**排序后相邻去重——同
+   `(seq, ih)` 而 `accepted_at` 不同的记录字节不等，两份都进窗 → `seal_expired` 出
+   2 条目 → 净额 Σ=284，链上给 vendor 双倍支付一笔 142 的意图。修复：尾去重键改为
+   意图身份 `(seq, intent_hash)`（`apply_log` pass 4，与账本侧幂等吸收键一致），排序
+   后相邻去重仍确定（同 `(seq, ih)` 记录的其余字段由意图本身决定，仅时间戳不同；保留
+   组内最小 `accepted_at` = 首次接受时刻，接受树锚原始事实）。裁决史不变（仍每条目一
+   裁决）；`permuted_and_duplicated_delivery_converges` property test 语义不变（其重复
+   投递是字节级副本，新旧键下都收敛）。**边界诚实**：ⓐ 这修的是「重复 WAL 不得双付」
+   的防御纵深——病根是无重放写入端能产出重复记录（S-77 候选，恢复面接上即根除）；
+   ⓑ 同 nonce 跨意图的重复记录（无重放进程各自花同一 nonce 但 memo 不同）重放时
+   `try_commit` 报 `E_NONCE` → 恢复整体 fail-closed（不静默择一），仍由 S-77 根治；
+   ⓒ probe 自此启动时清点并复位目标 WAL 目录（定夺 ⑧ 同款语义，参考客户端对
+   caller 目录的 scratch 约定），门禁与复跑不再天然产出病态 WAL。
 
 ### 6.17 Phase 2 多运营者治理（设计轮，P2-0，2026-08-31）
 
@@ -3043,6 +3146,7 @@ contract BatchSettler {
 | `E_REV_ROOT` | 证明公共输入 `revocation_root` 不在聚合器撤销状态根集合（S-44 绑定闸，§6.2；仅 `enforce_revocation_root = true` 时触发） |
 | `E_OPERATOR` | 意图委托的链上绑定指向其他运营者（S-62 运营者绑定闸，§6.19.2；未绑定 fail-open 放行） |
 | `E_BIND_BACKEND` | 运营者绑定读面不可得（RPC 失败 / 短返回，S-62，§6.19.2）——fail-closed，绝不按未绑定放行 |
+| `E_WAL` | 回执持久化失败（S-76：MCP 面变更工具回执前 `flush_wal` 失败，§6.16 / §8.1）——fail-visible，回执不落盘就不是已持久化事实 |
 | `E_BUDGET_PER_SPEND` | 超过单笔上限 |
 | `E_BUDGET_RATE` | 超过窗口速率 |
 | `E_BUDGET_TOTAL` | 超过累计总上限 |

@@ -103,6 +103,12 @@ cd eliza && node eliza_client.mjs
    重建状态。重启后 EAttestBind 靠 `Aggregator::registered` 兜底（authorize 同时查
    注册表）；客户端重发语义按 S-12（同意图重发 re-ack、跨意图 E_NONCE），首笔
    accepted 的 seq 以 `verify_receipt` 为准。
+   **持久点（S-76，TECH_SPEC §6.16 定夺 ⑦ / §8.1）**：变更工具（authorize / pay）
+   回执离开状态层前强制 `flush_wal`——**回执 = 已持久化事实**，失败 `E_WAL`
+   fail-visible；bin 停机路径（stdin EOF / Ctrl-C 后）再补一次兜底 flush。此前本面
+   记录数低于 `sync_every`（1_000）且无停机 flush，进程退出即整本丢失；S-76 起每轮
+   会话的真账本落盘，`demo_settle --wal`（结算侧车）与框架 demo 第 7 步消费的正是
+   这份 WAL。kill -9 / 断电丢未 fsync 尾巴仍属标准 WAL 语义。
 3. **`balance` 的 total_cap 来自 authorize 内存表**（非聚合器）；total_spent 来自
    聚合器。重启后 balance 需重新 authorize。
 4. **agent-DID 与委托不符 → `E_ORDERING`**（原探针 `E_INTENT_HASH`）。

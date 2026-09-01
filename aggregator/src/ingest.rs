@@ -1924,6 +1924,68 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// §6.16 定夺 ⑨ 回归（S-76 端到端首验复现的双付事故）：无重放写入端对同一逻辑
+    /// 意图二次接受 → WAL 两条同 `(seq, intent_hash)` 而 `accepted_at` 不同的 Intent
+    /// 记录。重放侧账本被 `try_commit` 幂等吸收（一笔），未密封尾必须同样只重建一份
+    /// ——否则密封后净额双付（修复前 2 条目 / Σ=284 vs 账本 142，结算与账本发散）。
+    #[test]
+    fn replay_duplicated_acceptance_settles_once() {
+        let path = tmp_path("dup_intent_replay");
+        let agent_key = AgentSigningKey::from_bytes(&[5u8; 32]);
+        let d = delegation([1u8; 20], 1_000, 1_000_000);
+        let dh = mist_core::dsa::delegation_hash(&d);
+
+        // 同一信封（同一逻辑意图）：expires_at 固定于 T1（probe 用 2100 年固定值同款），
+        // 两个实例各自接受 → 意图字段逐字节相同，只有 accepted_at 随各自时钟不同。
+        let t1 = 1_700_000_000u64;
+        let env = make_env(dh, [1u8; 20], &agent_key, [0xAA; 20], 142, 1, t1);
+
+        // 实例 1（时钟 T1）：注册 + 接受 → WAL：Register + Intent(accepted_at=T1)。
+        {
+            let clock = Arc::new(AtomicU64::new(t1));
+            let agg = test_aggregator(&clock, &path);
+            let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
+            agg.register(sd, agent_key.verifying_key());
+            let r = agg.submit(&env);
+            assert!(r.accepted);
+            assert_eq!(r.seq, 0);
+            agg.wal.flush().unwrap();
+        }
+        // 实例 2（时钟 T2）：直接开同一 WAL，**不 restore**（S-77 缝隙的事故形态）——
+        // 新进程把同一逻辑意图当新意图接受，seq 从 0 重来。
+        {
+            let clock = Arc::new(AtomicU64::new(t1 + 5));
+            let agg = test_aggregator(&clock, &path);
+            let sd = sign_delegation(&d, &owner_signing_key_from_bytes([7u8; 32]));
+            agg.register(sd, agent_key.verifying_key());
+            let r = agg.submit(&env);
+            assert!(r.accepted, "无重放写入端重复接受同一意图（事故前提）");
+            assert_eq!(r.seq, 0);
+            agg.wal.flush().unwrap();
+        }
+
+        // 重放：账本一笔；密封当前尾（demo_settle 同款 `seal_expired(now, 0)`）→
+        // 恰 1 条目、Σnet = 142。
+        let clock = Arc::new(AtomicU64::new(t1 + 10));
+        let c = Arc::clone(&clock);
+        let (agg2, truncated) = Aggregator::restore_from_wal(
+            test_cfg(),
+            Box::new(FormatVerifier),
+            &path,
+            Box::new(move || c.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        assert!(!truncated);
+        assert_eq!(agg2.total_spent(&dh), Some(142), "账本幂等吸收，只记一笔");
+        let sealed = agg2.seal_expired((agg2.now_fn)(), 0);
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].entries.len(), 1, "同一意图身份只重建一份窗口条目");
+        let res = agg2.settle_epoch(&sealed[0]).unwrap();
+        let sum_net: u64 = res.net.iter().map(|l| l.amount).sum();
+        assert_eq!(sum_net, 142, "净额 = 一笔（修复前 284 = 链上双付）");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 结算全部已封 epoch 并校验不变量（S-10c 的 fuzz 断言）：Σnet == Σaccepted；
     /// 每个 accepted 的 intent_hash 恰出现在一个 epoch 里一次；无 rejected 的 intent_hash
     /// 入承诺（无双重记账、无丢失）。

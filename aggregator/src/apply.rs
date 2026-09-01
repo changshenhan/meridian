@@ -288,9 +288,14 @@ pub(crate) fn apply_log(
         .collect();
     intents.sort_unstable();
     // 未密封尾（已接受但未进任何 epoch 承诺）：重建当前窗口用（S-10c，否则这些意图
-    // 永远不会被净额结算）。重复投递的同一意图必须只重建一份（窗口条目以 seq 为键，
-    // 重复入窗 = 窗口域双重记账 → 副本间该域发散）；排序后相邻重复 `dedup` 即确定性的
-    // 多重集 → 集合（裁决史不受影响——定夺 4 的 total map 仍每条目一个裁决）。
+    // 永远不会被净额结算）。重复投递的同一意图必须只重建一份——去重键 = 意图身份
+    // `(seq, intent_hash)`，与账本侧 `try_commit` 的幂等吸收键一致（S-12）：同
+    // `(seq, ih)` 而 `accepted_at` 不同的记录（无重放写入端把同一逻辑意图重复接受的
+    // 形态，§6.16 定夺 ⑨ 实测）字节不等，按整条字节 dedup 会双份入窗 → 净额对同一
+    // 意图双重支付而账本只记一次（结算与账本发散）。排序后相邻去重仍确定性（同
+    // `(seq, ih)` 的记录除时间戳外其余字段由意图决定，必相邻；保留组内最小
+    // `accepted_at` = 首次接受时刻，接受树锚原始事实）；多重集 → 集合，裁决史不受
+    // 影响——定夺 4 的 total map 仍每条目一个裁决。
     let mut tail: Vec<WindowEntry> = intents
         .iter()
         .filter(|t| t.seq >= report.sealed_accepted_count)
@@ -300,7 +305,7 @@ pub(crate) fn apply_log(
             accepted_at: t.accepted_at,
         })
         .collect();
-    tail.dedup();
+    tail.dedup_by(|a, b| a.seq == b.seq && a.intent_hash == b.intent_hash);
     for t in &intents {
         let reg = parts.registry.lookup(&t.delegation_hash).ok_or(
             ApplyError::UnregisteredDelegation {

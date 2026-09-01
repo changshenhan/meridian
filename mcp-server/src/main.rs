@@ -76,8 +76,15 @@ async fn main() -> anyhow::Result<()> {
         ingest_cfg.enforce_revocation_root = true;
     }
     let agg = Arc::new(Aggregator::new(ingest_cfg, verifier, wal));
+    let agg_for_shutdown = Arc::clone(&agg);
     let service = MistServer::new(agg);
     let running = service.serve(stdio()).await?;
     running.waiting().await?;
+    // S-76（TECH_SPEC §6.16 / §8.1）：停机持久点——客户端断开（stdin EOF）或 Ctrl-C
+    // 后把缓冲中低于 sync_every 阈值的尾巴 fsync 落盘（变更工具已有回执前 flush，
+    // 此处兜住其余路径）。kill -9 / 断电丢未 fsync 尾巴仍属标准 WAL 语义（§8.1）。
+    agg_for_shutdown
+        .flush_wal()
+        .map_err(|e| anyhow::anyhow!("shutdown flush_wal: {e}"))?;
     Ok(())
 }

@@ -251,6 +251,15 @@ if { command -v forge >/dev/null 2>&1 || [ -x "$HOME/.foundry/bin/forge" ]; } \
     # P2-4 多运营者多实例部署流程演练（TECH_SPEC §6.21.3）：append-only 调度 ×2 代 →
     # 两 BatchSettler 实例各持其部署版本 → 名册 self-registration 快照 → 负向组 6 例全拒。
     run "registry_flow" bash -c 'export PATH="$HOME/.foundry/bin:$PATH"; cd contracts/rust-smoke && cargo run --quiet --bin registry_flow'
+    # S-76：对外框架 demo 真链 settle 完整化（TECH_SPEC §6.16）。三件套——mcp_probe
+    # （Rust 侧 MCP stdio 客户端参考实现）走真协议驱动 mist-mcp 产真 WAL → demo_settle
+    # 消费真 WAL 真链结算（快照侧车：拷贝后操作副本，原 WAL 不回写，幂等）。WAL 目录
+    # 用 target/ 一次性目录（框架 demo 用 demos/.wal 且自带启动清盘，门禁不碰工作树）。
+    run "mist-mcp bins build (mist-mcp + mcp_probe)" cargo build -p mist-mcp --bins
+    PROBE_WAL_DIR="$ROOT/target/mcp-probe-smoke"
+    rm -rf "$PROBE_WAL_DIR"
+    run "mcp_probe 冒烟 (真 stdio 协议产真 WAL)" bash -c "cargo run -q -p mist-mcp --bin mcp_probe -- '$PROBE_WAL_DIR'"
+    run "demo_settle 真链结算 (probe WAL -> commit/settle/claim)" bash -c "export PATH=\"\$HOME/.foundry/bin:\$PATH\"; cd contracts/rust-smoke && cargo run --quiet --bin demo_settle -- --wal '$PROBE_WAL_DIR/mist.wal'"
 else
     skip "forge/anvil 未找到 → rust-smoke 门禁跳过"
 fi
