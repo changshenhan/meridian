@@ -137,8 +137,10 @@ sol! {
         function commit(uint256 epochId, bytes32 commitmentRoot, bytes32 revocationRoot, bytes32 acceptanceRoot, uint64 sealedAt) external payable;
         function settle(uint256 epochId, NetInstruction[] calldata net, bytes32 nettingRoot) external payable;
         function claim(uint256 epochId, uint256 netIndex) external;
+        function releaseBond(uint256 epochId) external;
         function challenge(uint256 epochId, FraudProof calldata fp) external payable;
         function challengeBond() external view returns (uint256);
+        function CHALLENGE_WINDOW() external view returns (uint256);
         function operator() external view returns (address);
         function epochs(uint256 epochId) external view returns (EpochView memory);
         function epochStatus(uint256 epochId) external view returns (EpochStatus memory);
